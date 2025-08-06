@@ -1,0 +1,69 @@
+# Prometheus Stack values for homelab
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+    resources:
+      requests:
+        cpu: 200m
+        memory: 1Gi
+      limits:
+        cpu: 500m
+        memory: 2Gi
+
+grafana:
+  adminPassword: changeme  # CHANGE THIS!
+  persistence:
+    enabled: true
+    storageClassName: longhorn
+    size: 5Gi
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - grafana.mackie.house
+    tls:
+      - secretName: grafana-tls
+        hosts:
+          - grafana.mackie.house
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      traefik.ingress.kubernetes.io/router.middlewares: kube-system-local-only@kubernetescrd
+
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 5Gi
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - alertmanager.mackie.house
+    tls:
+      - secretName: alertmanager-tls
+        hosts:
+          - alertmanager.mackie.house
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      traefik.ingress.kubernetes.io/router.middlewares: kube-system-local-only@kubernetescrd
+
+# Disable components we don't need for a homelab
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false

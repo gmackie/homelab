@@ -1,0 +1,103 @@
+# Prowlarr - Centralized indexer management (replaces Jackett)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prowlarr-config
+  namespace: media
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prowlarr
+  namespace: media
+  labels:
+    app: prowlarr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prowlarr
+  template:
+    metadata:
+      labels:
+        app: prowlarr
+    spec:
+      containers:
+      - name: prowlarr
+        image: lscr.io/linuxserver/prowlarr:latest
+        ports:
+        - containerPort: 9696
+        envFrom:
+        - configMapRef:
+            name: media-env
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /ping
+            port: 9696
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ping
+            port: 9696
+          initialDelaySeconds: 15
+          periodSeconds: 5
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: prowlarr-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prowlarr
+  namespace: media
+spec:
+  selector:
+    app: prowlarr
+  ports:
+  - port: 9696
+    targetPort: 9696
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prowlarr
+  namespace: media
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-local-only@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - prowlarr.mackie.house
+    secretName: prowlarr-tls
+  rules:
+  - host: prowlarr.mackie.house
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: prowlarr
+            port:
+              number: 9696

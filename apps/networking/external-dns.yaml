@@ -1,0 +1,164 @@
+# External DNS - Automatic DNS record management with Cloudflare
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudflare-api-token
+  namespace: kube-system
+type: Opaque
+stringData:
+  # Create token at: https://dash.cloudflare.com/profile/api-tokens
+  # Required permissions: Zone:Read, DNS:Edit for your domain
+  CF_API_TOKEN: "your-cloudflare-api-token"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-dns
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-dns
+rules:
+- apiGroups: [""]
+  resources: ["services", "endpoints", "pods"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["extensions", "networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-dns-viewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-dns
+subjects:
+- kind: ServiceAccount
+  name: external-dns
+  namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns
+  namespace: kube-system
+spec:
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: external-dns
+  template:
+    metadata:
+      labels:
+        app: external-dns
+    spec:
+      serviceAccountName: external-dns
+      containers:
+      - name: external-dns
+        image: registry.k8s.io/external-dns/external-dns:v0.13.5
+        args:
+        - --source=service
+        - --source=ingress
+        - --domain-filter=mackie.house
+        - --provider=cloudflare
+        - --cloudflare-proxied  # Enable Cloudflare proxy (orange cloud)
+        - --policy=sync  # sync = create+delete, upsert-only = create only
+        - --txt-owner-id=homelab
+        - --txt-prefix=_extdns.
+        - --log-level=info
+        - --interval=1m
+        env:
+        - name: CF_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: cloudflare-api-token
+              key: CF_API_TOKEN
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+---
+# Annotation-based DNS records for specific needs
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-dns-annotations
+  namespace: kube-system
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: "vpn.mackie.house"
+    external-dns.alpha.kubernetes.io/ttl: "300"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.201  # Your home IP will be set by external-dns
+  ports:
+  - port: 51820
+    protocol: UDP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: external-dns-config
+  namespace: kube-system
+data:
+  config.md: |
+    # External DNS Configuration
+    
+    ## Automatic DNS Management
+    
+    External DNS will automatically create/update/delete DNS records for:
+    - Ingress resources
+    - LoadBalancer services
+    
+    ## Cloudflare Setup
+    
+    1. Get your Zone ID from Cloudflare dashboard
+    2. Create API token with permissions:
+       - Zone:Read
+       - DNS:Edit
+    3. Update the secret with your token
+    
+    ## Annotations
+    
+    Control DNS records with annotations:
+    
+    ```yaml
+    metadata:
+      annotations:
+        # Force a specific hostname
+        external-dns.alpha.kubernetes.io/hostname: vpn.mackie.house
+        
+        # Set TTL (default 300)
+        external-dns.alpha.kubernetes.io/ttl: "60"
+        
+        # Disable Cloudflare proxy for this record
+        external-dns.alpha.kubernetes.io/cloudflare-proxied: "false"
+        
+        # Exclude from external-dns management
+        external-dns.alpha.kubernetes.io/exclude: "true"
+    ```
+    
+    ## Public Services
+    
+    These services will get public DNS records:
+    - mackie.house
+    - secure.mackie.house
+    - requests.mackie.house
+    - vault.mackie.house
+    - status-public.mackie.house
+    
+    ## Internal Services
+    
+    These remain internal only (no public DNS):
+    - *.local.mackie.house
+    - All other service subdomains

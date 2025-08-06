@@ -1,0 +1,257 @@
+# FreeIPA - Identity Management for Homelab
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: identity
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: freeipa-data
+  namespace: identity
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: freeipa-passwords
+  namespace: identity
+type: Opaque
+stringData:
+  admin_password: "ChangeMeToSecurePassword123!"  # Change this!
+  dm_password: "DirectoryManagerPassword123!"     # Change this!
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: freeipa-config
+  namespace: identity
+data:
+  ipa-server-install-options: |
+    --unattended
+    --realm=MACKIE.HOUSE
+    --domain=mackie.house
+    --ds-password=$DM_PASSWORD
+    --admin-password=$ADMIN_PASSWORD
+    --hostname=ipa.mackie.house
+    --no-ntp
+    --setup-dns
+    --forwarder=192.168.1.53
+    --forwarder=1.1.1.1
+    --reverse-zone=1.168.192.in-addr.arpa
+    --allow-zone-overlap
+    --ssh-trust-dns
+    --mkhomedir
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: freeipa
+  namespace: identity
+spec:
+  serviceName: freeipa
+  replicas: 1
+  selector:
+    matchLabels:
+      app: freeipa
+  template:
+    metadata:
+      labels:
+        app: freeipa
+    spec:
+      hostname: ipa
+      containers:
+      - name: freeipa
+        image: freeipa/freeipa-server:latest
+        args:
+        - -U
+        - --realm=MACKIE.HOUSE
+        - --domain=mackie.house
+        - --admin-password=$(ADMIN_PASSWORD)
+        - --ds-password=$(DM_PASSWORD)
+        - --no-ntp
+        - --setup-dns
+        - --forwarder=192.168.1.53
+        - --forwarder=1.1.1.1
+        env:
+        - name: IPA_SERVER_HOSTNAME
+          value: ipa.mackie.house
+        - name: ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: freeipa-passwords
+              key: admin_password
+        - name: DM_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: freeipa-passwords
+              key: dm_password
+        ports:
+        - containerPort: 80
+          name: http
+        - containerPort: 443
+          name: https
+        - containerPort: 389
+          name: ldap
+        - containerPort: 636
+          name: ldaps
+        - containerPort: 88
+          name: kerberos
+        - containerPort: 88
+          protocol: UDP
+          name: kerberos-udp
+        - containerPort: 464
+          name: kerberos-adm
+        - containerPort: 464
+          protocol: UDP
+          name: kerberos-adm-udp
+        - containerPort: 53
+          name: dns
+        - containerPort: 53
+          protocol: UDP
+          name: dns-udp
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: run
+          mountPath: /run
+        - name: tmp
+          mountPath: /tmp
+        readinessProbe:
+          exec:
+            command:
+            - /usr/bin/systemctl
+            - is-system-running
+          initialDelaySeconds: 300
+          periodSeconds: 30
+          timeoutSeconds: 10
+        livenessProbe:
+          exec:
+            command:
+            - /usr/bin/systemctl
+            - is-system-running
+          initialDelaySeconds: 600
+          periodSeconds: 60
+          timeoutSeconds: 10
+        resources:
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+          requests:
+            cpu: 500m
+            memory: 2Gi
+        securityContext:
+          capabilities:
+            add:
+            - SYS_ADMIN
+            - NET_ADMIN
+          readOnlyRootFilesystem: false
+      volumes:
+      - name: run
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn
+      resources:
+        requests:
+          storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: freeipa
+  namespace: identity
+spec:
+  selector:
+    app: freeipa
+  clusterIP: None  # Headless service for StatefulSet
+  ports:
+  - name: http
+    port: 80
+  - name: https
+    port: 443
+  - name: ldap
+    port: 389
+  - name: ldaps
+    port: 636
+  - name: kerberos
+    port: 88
+  - name: kerberos-udp
+    port: 88
+    protocol: UDP
+  - name: kerberos-adm
+    port: 464
+  - name: kerberos-adm-udp
+    port: 464
+    protocol: UDP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: freeipa-web
+  namespace: identity
+spec:
+  selector:
+    app: freeipa
+  ports:
+  - name: https
+    port: 443
+    targetPort: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: freeipa
+  namespace: identity
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-local-only@kubernetescrd
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - ipa.mackie.house
+    secretName: freeipa-tls
+  rules:
+  - host: ipa.mackie.house
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: freeipa-web
+            port:
+              number: 443
+---
+# DNS Service for cluster
+apiVersion: v1
+kind: Service
+metadata:
+  name: freeipa-dns
+  namespace: identity
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.54  # Secondary DNS after Pi-hole
+  selector:
+    app: freeipa
+  ports:
+  - name: dns
+    port: 53
+    targetPort: 53
+  - name: dns-udp
+    port: 53
+    targetPort: 53
+    protocol: UDP

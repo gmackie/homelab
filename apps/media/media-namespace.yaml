@@ -1,0 +1,43 @@
+# Shared resources for media stack
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: media
+---
+# Shared PVCs for media stack
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: media-storage
+  namespace: media
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Ti  # Adjust based on your media library size
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: downloads
+  namespace: media
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 100Gi  # For active downloads
+---
+# ConfigMap for shared environment variables
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: media-env
+  namespace: media
+data:
+  TZ: "America/New_York"  # Update to your timezone
+  PUID: "1000"
+  PGID: "1000"

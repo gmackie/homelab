@@ -1,0 +1,32 @@
+# InfluxDB 2.x Helm values
+image:
+  repository: influxdb
+  tag: 2.7-alpine
+
+persistence:
+  enabled: true
+  storageClass: longhorn
+  size: 20Gi
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+  requests:
+    cpu: 100m
+    memory: 256Mi
+
+adminUser:
+  organization: "homelab"
+  bucket: "default"
+  user: "admin"
+  password: "changeme123"  # CHANGE THIS!
+  token: "my-super-secret-auth-token"  # CHANGE THIS!
+
+ingress:
+  enabled: true
+  className: traefik
+  hostname: influxdb.mackie.house
+  tls: true
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod

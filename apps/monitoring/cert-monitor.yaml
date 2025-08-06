@@ -1,0 +1,84 @@
+# Certificate monitoring and renewal alerts
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cert-monitor
+  namespace: cert-manager
+spec:
+  schedule: "0 */6 * * *"  # Every 6 hours
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cert-monitor-sa
+          containers:
+          - name: monitor
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/bash
+            - -c
+            - |
+              #!/bin/bash
+              
+              # Check all certificates
+              echo "Checking certificate status..."
+              
+              WARN_DAYS=30
+              CRITICAL_DAYS=7
+              
+              kubectl get certificates -A -o json | jq -r '.items[] | 
+                select(.status.conditions[]? | select(.type=="Ready" and .status=="False")) | 
+                "\(.metadata.namespace)/\(.metadata.name): Not Ready - \(.status.conditions[].message)"'
+              
+              # Check expiration dates
+              kubectl get certificates -A -o json | jq -r '.items[] | 
+                select(.status.renewalTime) |
+                {
+                  name: "\(.metadata.namespace)/\(.metadata.name)",
+                  renewal: .status.renewalTime,
+                  notAfter: .status.notAfter
+                } | 
+                select((.notAfter | fromdateiso8601) - now < 30 * 86400) |
+                "\(.name): Expires in \(((.notAfter | fromdateiso8601) - now) / 86400 | floor) days"'
+              
+              # Trigger renewal for certificates expiring soon
+              kubectl get certificates -A -o json | jq -r '.items[] | 
+                select(.status.renewalTime) |
+                select((.status.notAfter | fromdateiso8601) - now < 7 * 86400) |
+                "kubectl cert-manager renew -n \(.metadata.namespace) \(.metadata.name)"' | 
+              while read cmd; do
+                echo "Triggering renewal: $cmd"
+                eval $cmd
+              done
+          restartPolicy: OnFailure
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-monitor-sa
+  namespace: cert-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-monitor-role
+rules:
+- apiGroups: ["cert-manager.io"]
+  resources: ["certificates", "certificaterequests"]
+  verbs: ["get", "list", "update"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-monitor-rb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cert-monitor-role
+subjects:
+- kind: ServiceAccount
+  name: cert-monitor-sa
+  namespace: cert-manager

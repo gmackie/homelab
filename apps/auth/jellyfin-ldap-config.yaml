@@ -1,0 +1,89 @@
+# Jellyfin LDAP Plugin Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jellyfin-ldap-config
+  namespace: media
+data:
+  ldap-config.xml: |
+    <?xml version="1.0" encoding="utf-8"?>
+    <PluginConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+      <LdapServer>freeipa.identity</LdapServer>
+      <LdapPort>389</LdapPort>
+      <UseSsl>false</UseSsl>
+      <UseStartTls>false</UseStartTls>
+      <SkipSslVerify>true</SkipSslVerify>
+      <LdapBindUser>uid=jellyfin,cn=users,cn=accounts,dc=mackie,dc=house</LdapBindUser>
+      <LdapBindPassword>FROM_SECRET</LdapBindPassword>
+      <LdapBaseDn>cn=users,cn=accounts,dc=mackie,dc=house</LdapBaseDn>
+      <LdapSearchFilter>(uid={username})</LdapSearchFilter>
+      <LdapAdminBaseDn>cn=groups,cn=accounts,dc=mackie,dc=house</LdapAdminBaseDn>
+      <LdapAdminFilter>(cn=media-admins)</LdapAdminFilter>
+      <EnableLdapAdminFilterMemberUid>false</EnableLdapAdminFilterMemberUid>
+      <LdapSearchAttributes>uid,cn,mail,displayName</LdapSearchAttributes>
+      <LdapUidAttribute>uid</LdapUidAttribute>
+      <LdapUsernameAttribute>uid</LdapUsernameAttribute>
+      <LdapPasswordAttribute>userPassword</LdapPasswordAttribute>
+      <CreateUsersFromLdap>true</CreateUsersFromLdap>
+      <AllowPassChange>false</AllowPassChange>
+    </PluginConfiguration>
+  
+  install-plugin.sh: |
+    #!/bin/bash
+    # Install LDAP plugin in Jellyfin
+    
+    # Wait for Jellyfin to be ready
+    until curl -f http://localhost:8096/System/Info; do
+      echo "Waiting for Jellyfin..."
+      sleep 5
+    done
+    
+    # Install LDAP Authentication plugin
+    curl -X POST "http://localhost:8096/Packages/Installed/LDAP%20Authentication" \
+      -H "X-Emby-Token: ${JELLYFIN_API_KEY}"
+    
+    # Copy LDAP config
+    cp /config/ldap-config.xml /config/plugins/LDAP-Auth/configuration.xml
+    
+    # Update password from secret
+    LDAP_PASS=$(cat /secrets/jellyfin-password)
+    sed -i "s/FROM_SECRET/$LDAP_PASS/g" /config/plugins/LDAP-Auth/configuration.xml
+    
+    # Restart Jellyfin to load plugin
+    killall jellyfin
+---
+# Job to configure Jellyfin LDAP
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: configure-jellyfin-ldap
+  namespace: media
+spec:
+  template:
+    spec:
+      containers:
+      - name: configure
+        image: curlimages/curl:latest
+        command: ["/bin/sh", "/scripts/install-plugin.sh"]
+        env:
+        - name: JELLYFIN_API_KEY
+          value: "YOUR_JELLYFIN_API_KEY"  # Get from Jellyfin dashboard
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: config
+          mountPath: /config
+        - name: secrets
+          mountPath: /secrets
+      volumes:
+      - name: scripts
+        configMap:
+          name: jellyfin-ldap-config
+          defaultMode: 0755
+      - name: config
+        persistentVolumeClaim:
+          claimName: jellyfin-config
+      - name: secrets
+        secret:
+          secretName: freeipa-service-accounts
+      restartPolicy: OnFailure

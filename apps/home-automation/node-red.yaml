@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: node-red-data
+  namespace: home-automation
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-red
+  namespace: home-automation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-red
+  template:
+    metadata:
+      labels:
+        app: node-red
+    spec:
+      containers:
+      - name: node-red
+        image: nodered/node-red:latest
+        ports:
+        - containerPort: 1880
+        env:
+        - name: TZ
+          value: "America/New_York"  # Update to your timezone
+        - name: NODE_RED_ENABLE_PROJECTS
+          value: "true"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: node-red-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-red
+  namespace: home-automation
+spec:
+  selector:
+    app: node-red
+  ports:
+  - port: 1880
+    targetPort: 1880
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: node-red
+  namespace: home-automation
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - nodered.mackie.house
+    secretName: node-red-tls
+  rules:
+  - host: nodered.mackie.house
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: node-red
+            port:
+              number: 1880

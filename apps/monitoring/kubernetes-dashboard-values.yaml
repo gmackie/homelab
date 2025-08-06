@@ -1,0 +1,47 @@
+# Kubernetes Dashboard Helm values
+extraArgs:
+  - --enable-skip-login
+  - --disable-settings-authorizer
+  - --enable-insecure-login
+  - --namespace=kubernetes-dashboard
+
+service:
+  type: ClusterIP
+  externalPort: 443
+
+ingress:
+  enabled: true
+  className: traefik
+  hosts:
+    - dashboard.mackie.house
+  tls:
+    - secretName: kubernetes-dashboard-tls
+      hosts:
+        - dashboard.mackie.house
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-local-only@kubernetescrd
+    # Required for dashboard websockets
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+
+protocolHttp: false
+metricsScraper:
+  enabled: true
+
+# Resource limits
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+# Settings
+settings:
+  clusterName: "Homelab K3s"
+  itemsPerPage: 20
+  labelsLimit: 3
+  logsAutoRefreshTimeInterval: 5
+  resourceAutoRefreshTimeInterval: 5

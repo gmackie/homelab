@@ -1,0 +1,160 @@
+# Exportarr - Prometheus metrics for *arr services
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: exportarr-sonarr
+  namespace: monitoring
+  labels:
+    app: exportarr-sonarr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: exportarr-sonarr
+  template:
+    metadata:
+      labels:
+        app: exportarr-sonarr
+    spec:
+      containers:
+      - name: exportarr
+        image: ghcr.io/onedr0p/exportarr:latest
+        args:
+          - sonarr
+        env:
+        - name: PORT
+          value: "9707"
+        - name: URL
+          value: "http://sonarr.media:8989"
+        - name: APIKEY
+          valueFrom:
+            secretKeyRef:
+              name: sonarr-api
+              key: apikey
+        ports:
+        - containerPort: 9707
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: exportarr-sonarr
+  namespace: monitoring
+  labels:
+    app: exportarr-sonarr
+spec:
+  selector:
+    app: exportarr-sonarr
+  ports:
+  - port: 9707
+    targetPort: 9707
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sonarr-api
+  namespace: monitoring
+type: Opaque
+stringData:
+  apikey: "YOUR_SONARR_API_KEY"  # Update after Sonarr is configured
+---
+# Similar setup for Radarr
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: exportarr-radarr
+  namespace: monitoring
+  labels:
+    app: exportarr-radarr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: exportarr-radarr
+  template:
+    metadata:
+      labels:
+        app: exportarr-radarr
+    spec:
+      containers:
+      - name: exportarr
+        image: ghcr.io/onedr0p/exportarr:latest
+        args:
+          - radarr
+        env:
+        - name: PORT
+          value: "9708"
+        - name: URL
+          value: "http://radarr.media:7878"
+        - name: APIKEY
+          valueFrom:
+            secretKeyRef:
+              name: radarr-api
+              key: apikey
+        ports:
+        - containerPort: 9708
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: exportarr-radarr
+  namespace: monitoring
+  labels:
+    app: exportarr-radarr
+spec:
+  selector:
+    app: exportarr-radarr
+  ports:
+  - port: 9708
+    targetPort: 9708
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: radarr-api
+  namespace: monitoring
+type: Opaque
+stringData:
+  apikey: "YOUR_RADARR_API_KEY"  # Update after Radarr is configured
+---
+# Prometheus ServiceMonitor for auto-discovery
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: exportarr
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: exportarr-sonarr
+  endpoints:
+  - port: "9707"
+    interval: 60s
+    path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: exportarr-radarr
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: exportarr-radarr
+  endpoints:
+  - port: "9708"
+    interval: 60s
+    path: /metrics

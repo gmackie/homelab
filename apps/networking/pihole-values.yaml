@@ -1,0 +1,52 @@
+# Pi-hole Helm values for homelab
+replicaCount: 1
+
+image:
+  repository: pihole/pihole
+  tag: latest
+  pullPolicy: IfNotPresent
+
+persistentVolumeClaim:
+  enabled: true
+  storageClass: longhorn
+  size: 5Gi
+
+adminPassword: "changeme"  # Change this!
+
+DNS1: "1.1.1.1"
+DNS2: "1.0.0.1"
+
+dnsmasq:
+  customDnsEntries:
+    - "address=/mackie.house/192.168.1.100"  # Update with your NUC IP
+    
+serviceDns:
+  type: LoadBalancer
+  port: 53
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: 192.168.1.53  # Update with desired IP
+    
+serviceWeb:
+  type: ClusterIP
+  port: 80
+  
+ingress:
+  enabled: true
+  ingressClassName: traefik
+  hosts:
+    - pihole.mackie.house
+  tls:
+    - secretName: pihole-tls
+      hosts:
+        - pihole.mackie.house
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-local-only@kubernetescrd
+    
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi

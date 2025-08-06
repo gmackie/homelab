@@ -1,0 +1,309 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secure-dashboard-content
+  namespace: web
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Secure Dashboard - mackie.house</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background-color: #0a0a0a;
+                color: #e0e0e0;
+                line-height: 1.6;
+            }
+            .header {
+                background-color: #1a1a1a;
+                padding: 1rem 2rem;
+                border-bottom: 2px solid #4a9eff;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 2rem;
+            }
+            h1 {
+                color: #4a9eff;
+                margin-bottom: 0.5rem;
+            }
+            .subtitle {
+                color: #888;
+                font-size: 0.9rem;
+            }
+            .services-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 1.5rem;
+                margin-top: 2rem;
+            }
+            .service-card {
+                background-color: #1a1a1a;
+                border: 1px solid #333;
+                border-radius: 8px;
+                padding: 1.5rem;
+                transition: all 0.3s;
+            }
+            .service-card:hover {
+                border-color: #4a9eff;
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(74, 158, 255, 0.2);
+            }
+            .service-card h3 {
+                color: #4a9eff;
+                margin-bottom: 0.5rem;
+            }
+            .service-card p {
+                color: #ccc;
+                font-size: 0.9rem;
+                margin-bottom: 1rem;
+            }
+            .service-card a {
+                display: inline-block;
+                color: #4a9eff;
+                text-decoration: none;
+                padding: 0.5rem 1rem;
+                border: 1px solid #4a9eff;
+                border-radius: 4px;
+                transition: all 0.3s;
+            }
+            .service-card a:hover {
+                background-color: #4a9eff;
+                color: #0a0a0a;
+            }
+            .status {
+                display: inline-block;
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                margin-right: 0.5rem;
+            }
+            .status.online { background-color: #4caf50; }
+            .status.offline { background-color: #f44336; }
+            .section-title {
+                margin-top: 3rem;
+                margin-bottom: 1rem;
+                color: #4a9eff;
+                border-bottom: 1px solid #333;
+                padding-bottom: 0.5rem;
+            }
+            .monitoring-links {
+                display: flex;
+                gap: 1rem;
+                flex-wrap: wrap;
+                margin-top: 1rem;
+            }
+            .monitoring-links a {
+                color: #4a9eff;
+                text-decoration: none;
+                padding: 0.75rem 1.5rem;
+                border: 1px solid #4a9eff;
+                border-radius: 4px;
+                transition: all 0.3s;
+            }
+            .monitoring-links a:hover {
+                background-color: #4a9eff;
+                color: #0a0a0a;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div class="container">
+                <h1>Secure Dashboard</h1>
+                <p class="subtitle">Homelab Management Portal</p>
+            </div>
+        </div>
+        
+        <div class="container">
+            <h2 class="section-title">Monitoring & Metrics</h2>
+            <div class="monitoring-links">
+                <a href="/api/prometheus/metrics" target="_blank">Prometheus Metrics</a>
+                <a href="/api/cluster/health" target="_blank">Cluster Health</a>
+                <a href="/api/longhorn/metrics" target="_blank">Storage Metrics</a>
+                <a href="/api/grafana/dashboard" target="_blank">Grafana Dashboards</a>
+            </div>
+            
+            <h2 class="section-title">Services Status</h2>
+            <div class="services-grid">
+                <div class="service-card">
+                    <span class="status online"></span>
+                    <h3>Kubernetes Dashboard</h3>
+                    <p>Cluster management and monitoring interface</p>
+                    <a href="https://dashboard.mackie.house" target="_blank">Open Dashboard</a>
+                </div>
+                
+                <div class="service-card">
+                    <span class="status online"></span>
+                    <h3>Grafana</h3>
+                    <p>Metrics visualization and dashboards</p>
+                    <a href="https://grafana.mackie.house" target="_blank">Open Grafana</a>
+                </div>
+                
+                <div class="service-card">
+                    <span class="status online"></span>
+                    <h3>Prometheus</h3>
+                    <p>Time series metrics collection</p>
+                    <a href="/api/prometheus" target="_blank">Query API</a>
+                </div>
+                
+                <div class="service-card">
+                    <span class="status online"></span>
+                    <h3>Longhorn</h3>
+                    <p>Distributed storage management</p>
+                    <a href="https://longhorn.mackie.house" target="_blank">Open Longhorn</a>
+                </div>
+                
+                <div class="service-card">
+                    <span class="status online"></span>
+                    <h3>Pi-hole</h3>
+                    <p>Network-wide ad blocking</p>
+                    <a href="https://pihole.mackie.house" target="_blank">Open Pi-hole</a>
+                </div>
+                
+                <div class="service-card">
+                    <span class="status online"></span>
+                    <h3>Alert Manager</h3>
+                    <p>Alert routing and management</p>
+                    <a href="https://alertmanager.mackie.house" target="_blank">Open Alerts</a>
+                </div>
+            </div>
+            
+            <h2 class="section-title">Quick Actions</h2>
+            <div class="monitoring-links">
+                <a href="/api/backup/trigger" onclick="return confirm('Start backup job?')">Trigger Backup</a>
+                <a href="/api/certificates/status" target="_blank">Certificate Status</a>
+                <a href="/api/nodes/status" target="_blank">Node Status</a>
+                <a href="/logs" target="_blank">System Logs</a>
+            </div>
+        </div>
+        
+        <script>
+            // Add dynamic status checking later
+            console.log('Secure dashboard loaded');
+        </script>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-dashboard
+  namespace: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secure-dashboard
+  template:
+    metadata:
+      labels:
+        app: secure-dashboard
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+      volumes:
+      - name: html
+        configMap:
+          name: secure-dashboard-content
+      - name: nginx-config
+        configMap:
+          name: secure-dashboard-nginx
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secure-dashboard-nginx
+  namespace: web
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name secure.mackie.house;
+        
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+            try_files $uri $uri/ /index.html;
+        }
+        
+        # Proxy Prometheus metrics
+        location /api/prometheus {
+            proxy_pass http://kube-prometheus-stack-prometheus.monitoring:9090;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+        
+        # Proxy Grafana API
+        location /api/grafana {
+            proxy_pass http://kube-prometheus-stack-grafana.monitoring;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+        
+        # Proxy cluster health endpoint
+        location /api/cluster/health {
+            proxy_pass http://kubernetes.default.svc:443/healthz;
+            proxy_set_header Host $host;
+        }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secure-dashboard
+  namespace: web
+spec:
+  selector:
+    app: secure-dashboard
+  ports:
+  - port: 80
+    targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-dashboard
+  namespace: web
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-secure-external@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - secure.mackie.house
+    secretName: secure-mackie-house-tls
+  rules:
+  - host: secure.mackie.house
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: secure-dashboard
+            port:
+              number: 80

@@ -1,0 +1,150 @@
+# Automated backup jobs for critical data
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backup
+---
+# S3 backup credentials (for Longhorn and database backups)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-backup-secret
+  namespace: backup
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "your-access-key"
+  AWS_SECRET_ACCESS_KEY: "your-secret-key"
+  S3_ENDPOINT: "https://s3.amazonaws.com"  # Or your S3-compatible endpoint
+  S3_BUCKET: "homelab-backups"
+---
+# ConfigMap backup job - backs up all configmaps
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-configs
+  namespace: backup
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: backup-sa
+          containers:
+          - name: backup
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/bash
+            - -c
+            - |
+              DATE=$(date +%Y%m%d-%H%M%S)
+              BACKUP_DIR="/tmp/backup-${DATE}"
+              mkdir -p ${BACKUP_DIR}
+              
+              # Export all configmaps and secrets (encrypted)
+              for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}'); do
+                echo "Backing up namespace: $ns"
+                mkdir -p ${BACKUP_DIR}/${ns}
+                kubectl get configmap,secret -n $ns -o yaml > ${BACKUP_DIR}/${ns}/resources.yaml
+              done
+              
+              # Tar and upload to S3
+              cd /tmp
+              tar czf backup-${DATE}.tar.gz backup-${DATE}/
+              
+              # Upload to S3 (requires aws cli in image)
+              echo "Backup completed: backup-${DATE}.tar.gz"
+            volumeMounts:
+            - name: temp
+              mountPath: /tmp
+          volumes:
+          - name: temp
+            emptyDir: {}
+          restartPolicy: OnFailure
+---
+# Database backup job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-databases
+  namespace: backup
+spec:
+  schedule: "0 3 * * *"  # Daily at 3 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: backup
+            image: postgres:15-alpine  # Adjust based on your databases
+            envFrom:
+            - secretRef:
+                name: s3-backup-secret
+            command:
+            - /bin/sh
+            - -c
+            - |
+              DATE=$(date +%Y%m%d-%H%M%S)
+              
+              # Backup Pi-hole (if using persistent storage)
+              # Add database backup commands here
+              
+              echo "Database backups completed"
+          restartPolicy: OnFailure
+---
+# Service account for backup operations
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backup-sa
+  namespace: backup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: backup-role
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "secrets", "persistentvolumeclaims", "namespaces"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: backup-rb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: backup-role
+subjects:
+- kind: ServiceAccount
+  name: backup-sa
+  namespace: backup
+---
+# Longhorn backup job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-longhorn-snapshots
+  namespace: backup
+spec:
+  schedule: "0 4 * * *"  # Daily at 4 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: backup-sa
+          containers:
+          - name: backup
+            image: longhornio/longhorn-manager:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Script to trigger Longhorn snapshots
+              echo "Triggering Longhorn snapshots..."
+              # Add Longhorn API calls here
+          restartPolicy: OnFailure

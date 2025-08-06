@@ -1,0 +1,37 @@
+# Secrets and sensitive data
+*.secret
+*.key
+*.pem
+*.crt
+secrets/
+.env
+.env.*
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Helm
+*.tgz
+charts/*.lock
+charts/*/charts/
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/

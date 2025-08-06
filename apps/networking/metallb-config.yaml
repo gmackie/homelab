@@ -1,0 +1,25 @@
+# MetalLB configuration for bare metal load balancing
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: metallb-system
+---
+# IP Address Pool
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: homelab-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 192.168.1.200-192.168.1.250  # Adjust to your network range
+---
+# L2 Advertisement
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: homelab-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - homelab-pool

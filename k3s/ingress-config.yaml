@@ -1,0 +1,23 @@
+# This file contains ingress class configurations for local vs external access
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: traefik-local
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "false"
+spec:
+  controller: traefik.io/ingress-controller
+  parameters:
+    apiGroup: traefik.containo.us
+    kind: IngressClassConfiguration
+    name: traefik-local
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressClassConfiguration
+metadata:
+  name: traefik-local
+spec:
+  # Local-only ingress configuration
+  entryPoints:
+    - web
+    - websecure

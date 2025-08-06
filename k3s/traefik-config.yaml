@@ -1,0 +1,58 @@
+# Traefik middleware for local network access control
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: local-only
+  namespace: kube-system
+spec:
+  ipWhiteList:
+    sourceRange:
+      - 192.168.0.0/16
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 127.0.0.1/32
+---
+# Basic auth middleware for secure endpoints
+apiVersion: v1
+kind: Secret
+metadata:
+  name: basic-auth-secret
+  namespace: kube-system
+type: Opaque
+data:
+  # Username: admin, Password: changeme (htpasswd -nb admin changeme)
+  # IMPORTANT: Generate your own with: htpasswd -nb username password | base64
+  users: YWRtaW46JDJ5JDA1JEZPQjNGL0UvSDRBNTNGLnpQMFlKQy51MWhpVmJDdGFZdGR3VkpTLkpRaS9XR1ovbng2NTNtCg==
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: basic-auth
+  namespace: kube-system
+spec:
+  basicAuth:
+    secret: basic-auth-secret
+---
+# Chain middleware for secure external access
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: secure-external
+  namespace: kube-system
+spec:
+  chain:
+    middlewares:
+      - name: basic-auth
+        namespace: kube-system
+---
+# Rate limiting middleware
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limit
+  namespace: kube-system
+spec:
+  rateLimit:
+    average: 100
+    burst: 50
+    period: 1m

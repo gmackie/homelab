@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: overseerr-config
+  namespace: media
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overseerr
+  namespace: media
+  labels:
+    app: overseerr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: overseerr
+  template:
+    metadata:
+      labels:
+        app: overseerr
+    spec:
+      containers:
+      - name: overseerr
+        image: lscr.io/linuxserver/overseerr:latest
+        ports:
+        - containerPort: 5055
+        envFrom:
+        - configMapRef:
+            name: media-env
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /api/v1/status
+            port: 5055
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: overseerr-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overseerr
+  namespace: media
+spec:
+  selector:
+    app: overseerr
+  ports:
+  - port: 5055
+    targetPort: 5055
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: overseerr
+  namespace: media
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Overseerr can be public for media requests
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - requests.mackie.house
+    secretName: overseerr-tls
+  rules:
+  - host: requests.mackie.house
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: overseerr
+            port:
+              number: 5055

@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bazarr-config
+  namespace: media
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bazarr
+  namespace: media
+  labels:
+    app: bazarr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bazarr
+  template:
+    metadata:
+      labels:
+        app: bazarr
+    spec:
+      containers:
+      - name: bazarr
+        image: lscr.io/linuxserver/bazarr:latest
+        ports:
+        - containerPort: 6767
+        envFrom:
+        - configMapRef:
+            name: media-env
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: media
+          mountPath: /movies
+        - name: media
+          mountPath: /tv
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 6767
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: bazarr-config
+      - name: media
+        persistentVolumeClaim:
+          claimName: media-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bazarr
+  namespace: media
+spec:
+  selector:
+    app: bazarr
+  ports:
+  - port: 6767
+    targetPort: 6767
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bazarr
+  namespace: media
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-local-only@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - bazarr.mackie.house
+    secretName: bazarr-tls
+  rules:
+  - host: bazarr.mackie.house
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: bazarr
+            port:
+              number: 6767

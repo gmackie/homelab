@@ -1,0 +1,296 @@
+# Authelia - Centralized authentication and authorization
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: auth
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: authelia-secrets
+  namespace: auth
+type: Opaque
+stringData:
+  JWT_SECRET: "a_very_important_secret_change_me"  # Generate with: openssl rand -base64 32
+  SESSION_SECRET: "another_very_important_secret"   # Generate with: openssl rand -base64 32
+  STORAGE_PASSWORD: "password_for_postgres"
+  STORAGE_ENCRYPTION_KEY: "a_32_character_encryption_key_!!"  # Must be exactly 32 characters
+  SMTP_PASSWORD: "your_smtp_password"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authelia-config
+  namespace: auth
+data:
+  configuration.yml: |
+    theme: dark
+    
+    server:
+      host: 0.0.0.0
+      port: 9091
+      
+    log:
+      level: info
+      
+    totp:
+      issuer: mackie.house
+      period: 30
+      skew: 1
+      
+    authentication_backend:
+      password_reset:
+        disable: false
+      file:
+        path: /config/users_database.yml
+        password:
+          algorithm: argon2id
+          iterations: 1
+          key_length: 32
+          salt_length: 16
+          memory: 64
+          parallelism: 8
+          
+    access_control:
+      default_policy: deny
+      rules:
+        # Public access
+        - domain: mackie.house
+          policy: bypass
+        - domain: requests.mackie.house
+          policy: bypass
+        - domain: secure.mackie.house
+          policy: two_factor
+          
+        # Admin services - two factor required
+        - domain:
+          - dashboard.mackie.house
+          - longhorn.mackie.house
+          - grafana.mackie.house
+          - prometheus.mackie.house
+          - alertmanager.mackie.house
+          - pihole.mackie.house
+          policy: two_factor
+          subject: ["group:admins"]
+          
+        # Media services - single factor
+        - domain:
+          - jellyfin.mackie.house
+          - sonarr.mackie.house
+          - radarr.mackie.house
+          - prowlarr.mackie.house
+          - sabnzbd.mackie.house
+          - bazarr.mackie.house
+          policy: one_factor
+          
+        # Home automation - single factor
+        - domain:
+          - ha.mackie.house
+          - nodered.mackie.house
+          policy: one_factor
+          
+    session:
+      name: authelia_session
+      domain: mackie.house
+      same_site: lax
+      secret: ${SESSION_SECRET}
+      expiration: 1h
+      inactivity: 5m
+      remember_me_duration: 1M
+      
+    regulation:
+      max_retries: 3
+      find_time: 2m
+      ban_time: 5m
+      
+    storage:
+      encryption_key: ${STORAGE_ENCRYPTION_KEY}
+      postgres:
+        host: authelia-postgres
+        port: 5432
+        database: authelia
+        username: authelia
+        password: ${STORAGE_PASSWORD}
+        
+    notifier:
+      smtp:
+        host: smtp.gmail.com
+        port: 587
+        username: your-email@gmail.com
+        password: ${SMTP_PASSWORD}
+        sender: "Authelia <no-reply@mackie.house>"
+        
+  users_database.yml: |
+    users:
+      admin:
+        displayname: "Admin User"
+        password: "$argon2id$v=19$m=65536,t=1,p=8$..."  # Generate with docker run authelia/authelia:latest authelia hash-password
+        email: admin@example.com
+        groups:
+          - admins
+          - users
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: authelia-postgres
+  namespace: auth
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: authelia-postgres
+  namespace: auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: authelia-postgres
+  template:
+    metadata:
+      labels:
+        app: authelia-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: authelia
+        - name: POSTGRES_USER
+          value: authelia
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: authelia-secrets
+              key: STORAGE_PASSWORD
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: authelia-postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: authelia-postgres
+  namespace: auth
+spec:
+  selector:
+    app: authelia-postgres
+  ports:
+  - port: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: authelia
+  namespace: auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: authelia
+  template:
+    metadata:
+      labels:
+        app: authelia
+    spec:
+      containers:
+      - name: authelia
+        image: authelia/authelia:latest
+        ports:
+        - containerPort: 9091
+        envFrom:
+        - secretRef:
+            name: authelia-secrets
+        volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 9091
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: config
+        configMap:
+          name: authelia-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: authelia
+  namespace: auth
+spec:
+  selector:
+    app: authelia
+  ports:
+  - port: 80
+    targetPort: 9091
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: authelia
+  namespace: auth
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - auth.mackie.house
+    secretName: authelia-tls
+  rules:
+  - host: auth.mackie.house
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: authelia
+            port:
+              number: 80
+---
+# Traefik middleware for Authelia
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: authelia
+  namespace: auth
+spec:
+  forwardAuth:
+    address: http://authelia.auth/api/verify?rd=https://auth.mackie.house
+    trustForwardHeader: true
+    authResponseHeaders:
+      - Remote-User
+      - Remote-Groups
+      - Remote-Name
+      - Remote-Email

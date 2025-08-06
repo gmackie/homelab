@@ -1,0 +1,121 @@
+# Uptime Kuma - Status monitoring
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uptime-kuma-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: uptime-kuma
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: uptime-kuma
+  template:
+    metadata:
+      labels:
+        app: uptime-kuma
+    spec:
+      containers:
+      - name: uptime-kuma
+        image: louislam/uptime-kuma:latest
+        ports:
+        - containerPort: 3001
+        volumeMounts:
+        - name: data
+          mountPath: /app/data
+        env:
+        - name: UPTIME_KUMA_DISABLE_FRAME_SAMEORIGIN
+          value: "1"
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3001
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: uptime-kuma-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: uptime-kuma
+  namespace: monitoring
+spec:
+  selector:
+    app: uptime-kuma
+  ports:
+  - port: 3001
+    targetPort: 3001
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: uptime-kuma
+  namespace: monitoring
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-local-only@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - status.mackie.house
+    secretName: uptime-kuma-tls
+  rules:
+  - host: status.mackie.house
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: uptime-kuma
+            port:
+              number: 3001
+---
+# Public status page
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: uptime-kuma-public
+  namespace: monitoring
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - status-public.mackie.house
+    secretName: uptime-kuma-public-tls
+  rules:
+  - host: status-public.mackie.house
+    http:
+      paths:
+      - path: /status/
+        pathType: Prefix
+        backend:
+          service:
+            name: uptime-kuma
+            port:
+              number: 3001

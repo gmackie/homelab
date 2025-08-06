@@ -1,0 +1,123 @@
+# Patches to add Authelia forward auth to all services
+
+# Monitoring services
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kube-prometheus-stack-grafana
+  namespace: monitoring
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kube-prometheus-stack-prometheus
+  namespace: monitoring
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kube-prometheus-stack-alertmanager
+  namespace: monitoring
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kubernetes-dashboard
+  namespace: kubernetes-dashboard
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+
+# Media services
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jellyfin
+  namespace: media
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sonarr
+  namespace: media
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: radarr
+  namespace: media
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prowlarr
+  namespace: media
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sabnzbd
+  namespace: media
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bazarr
+  namespace: media
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+
+# Home automation
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: home-assistant
+  namespace: home-automation
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: node-red
+  namespace: home-automation
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+
+# Storage
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: longhorn
+  namespace: longhorn-system
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd
+
+# Network services
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pihole
+  namespace: pihole
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: auth-authelia@kubernetescrd

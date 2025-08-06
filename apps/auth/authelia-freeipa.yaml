@@ -1,0 +1,193 @@
+# Updated Authelia configuration to use FreeIPA LDAP
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authelia-config
+  namespace: auth
+data:
+  configuration.yml: |
+    theme: dark
+    
+    server:
+      host: 0.0.0.0
+      port: 9091
+      
+    log:
+      level: info
+      
+    totp:
+      issuer: mackie.house
+      period: 30
+      skew: 1
+      
+    authentication_backend:
+      password_reset:
+        disable: false
+      ldap:
+        implementation: custom
+        url: ldap://freeipa.identity:389
+        timeout: 5s
+        start_tls: false
+        tls:
+          skip_verify: true
+        base_dn: dc=mackie,dc=house
+        username_attribute: uid
+        additional_users_dn: cn=users,cn=accounts
+        users_filter: (&(objectClass=posixAccount)(uid={username}))
+        additional_groups_dn: cn=groups,cn=accounts
+        groups_filter: (&(objectClass=groupOfNames)(member={dn}))
+        group_name_attribute: cn
+        mail_attribute: mail
+        display_name_attribute: displayName
+        user: uid=authelia,cn=users,cn=accounts,dc=mackie,dc=house
+        password: ${LDAP_PASSWORD}
+        
+    access_control:
+      default_policy: deny
+      networks:
+      - name: internal
+        networks:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+      rules:
+        # Public access
+        - domain: mackie.house
+          policy: bypass
+        - domain: requests.mackie.house
+          policy: bypass
+        - domain: vault.mackie.house
+          policy: two_factor
+        - domain: status-public.mackie.house
+          policy: bypass
+          resources:
+          - '^/status/.*'
+          
+        # Secure dashboard - requires 2FA
+        - domain: secure.mackie.house
+          policy: two_factor
+          
+        # Admin services - family-admins group only with 2FA
+        - domain:
+          - dashboard.mackie.house
+          - longhorn.mackie.house
+          - pihole.mackie.house
+          - ipa.mackie.house
+          policy: two_factor
+          subject:
+          - "group:family-admins"
+          
+        # Monitoring - admins and monitoring users
+        - domain:
+          - grafana.mackie.house
+          - prometheus.mackie.house
+          - alertmanager.mackie.house
+          - status.mackie.house
+          policy: one_factor
+          subject:
+          - "group:family-admins"
+          - "group:monitoring-users"
+          
+        # Media services - media users and admins
+        - domain:
+          - jellyfin.mackie.house
+          - sonarr.mackie.house
+          - radarr.mackie.house
+          - prowlarr.mackie.house
+          - sabnzbd.mackie.house
+          - bazarr.mackie.house
+          policy: one_factor
+          subject:
+          - "group:family-admins"
+          - "group:media-admins"
+          - "group:media-users"
+          
+        # Home automation - family users
+        - domain:
+          - ha.mackie.house
+          - nodered.mackie.house
+          policy: one_factor
+          subject:
+          - "group:family-admins"
+          - "group:family-users"
+          - "group:home-automation"
+          
+        # Internal network bypass for certain services
+        - domain: '*.mackie.house'
+          policy: one_factor
+          networks:
+          - internal
+          subject:
+          - "group:family-users"
+          
+    session:
+      name: authelia_session
+      domain: mackie.house
+      same_site: lax
+      secret: ${SESSION_SECRET}
+      expiration: 1h
+      inactivity: 5m
+      remember_me_duration: 1M
+      
+    regulation:
+      max_retries: 3
+      find_time: 2m
+      ban_time: 5m
+      
+    storage:
+      encryption_key: ${STORAGE_ENCRYPTION_KEY}
+      postgres:
+        host: authelia-postgres
+        port: 5432
+        database: authelia
+        username: authelia
+        password: ${STORAGE_PASSWORD}
+        
+    notifier:
+      smtp:
+        host: smtp-relay
+        port: 25
+        sender: "Authelia <authelia@mackie.house>"
+        disable_require_tls: true
+---
+# Update secret to include LDAP password
+apiVersion: v1
+kind: Secret
+metadata:
+  name: authelia-secrets
+  namespace: auth
+type: Opaque
+data:
+  JWT_SECRET: "YV92ZXJ5X2ltcG9ydGFudF9zZWNyZXRfY2hhbmdlX21l"  # base64 encoded
+  SESSION_SECRET: "YW5vdGhlcl92ZXJ5X2ltcG9ydGFudF9zZWNyZXQ="     # base64 encoded
+  STORAGE_PASSWORD: "cGFzc3dvcmRfZm9yX3Bvc3RncmVz"                # base64 encoded
+  STORAGE_ENCRYPTION_KEY: "YV8zMl9jaGFyYWN0ZXJfZW5jcnlwdGlvbl9rZXlfISE="  # base64 encoded
+  LDAP_PASSWORD: "" # Will be populated from freeipa-service-accounts secret
+---
+# Job to sync LDAP password from FreeIPA service accounts
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sync-authelia-ldap-password
+  namespace: auth
+spec:
+  template:
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: sync
+        image: bitnami/kubectl:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Get LDAP password from FreeIPA service accounts secret
+          LDAP_PASS=$(kubectl get secret freeipa-service-accounts -n auth -o jsonpath='{.data.authelia-password}')
+          
+          # Update Authelia secret
+          kubectl patch secret authelia-secrets -n auth --type='json' \
+            -p='[{"op": "replace", "path": "/data/LDAP_PASSWORD", "value": "'$LDAP_PASS'"}]'
+          
+          # Restart Authelia to pick up new password
+          kubectl rollout restart deployment/authelia -n auth
+      restartPolicy: OnFailure

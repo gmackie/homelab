@@ -1,0 +1,95 @@
+# Resource quotas and limits for namespaces
+---
+# Media namespace quota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: media-quota
+  namespace: media
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: "20Gi"
+    limits.cpu: "20"
+    limits.memory: "40Gi"
+    persistentvolumeclaims: "20"
+    requests.storage: "2Ti"
+---
+# Monitoring namespace quota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: monitoring-quota
+  namespace: monitoring
+spec:
+  hard:
+    requests.cpu: "5"
+    requests.memory: "10Gi"
+    limits.cpu: "10"
+    limits.memory: "20Gi"
+    persistentvolumeclaims: "10"
+    requests.storage: "100Gi"
+---
+# Home automation namespace quota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: home-automation-quota
+  namespace: home-automation
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: "8Gi"
+    limits.cpu: "8"
+    limits.memory: "16Gi"
+    persistentvolumeclaims: "10"
+    requests.storage: "50Gi"
+---
+# Default limit ranges
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: media
+spec:
+  limits:
+  - default:
+      cpu: "1"
+      memory: "2Gi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "256Mi"
+    type: Container
+  - max:
+      storage: "100Gi"
+    type: PersistentVolumeClaim
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: monitoring
+spec:
+  limits:
+  - default:
+      cpu: "500m"
+      memory: "1Gi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "128Mi"
+    type: Container
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: home-automation
+spec:
+  limits:
+  - default:
+      cpu: "1"
+      memory: "2Gi"
+    defaultRequest:
+      cpu: "200m"
+      memory: "512Mi"
+    type: Container

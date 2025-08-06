@@ -1,0 +1,292 @@
+# ServiceMonitors for Prometheus scraping
+---
+# Loki monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: loki
+  namespace: logging
+spec:
+  selector:
+    matchLabels:
+      app: loki
+  endpoints:
+  - port: http-metrics
+    interval: 30s
+    path: /metrics
+---
+# Promtail monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: promtail
+  namespace: logging
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  endpoints:
+  - port: http-metrics
+    interval: 30s
+    path: /metrics
+---
+# Authelia monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: authelia
+  namespace: auth
+spec:
+  selector:
+    matchLabels:
+      app: authelia
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /api/health
+---
+# FreeIPA monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: freeipa
+  namespace: identity
+spec:
+  selector:
+    matchLabels:
+      app: freeipa
+  endpoints:
+  - port: https
+    interval: 60s
+    path: /metrics
+    scheme: https
+    tlsConfig:
+      insecureSkipVerify: true
+---
+# Longhorn monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: longhorn
+  namespace: longhorn-system
+spec:
+  selector:
+    matchLabels:
+      app: longhorn-manager
+  endpoints:
+  - port: manager
+    interval: 30s
+    path: /metrics
+---
+# Traefik monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: traefik
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+---
+# Jellyfin monitoring (via custom exporter)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jellyfin-exporter-config
+  namespace: media
+data:
+  config.yml: |
+    jellyfin:
+      url: http://jellyfin:8096
+      api_key: ${JELLYFIN_API_KEY}
+    metrics:
+      - name: jellyfin_users_total
+        help: Total number of users
+        type: gauge
+      - name: jellyfin_items_total
+        help: Total number of media items
+        type: gauge
+      - name: jellyfin_playback_sessions
+        help: Current playback sessions
+        type: gauge
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jellyfin-exporter
+  namespace: media
+  labels:
+    app: jellyfin-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jellyfin-exporter
+  template:
+    metadata:
+      labels:
+        app: jellyfin-exporter
+      annotations:
+        promtail.io/scrape: "true"
+    spec:
+      containers:
+      - name: exporter
+        image: amdbarrett/jellyfin_exporter:latest
+        env:
+        - name: JELLYFIN_URL
+          value: "http://jellyfin:8096"
+        - name: JELLYFIN_APIKEY
+          valueFrom:
+            secretKeyRef:
+              name: jellyfin-api
+              key: apikey
+        ports:
+        - containerPort: 9090
+          name: metrics
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jellyfin-exporter
+  namespace: media
+  labels:
+    app: jellyfin-exporter
+spec:
+  selector:
+    app: jellyfin-exporter
+  ports:
+  - port: 9090
+    targetPort: 9090
+    name: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: jellyfin-exporter
+  namespace: media
+spec:
+  selector:
+    matchLabels:
+      app: jellyfin-exporter
+  endpoints:
+  - port: metrics
+    interval: 30s
+---
+# Home Assistant monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: home-assistant
+  namespace: home-automation
+spec:
+  selector:
+    matchLabels:
+      app: home-assistant
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /api/prometheus
+    bearerTokenSecret:
+      name: home-assistant-token
+      key: token
+---
+# Pi-hole monitoring
+apiVersion: v1
+kind: Service
+metadata:
+  name: pihole-exporter
+  namespace: pihole
+  labels:
+    app: pihole-exporter
+spec:
+  selector:
+    app: pihole
+  ports:
+  - port: 9617
+    targetPort: 9617
+    name: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: pihole
+  namespace: pihole
+spec:
+  selector:
+    matchLabels:
+      app: pihole-exporter
+  endpoints:
+  - port: metrics
+    interval: 30s
+---
+# Node-RED monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: node-red
+  namespace: home-automation
+spec:
+  selector:
+    matchLabels:
+      app: node-red
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics
+---
+# Uptime Kuma monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: uptime-kuma
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: uptime-kuma
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics
+---
+# Vaultwarden monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vaultwarden
+  namespace: tools
+spec:
+  selector:
+    matchLabels:
+      app: vaultwarden
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /alive
+---
+# Cert-manager monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cert-manager
+  namespace: cert-manager
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cert-manager
+  endpoints:
+  - port: tcp-prometheus-servicemonitor
+    interval: 30s
+    path: /metrics

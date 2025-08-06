@@ -1,0 +1,211 @@
+# SMTP Relay for sending notifications
+apiVersion: v1
+kind: Secret
+metadata:
+  name: smtp-relay-auth
+  namespace: kube-system
+type: Opaque
+stringData:
+  # Gmail App Password (not your regular password)
+  # Generate at: https://myaccount.google.com/apppasswords
+  SMTP_USERNAME: "your-email@gmail.com"
+  SMTP_PASSWORD: "your-app-specific-password"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smtp-relay-config
+  namespace: kube-system
+data:
+  main.cf: |
+    # Basic configuration
+    smtpd_banner = $myhostname ESMTP $mail_name
+    biff = no
+    append_dot_mydomain = no
+    readme_directory = no
+    
+    # Network configuration
+    myhostname = smtp-relay.mackie.house
+    mydestination = 
+    relayhost = [smtp.gmail.com]:587
+    mynetworks = 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8
+    inet_interfaces = all
+    inet_protocols = ipv4
+    
+    # Security
+    smtp_use_tls = yes
+    smtp_sasl_auth_enable = yes
+    smtp_sasl_security_options = noanonymous
+    smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
+    smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt
+    smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
+    
+    # Size limits
+    message_size_limit = 10485760
+    mailbox_size_limit = 0
+    
+    # Rate limiting
+    smtp_destination_rate_delay = 1s
+    smtp_destination_concurrency_limit = 5
+    
+  sasl_passwd.template: |
+    [smtp.gmail.com]:587 ${SMTP_USERNAME}:${SMTP_PASSWORD}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smtp-relay
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: smtp-relay
+  template:
+    metadata:
+      labels:
+        app: smtp-relay
+    spec:
+      containers:
+      - name: postfix
+        image: boky/postfix:latest
+        ports:
+        - containerPort: 25
+        env:
+        - name: ALLOWED_SENDER_DOMAINS
+          value: "mackie.house"
+        - name: POSTFIX_myhostname
+          value: "smtp-relay.mackie.house"
+        - name: POSTFIX_mynetworks
+          value: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8"
+        - name: POSTFIX_message_size_limit
+          value: "10485760"  # 10MB
+        envFrom:
+        - secretRef:
+            name: smtp-relay-auth
+        volumeMounts:
+        - name: config
+          mountPath: /etc/postfix/main.cf
+          subPath: main.cf
+        - name: spool
+          mountPath: /var/spool/postfix
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        livenessProbe:
+          tcpSocket:
+            port: 25
+          initialDelaySeconds: 30
+          periodSeconds: 60
+      volumes:
+      - name: config
+        configMap:
+          name: smtp-relay-config
+      - name: spool
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smtp-relay
+  namespace: kube-system
+spec:
+  selector:
+    app: smtp-relay
+  ports:
+  - name: smtp
+    port: 25
+    targetPort: 25
+  - name: submission
+    port: 587
+    targetPort: 25
+---
+# Allow other namespaces to use the SMTP relay
+apiVersion: v1
+kind: Service
+metadata:
+  name: smtp-relay
+  namespace: default
+spec:
+  type: ExternalName
+  externalName: smtp-relay.kube-system.svc.cluster.local
+  ports:
+  - port: 25
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smtp-relay
+  namespace: monitoring
+spec:
+  type: ExternalName
+  externalName: smtp-relay.kube-system.svc.cluster.local
+  ports:
+  - port: 25
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smtp-relay
+  namespace: media
+spec:
+  type: ExternalName
+  externalName: smtp-relay.kube-system.svc.cluster.local
+  ports:
+  - port: 25
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smtp-relay
+  namespace: auth
+spec:
+  type: ExternalName
+  externalName: smtp-relay.kube-system.svc.cluster.local
+  ports:
+  - port: 25
+---
+# Documentation ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smtp-relay-docs
+  namespace: kube-system
+data:
+  README.md: |
+    # SMTP Relay Configuration
+    
+    This SMTP relay is configured to send emails through Gmail.
+    
+    ## Usage in Applications
+    
+    Configure your applications with these settings:
+    - SMTP Host: `smtp-relay` (or `smtp-relay.kube-system` from other namespaces)
+    - SMTP Port: `25`
+    - Authentication: None required (relay handles it)
+    - Encryption: None (internal cluster traffic)
+    
+    ## Supported Services
+    
+    The following services are configured to use this relay:
+    - AlertManager: `smtp-relay:25`
+    - Authelia: `smtp-relay:25`
+    - Vaultwarden: `smtp-relay:25`
+    - Sonarr/Radarr: `smtp-relay:25`
+    
+    ## Gmail Setup
+    
+    1. Enable 2-factor authentication on your Gmail account
+    2. Generate an app-specific password: https://myaccount.google.com/apppasswords
+    3. Update the secret in `smtp-relay-auth`
+    
+    ## Testing
+    
+    ```bash
+    kubectl run -it --rm debug --image=nicolaka/netshoot --restart=Never -- sh
+    echo "Test email" | mail -s "Test from K8s" your-email@example.com
+    ```

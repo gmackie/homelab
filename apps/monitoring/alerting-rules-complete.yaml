@@ -1,0 +1,379 @@
+# Comprehensive Alerting Rules for all services
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: homelab-complete-alerts
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+spec:
+  groups:
+  # Infrastructure Alerts
+  - name: infrastructure.rules
+    interval: 30s
+    rules:
+    - alert: NodeDown
+      expr: up{job="node-exporter"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        service: infrastructure
+      annotations:
+        summary: "Node {{ $labels.instance }} is down"
+        description: "Node {{ $labels.instance }} has been down for more than 2 minutes"
+        runbook_url: "https://mackie.house/runbooks/node-down"
+    
+    - alert: HighCPUUsage
+      expr: (100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 85
+      for: 10m
+      labels:
+        severity: warning
+        service: infrastructure
+      annotations:
+        summary: "High CPU usage on {{ $labels.instance }}"
+        description: "CPU usage is {{ $value }}% for more than 10 minutes"
+    
+    - alert: HighMemoryUsage
+      expr: ((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes) * 100 > 85
+      for: 10m
+      labels:
+        severity: warning
+        service: infrastructure
+      annotations:
+        summary: "High memory usage on {{ $labels.instance }}"
+        description: "Memory usage is {{ $value }}% for more than 10 minutes"
+    
+    - alert: DiskSpaceLow
+      expr: ((node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_avail_bytes{mountpoint="/"}) / node_filesystem_size_bytes{mountpoint="/"}) * 100 > 85
+      for: 5m
+      labels:
+        severity: warning
+        service: infrastructure
+      annotations:
+        summary: "Low disk space on {{ $labels.instance }}"
+        description: "Disk usage is {{ $value }}% on root filesystem"
+    
+    - alert: NetworkInterfaceDown
+      expr: node_network_up{device!~"lo|docker.*|veth.*"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        service: infrastructure
+      annotations:
+        summary: "Network interface {{ $labels.device }} is down on {{ $labels.instance }}"
+  
+  # Kubernetes Alerts
+  - name: kubernetes.rules
+    interval: 30s
+    rules:
+    - alert: PodCrashLooping
+      expr: rate(kube_pod_container_status_restarts_total[15m]) > 0.1
+      for: 5m
+      labels:
+        severity: warning
+        service: kubernetes
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is crash looping"
+        description: "Pod has restarted {{ $value }} times in the last 15 minutes"
+        runbook_url: "https://mackie.house/runbooks/pod-crash-loop"
+    
+    - alert: PodNotReady
+      expr: kube_pod_status_ready{condition="false"} == 1
+      for: 15m
+      labels:
+        severity: warning
+        service: kubernetes
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is not ready"
+        description: "Pod has been not ready for more than 15 minutes"
+    
+    - alert: DeploymentReplicasMismatch
+      expr: kube_deployment_spec_replicas != kube_deployment_status_replicas_available
+      for: 10m
+      labels:
+        severity: warning
+        service: kubernetes
+      annotations:
+        summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} replica mismatch"
+        description: "Deployment has {{ $value }} replicas available, expected {{ $labels.spec_replicas }}"
+    
+    - alert: PersistentVolumeError
+      expr: kube_persistentvolume_status_phase{phase=~"Failed|Pending"} > 0
+      for: 5m
+      labels:
+        severity: critical
+        service: storage
+      annotations:
+        summary: "Persistent volume {{ $labels.persistentvolume }} is in {{ $labels.phase }} state"
+  
+  # Storage Alerts
+  - name: storage.rules
+    interval: 30s
+    rules:
+    - alert: LonghornVolumeError
+      expr: longhorn_volume_robustness == 3
+      for: 5m
+      labels:
+        severity: critical
+        service: storage
+      annotations:
+        summary: "Longhorn volume {{ $labels.volume }} is in error state"
+        description: "Volume has been in error state for 5 minutes"
+    
+    - alert: LonghornDiskSpaceLow
+      expr: (longhorn_node_storage_usage_bytes / longhorn_node_storage_capacity_bytes) * 100 > 85
+      for: 10m
+      labels:
+        severity: warning
+        service: storage
+      annotations:
+        summary: "Longhorn node {{ $labels.node }} disk space low"
+        description: "Disk usage is {{ $value }}%"
+    
+    - alert: PVCUsageHigh
+      expr: (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * 100 > 85
+      for: 10m
+      labels:
+        severity: warning
+        service: storage
+      annotations:
+        summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} usage high"
+        description: "PVC is {{ $value }}% full"
+  
+  # Authentication Alerts
+  - name: authentication.rules
+    interval: 30s
+    rules:
+    - alert: HighAuthenticationFailureRate
+      expr: rate(authelia_authentication_attempts_total{success="false"}[5m]) > 0.5
+      for: 5m
+      labels:
+        severity: warning
+        service: auth
+      annotations:
+        summary: "High authentication failure rate"
+        description: "Failed auth rate is {{ $value }} per second"
+        runbook_url: "https://mackie.house/runbooks/auth-failures"
+    
+    - alert: AutheliaDown
+      expr: up{job="authelia"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        service: auth
+      annotations:
+        summary: "Authelia is down"
+        description: "Authentication service has been down for 2 minutes"
+    
+    - alert: FreeIPADown
+      expr: up{job="freeipa"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        service: auth
+      annotations:
+        summary: "FreeIPA is down"
+        description: "Identity management service has been down for 5 minutes"
+    
+    - alert: TooManySessions
+      expr: authelia_session_active_total > 100
+      for: 5m
+      labels:
+        severity: info
+        service: auth
+      annotations:
+        summary: "High number of active sessions"
+        description: "{{ $value }} active sessions"
+  
+  # Media Stack Alerts
+  - name: media.rules
+    interval: 30s
+    rules:
+    - alert: JellyfinDown
+      expr: up{job="jellyfin-exporter"} == 0
+      for: 5m
+      labels:
+        severity: warning
+        service: media
+      annotations:
+        summary: "Jellyfin is down"
+        description: "Media server has been unreachable for 5 minutes"
+    
+    - alert: HighStreamCount
+      expr: jellyfin_playback_sessions > 5
+      for: 5m
+      labels:
+        severity: info
+        service: media
+      annotations:
+        summary: "High number of Jellyfin streams"
+        description: "{{ $value }} concurrent streams active"
+    
+    - alert: SonarrDown
+      expr: up{job="exportarr-sonarr"} == 0
+      for: 5m
+      labels:
+        severity: warning
+        service: media
+      annotations:
+        summary: "Sonarr is down"
+    
+    - alert: RadarrDown
+      expr: up{job="exportarr-radarr"} == 0
+      for: 5m
+      labels:
+        severity: warning
+        service: media
+      annotations:
+        summary: "Radarr is down"
+    
+    - alert: DownloadQueueStalled
+      expr: (sabnzbd_queue_size_bytes > 0) and (rate(sabnzbd_downloaded_bytes[10m]) == 0)
+      for: 30m
+      labels:
+        severity: warning
+        service: media
+      annotations:
+        summary: "Download queue is stalled"
+        description: "No download progress for 30 minutes with items in queue"
+    
+    - alert: MediaImportFailure
+      expr: increase(sonarr_import_failures_total[1h]) > 0
+      labels:
+        severity: warning
+        service: media
+      annotations:
+        summary: "Media import failures detected"
+        description: "{{ $value }} import failures in the last hour"
+  
+  # Network Alerts
+  - name: network.rules
+    interval: 30s
+    rules:
+    - alert: PiHoleDown
+      expr: up{job="pihole"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        service: network
+      annotations:
+        summary: "Pi-hole is down"
+        description: "DNS service has been down for 5 minutes"
+    
+    - alert: DNSQueryRateHigh
+      expr: rate(pihole_dns_queries_today[5m]) > 100
+      for: 10m
+      labels:
+        severity: info
+        service: network
+      annotations:
+        summary: "High DNS query rate"
+        description: "{{ $value }} queries per second"
+    
+    - alert: TraefikBackendDown
+      expr: traefik_backend_server_up == 0
+      for: 5m
+      labels:
+        severity: warning
+        service: network
+      annotations:
+        summary: "Traefik backend {{ $labels.backend }} is down"
+    
+    - alert: CertificateExpiringSoon
+      expr: (certmanager_certificate_expiration_timestamp_seconds - time()) / 86400 < 30
+      for: 1h
+      labels:
+        severity: warning
+        service: network
+      annotations:
+        summary: "Certificate {{ $labels.name }} expiring soon"
+        description: "Certificate expires in {{ $value }} days"
+  
+  # Home Automation Alerts
+  - name: home-automation.rules
+    interval: 30s
+    rules:
+    - alert: HomeAssistantDown
+      expr: up{job="home-assistant"} == 0
+      for: 5m
+      labels:
+        severity: warning
+        service: home-automation
+      annotations:
+        summary: "Home Assistant is down"
+    
+    - alert: NodeRedDown
+      expr: up{job="node-red"} == 0
+      for: 5m
+      labels:
+        severity: warning
+        service: home-automation
+      annotations:
+        summary: "Node-RED is down"
+    
+    - alert: AutomationFailure
+      expr: increase(home_assistant_automation_errors_total[1h]) > 5
+      labels:
+        severity: warning
+        service: home-automation
+      annotations:
+        summary: "Home automation errors detected"
+        description: "{{ $value }} automation errors in the last hour"
+  
+  # Backup Alerts
+  - name: backup.rules
+    interval: 30s
+    rules:
+    - alert: BackupJobFailed
+      expr: kube_job_failed{job_name=~"backup-.*"} > 0
+      for: 1h
+      labels:
+        severity: critical
+        service: backup
+      annotations:
+        summary: "Backup job {{ $labels.job_name }} failed"
+        description: "Backup job has been in failed state for 1 hour"
+        runbook_url: "https://mackie.house/runbooks/backup-failure"
+    
+    - alert: BackupNotRunning
+      expr: time() - kube_job_status_completion_time{job_name=~"backup-.*"} > 86400
+      for: 1h
+      labels:
+        severity: warning
+        service: backup
+      annotations:
+        summary: "Backup job {{ $labels.job_name }} hasn't run in 24 hours"
+  
+  # Log Alerts
+  - name: logging.rules
+    interval: 30s
+    rules:
+    - alert: HighErrorLogRate
+      expr: |
+        sum(rate({level=~"error|critical"} [5m])) by (app) > 1
+      for: 5m
+      labels:
+        severity: warning
+        service: logging
+      annotations:
+        summary: "High error log rate for {{ $labels.app }}"
+        description: "{{ $value }} errors per second"
+    
+    - alert: LokiDown
+      expr: up{job="loki"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        service: logging
+      annotations:
+        summary: "Loki is down"
+        description: "Log aggregation service is down"
+    
+    - alert: PromtailDown
+      expr: up{job="promtail"} == 0
+      for: 5m
+      labels:
+        severity: warning
+        service: logging
+      annotations:
+        summary: "Promtail is down on {{ $labels.instance }}"

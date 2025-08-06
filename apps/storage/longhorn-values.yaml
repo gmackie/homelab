@@ -1,0 +1,27 @@
+# Longhorn Helm values for homelab
+defaultSettings:
+  defaultReplicaCount: 1  # Single node for now
+  createDefaultDiskLabeledNodes: true
+  defaultDataPath: "/var/lib/longhorn"
+  backupTarget: ""  # Configure S3 backup target if needed
+  
+persistence:
+  defaultClass: true
+  defaultClassReplicaCount: 1
+  
+ingress:
+  enabled: true
+  ingressClassName: traefik
+  host: longhorn.mackie.house
+  tls: true
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-local-only@kubernetescrd
+    
+resources:
+  limits:
+    cpu: 500m
+    memory: 1Gi
+  requests:
+    cpu: 100m
+    memory: 128Mi

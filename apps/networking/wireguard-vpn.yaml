@@ -1,0 +1,168 @@
+# WireGuard VPN for secure remote access
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vpn
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wireguard-config
+  namespace: vpn
+type: Opaque
+stringData:
+  wg0.conf: |
+    [Interface]
+    Address = 10.13.13.1/24
+    ListenPort = 51820
+    PrivateKey = YOUR_SERVER_PRIVATE_KEY
+    PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+    
+    # Peer 1 - Your laptop
+    [Peer]
+    PublicKey = YOUR_LAPTOP_PUBLIC_KEY
+    AllowedIPs = 10.13.13.2/32
+    
+    # Peer 2 - Your phone
+    [Peer]
+    PublicKey = YOUR_PHONE_PUBLIC_KEY
+    AllowedIPs = 10.13.13.3/32
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wireguard-scripts
+  namespace: vpn
+data:
+  init.sh: |
+    #!/bin/bash
+    # Generate keys if they don't exist
+    if [ ! -f /etc/wireguard/privatekey ]; then
+      wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
+      echo "Generated new WireGuard keys"
+      echo "Public key: $(cat /etc/wireguard/publickey)"
+    fi
+    
+    # Copy config
+    cp /config/wg0.conf /etc/wireguard/wg0.conf
+    
+    # Enable IP forwarding
+    sysctl -w net.ipv4.ip_forward=1
+    sysctl -w net.ipv6.conf.all.forwarding=1
+    
+    # Start WireGuard
+    wg-quick up wg0
+    
+    # Keep container running
+    sleep infinity
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wireguard
+  namespace: vpn
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wireguard
+  template:
+    metadata:
+      labels:
+        app: wireguard
+    spec:
+      containers:
+      - name: wireguard
+        image: lscr.io/linuxserver/wireguard:latest
+        securityContext:
+          capabilities:
+            add:
+              - NET_ADMIN
+              - SYS_MODULE
+          privileged: true
+        ports:
+        - containerPort: 51820
+          protocol: UDP
+        env:
+        - name: PUID
+          value: "1000"
+        - name: PGID
+          value: "1000"
+        - name: TZ
+          value: "America/New_York"
+        - name: PEERS
+          value: "laptop,phone"
+        - name: PEERDNS
+          value: "192.168.1.53"  # Pi-hole DNS
+        - name: INTERNAL_SUBNET
+          value: "10.13.13.0/24"
+        - name: SERVERURL
+          value: "vpn.mackie.house"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+      volumes:
+      - name: config
+        secret:
+          secretName: wireguard-config
+      - name: modules
+        hostPath:
+          path: /lib/modules
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wireguard
+  namespace: vpn
+spec:
+  type: LoadBalancer
+  selector:
+    app: wireguard
+  ports:
+  - port: 51820
+    targetPort: 51820
+    protocol: UDP
+  loadBalancerIP: 192.168.1.201  # Static IP from MetalLB pool
+---
+# Client configuration generator
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wireguard-client-configs
+  namespace: vpn
+data:
+  laptop.conf: |
+    [Interface]
+    Address = 10.13.13.2/32
+    PrivateKey = YOUR_LAPTOP_PRIVATE_KEY
+    DNS = 192.168.1.53
+    
+    [Peer]
+    PublicKey = YOUR_SERVER_PUBLIC_KEY
+    Endpoint = your-home-ip:51820
+    AllowedIPs = 192.168.1.0/24, 10.13.13.0/24
+    PersistentKeepalive = 25
+    
+  phone.conf: |
+    [Interface]
+    Address = 10.13.13.3/32
+    PrivateKey = YOUR_PHONE_PRIVATE_KEY
+    DNS = 192.168.1.53
+    
+    [Peer]
+    PublicKey = YOUR_SERVER_PUBLIC_KEY
+    Endpoint = your-home-ip:51820
+    AllowedIPs = 192.168.1.0/24, 10.13.13.0/24
+    PersistentKeepalive = 25

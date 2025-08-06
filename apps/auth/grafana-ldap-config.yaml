@@ -1,0 +1,120 @@
+# Grafana LDAP Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-ldap-config
+  namespace: monitoring
+data:
+  ldap.toml: |
+    [[servers]]
+    # FreeIPA LDAP server
+    host = "freeipa.identity"
+    port = 389
+    use_ssl = false
+    start_tls = false
+    ssl_skip_verify = true
+    
+    # Bind user
+    bind_dn = "uid=grafana,cn=users,cn=accounts,dc=mackie,dc=house"
+    bind_password = '${LDAP_BIND_PASSWORD}'
+    
+    # Search settings
+    search_filter = "(uid=%s)"
+    search_base_dns = ["cn=users,cn=accounts,dc=mackie,dc=house"]
+    
+    # Group search
+    group_search_filter = "(&(objectClass=groupOfNames)(member=%s))"
+    group_search_base_dns = ["cn=groups,cn=accounts,dc=mackie,dc=house"]
+    
+    [servers.attributes]
+    username = "uid"
+    name = "cn"
+    surname = "sn"
+    member_of = "memberOf"
+    email = "mail"
+    
+    # Group mappings - FreeIPA groups to Grafana roles
+    [[servers.group_mappings]]
+    group_dn = "cn=family-admins,cn=groups,cn=accounts,dc=mackie,dc=house"
+    org_role = "Admin"
+    grafana_admin = true
+    
+    [[servers.group_mappings]]
+    group_dn = "cn=monitoring-users,cn=groups,cn=accounts,dc=mackie,dc=house"
+    org_role = "Editor"
+    
+    [[servers.group_mappings]]
+    group_dn = "cn=family-users,cn=groups,cn=accounts,dc=mackie,dc=house"
+    org_role = "Viewer"
+    
+    [[servers.group_mappings]]
+    group_dn = "cn=media-users,cn=groups,cn=accounts,dc=mackie,dc=house"
+    org_role = "Viewer"
+---
+# Update Grafana deployment to include LDAP config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-ini
+  namespace: monitoring
+data:
+  grafana.ini: |
+    [server]
+    root_url = https://grafana.mackie.house
+    
+    [auth]
+    disable_login_form = false
+    oauth_auto_login = false
+    
+    [auth.ldap]
+    enabled = true
+    config_file = /etc/grafana/ldap.toml
+    allow_sign_up = true
+    
+    [auth.generic_oauth]
+    enabled = false
+    
+    [users]
+    allow_sign_up = false
+    auto_assign_org = true
+    auto_assign_org_role = Viewer
+    
+    [log]
+    mode = console
+    level = info
+    
+    [security]
+    admin_user = admin
+    admin_password = ${GF_SECURITY_ADMIN_PASSWORD}
+---
+# Patch for Grafana deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-prometheus-stack-grafana
+  namespace: monitoring
+spec:
+  template:
+    spec:
+      containers:
+      - name: grafana
+        env:
+        - name: LDAP_BIND_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: freeipa-service-accounts
+              key: grafana-password
+        volumeMounts:
+        - name: ldap-config
+          mountPath: /etc/grafana/ldap.toml
+          subPath: ldap.toml
+        - name: grafana-ini
+          mountPath: /etc/grafana/grafana.ini
+          subPath: grafana.ini
+      volumes:
+      - name: ldap-config
+        configMap:
+          name: grafana-ldap-config
+      - name: grafana-ini
+        configMap:
+          name: grafana-ini

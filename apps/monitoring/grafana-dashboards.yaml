@@ -1,0 +1,239 @@
+# Grafana dashboard ConfigMaps
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-providers
+  namespace: monitoring
+data:
+  providers.yaml: |
+    apiVersion: 1
+    providers:
+    - name: 'default'
+      orgId: 1
+      folder: ''
+      type: file
+      disableDeletion: false
+      updateIntervalSeconds: 10
+      allowUiUpdates: true
+      options:
+        path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  # Node Exporter Dashboard
+  node-exporter.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "uid": "node-exporter",
+        "title": "Node Exporter / Server Metrics",
+        "tags": ["prometheus", "node-exporter"],
+        "timezone": "browser",
+        "schemaVersion": 16,
+        "version": 0,
+        "panels": [
+          {
+            "datasource": "Prometheus",
+            "fieldConfig": {
+              "defaults": {
+                "color": {"mode": "palette-classic"},
+                "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+                "mappings": [],
+                "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 80}]},
+                "unit": "percent"
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "id": 2,
+            "options": {"tooltip": {"mode": "single"}},
+            "pluginVersion": "8.0.0",
+            "targets": [
+              {
+                "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+                "refId": "A"
+              }
+            ],
+            "title": "CPU Usage",
+            "type": "timeseries"
+          },
+          {
+            "datasource": "Prometheus",
+            "fieldConfig": {
+              "defaults": {
+                "color": {"mode": "palette-classic"},
+                "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+                "mappings": [],
+                "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 80}]},
+                "unit": "percent"
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+            "id": 3,
+            "options": {"tooltip": {"mode": "single"}},
+            "pluginVersion": "8.0.0",
+            "targets": [
+              {
+                "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100",
+                "refId": "A"
+              }
+            ],
+            "title": "Memory Usage",
+            "type": "timeseries"
+          }
+        ]
+      }
+    }
+  
+  # Media Stack Dashboard
+  media-stack.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "uid": "media-stack",
+        "title": "Media Stack Overview",
+        "tags": ["media", "arr"],
+        "timezone": "browser",
+        "schemaVersion": 16,
+        "version": 0,
+        "panels": [
+          {
+            "datasource": "Prometheus",
+            "fieldConfig": {
+              "defaults": {
+                "color": {"mode": "thresholds"},
+                "mappings": [],
+                "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+                "unit": "none"
+              }
+            },
+            "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+            "id": 1,
+            "options": {"orientation": "auto", "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "showThresholdLabels": false, "showThresholdMarkers": true},
+            "pluginVersion": "8.0.0",
+            "targets": [
+              {
+                "expr": "sonarr_system_status",
+                "refId": "A"
+              }
+            ],
+            "title": "Sonarr Status",
+            "type": "gauge"
+          },
+          {
+            "datasource": "Prometheus",
+            "fieldConfig": {
+              "defaults": {
+                "color": {"mode": "thresholds"},
+                "mappings": [],
+                "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+                "unit": "none"
+              }
+            },
+            "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+            "id": 2,
+            "options": {"orientation": "auto", "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "showThresholdLabels": false, "showThresholdMarkers": true},
+            "pluginVersion": "8.0.0",
+            "targets": [
+              {
+                "expr": "radarr_system_status",
+                "refId": "A"
+              }
+            ],
+            "title": "Radarr Status",
+            "type": "gauge"
+          },
+          {
+            "datasource": "Prometheus",
+            "fieldConfig": {
+              "defaults": {
+                "color": {"mode": "thresholds"},
+                "mappings": [],
+                "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 50}, {"color": "red", "value": 100}]},
+                "unit": "none"
+              }
+            },
+            "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+            "id": 3,
+            "options": {"orientation": "auto", "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "showThresholdLabels": false, "showThresholdMarkers": true},
+            "pluginVersion": "8.0.0",
+            "targets": [
+              {
+                "expr": "sonarr_queue_total",
+                "refId": "A"
+              }
+            ],
+            "title": "Sonarr Queue",
+            "type": "gauge"
+          },
+          {
+            "datasource": "Prometheus",
+            "fieldConfig": {
+              "defaults": {
+                "color": {"mode": "thresholds"},
+                "mappings": [],
+                "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 50}, {"color": "red", "value": 100}]},
+                "unit": "none"
+              }
+            },
+            "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+            "id": 4,
+            "options": {"orientation": "auto", "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "showThresholdLabels": false, "showThresholdMarkers": true},
+            "pluginVersion": "8.0.0",
+            "targets": [
+              {
+                "expr": "radarr_queue_total",
+                "refId": "A"
+              }
+            ],
+            "title": "Radarr Queue",
+            "type": "gauge"
+          }
+        ]
+      }
+    }
+  
+  # Storage Dashboard
+  storage.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "uid": "storage",
+        "title": "Storage Overview",
+        "tags": ["storage", "longhorn"],
+        "timezone": "browser",
+        "schemaVersion": 16,
+        "version": 0,
+        "panels": [
+          {
+            "datasource": "Prometheus",
+            "fieldConfig": {
+              "defaults": {
+                "color": {"mode": "palette-classic"},
+                "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+                "mappings": [],
+                "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 80}]},
+                "unit": "bytes"
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "id": 1,
+            "options": {"tooltip": {"mode": "single"}},
+            "pluginVersion": "8.0.0",
+            "targets": [
+              {
+                "expr": "sum(kubelet_volume_stats_used_bytes) by (persistentvolumeclaim)",
+                "refId": "A"
+              }
+            ],
+            "title": "PVC Usage",
+            "type": "timeseries"
+          }
+        ]
+      }
+    }

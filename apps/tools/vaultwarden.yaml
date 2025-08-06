@@ -1,0 +1,204 @@
+# Vaultwarden - Self-hosted password manager (Bitwarden compatible)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tools
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vaultwarden-data
+  namespace: tools
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vaultwarden-env
+  namespace: tools
+type: Opaque
+stringData:
+  ADMIN_TOKEN: "your_very_secure_admin_token"  # Generate with: openssl rand -base64 48
+  DATABASE_URL: "postgresql://vaultwarden:password@vaultwarden-postgres/vaultwarden"
+  POSTGRES_PASSWORD: "secure_postgres_password"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultwarden-postgres
+  namespace: tools
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vaultwarden-postgres
+  template:
+    metadata:
+      labels:
+        app: vaultwarden-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: vaultwarden
+        - name: POSTGRES_USER
+          value: vaultwarden
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: vaultwarden-env
+              key: POSTGRES_PASSWORD
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: vaultwarden-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultwarden-postgres
+  namespace: tools
+spec:
+  selector:
+    app: vaultwarden-postgres
+  ports:
+  - port: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultwarden
+  namespace: tools
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vaultwarden
+  template:
+    metadata:
+      labels:
+        app: vaultwarden
+    spec:
+      containers:
+      - name: vaultwarden
+        image: vaultwarden/server:latest
+        ports:
+        - containerPort: 80
+        env:
+        - name: DOMAIN
+          value: "https://vault.mackie.house"
+        - name: SIGNUPS_ALLOWED
+          value: "false"  # Set to true for initial setup
+        - name: INVITATIONS_ALLOWED
+          value: "true"
+        - name: SHOW_PASSWORD_HINT
+          value: "false"
+        - name: WEBSOCKET_ENABLED
+          value: "true"
+        - name: ROCKET_PORT
+          value: "80"
+        - name: WEB_VAULT_ENABLED
+          value: "true"
+        - name: SMTP_HOST
+          value: "smtp.gmail.com"
+        - name: SMTP_PORT
+          value: "587"
+        - name: SMTP_SECURITY
+          value: "starttls"
+        - name: SMTP_FROM
+          value: "vaultwarden@mackie.house"
+        - name: SMTP_FROM_NAME
+          value: "Vaultwarden"
+        - name: SMTP_USERNAME
+          value: "your-email@gmail.com"
+        envFrom:
+        - secretRef:
+            name: vaultwarden-env
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: data
+        emptyDir: {}  # Web vault data, actual data is in postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultwarden
+  namespace: tools
+spec:
+  selector:
+    app: vaultwarden
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  - name: websocket
+    port: 3012
+    targetPort: 3012
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vaultwarden
+  namespace: tools
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/websocket-services: vaultwarden
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - vault.mackie.house
+    secretName: vaultwarden-tls
+  rules:
+  - host: vault.mackie.house
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: vaultwarden
+            port:
+              number: 80
+      - path: /notifications/hub
+        pathType: Prefix
+        backend:
+          service:
+            name: vaultwarden
+            port:
+              number: 3012

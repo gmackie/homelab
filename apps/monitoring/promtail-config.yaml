@@ -1,0 +1,210 @@
+# Promtail - Log Collection Agent
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: logging
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+      
+    positions:
+      filename: /tmp/positions.yaml
+      
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+        tenant_id: homelab
+        
+    scrape_configs:
+    # Kubernetes pods logs
+    - job_name: kubernetes-pods
+      pipeline_stages:
+        - docker: {}
+        - kubernetes:
+            namespace_labels: true
+        # Service-specific parsing
+        - match:
+            selector: '{app="authelia"}'
+            stages:
+            - regex:
+                expression: 'level=(?P<level>\w+).*msg="(?P<message>[^"]+)"'
+            - labels:
+                level:
+        - match:
+            selector: '{app="jellyfin"}'
+            stages:
+            - regex:
+                expression: '\[(?P<timestamp>[^\]]+)\] \[(?P<level>\w+)\] (?P<message>.*)'
+            - timestamp:
+                source: timestamp
+                format: "2006-01-02 15:04:05.000"
+            - labels:
+                level:
+        - match:
+            selector: '{app=~"sonarr|radarr"}'
+            stages:
+            - regex:
+                expression: '\|(?P<level>\w+)\|(?P<component>[^\|]+)\|(?P<message>.*)'
+            - labels:
+                level:
+                component:
+        - match:
+            selector: '{app="home-assistant"}'
+            stages:
+            - regex:
+                expression: '(?P<timestamp>\S+\s\S+)\s+(?P<level>\w+)\s+\((?P<component>[^\)]+)\)\s+(?P<message>.*)'
+            - labels:
+                level:
+                component:
+                
+      kubernetes_sd_configs:
+        - role: pod
+      relabel_configs:
+        # Only scrape pods with annotation
+        - source_labels: [__meta_kubernetes_pod_annotation_promtail_io_scrape]
+          action: keep
+          regex: true
+        # Add namespace label
+        - source_labels: [__meta_kubernetes_namespace]
+          target_label: namespace
+        # Add pod name
+        - source_labels: [__meta_kubernetes_pod_name]
+          target_label: pod
+        # Add container name
+        - source_labels: [__meta_kubernetes_pod_container_name]
+          target_label: container
+        # Add app label
+        - source_labels: [__meta_kubernetes_pod_label_app]
+          target_label: app
+        # Add service label
+        - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+          target_label: service
+        # Set log path
+        - replacement: /var/log/pods/*$1/*.log
+          separator: /
+          source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+          target_label: __path__
+          
+    # System logs
+    - job_name: syslog
+      syslog:
+        listen_address: 0.0.0.0:514
+        idle_timeout: 60s
+        label_structured_data: yes
+        labels:
+          job: "syslog"
+      relabel_configs:
+        - source_labels: ['__syslog_message_hostname']
+          target_label: 'hostname'
+        - source_labels: ['__syslog_message_severity']
+          target_label: 'level'
+        - source_labels: ['__syslog_message_facility']
+          target_label: 'facility'
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: logging
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  template:
+    metadata:
+      labels:
+        app: promtail
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: promtail
+      containers:
+      - name: promtail
+        image: grafana/promtail:2.9.3
+        args:
+          - -config.file=/etc/promtail/promtail.yaml
+        ports:
+        - containerPort: 9080
+          name: http-metrics
+        - containerPort: 514
+          name: syslog
+          protocol: UDP
+        volumeMounts:
+        - name: config
+          mountPath: /etc/promtail
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        env:
+        - name: HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+      volumes:
+      - name: config
+        configMap:
+          name: promtail-config
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: promtail-syslog
+  namespace: logging
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.55  # For network devices to send syslog
+  selector:
+    app: promtail
+  ports:
+  - name: syslog
+    port: 514
+    targetPort: 514
+    protocol: UDP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promtail
+  namespace: logging
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: promtail
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "services", "pods", "namespaces"]
+  verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: promtail
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: promtail
+subjects:
+- kind: ServiceAccount
+  name: promtail
+  namespace: logging
