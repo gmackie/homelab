@@ -1,0 +1,21 @@
+[Unit]
+Description=Homelab Dashboard API
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/dashboard-api
+ExecStart=/opt/dashboard-api/dashboard-api
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dashboard-api
+
+# Docker socket access
+Environment="DOCKER_HOST=unix:///var/run/docker.sock"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multi-arch-config
+  namespace: kube-system
+data:
+  # Node labeling strategy for multi-architecture cluster
+  node-labels: |
+    # AMD64 Nodes (NUCs)
+    arch=amd64
+    node-role/master=true
+    node-role/compute=true
+    node-role/storage=true
+    workload/heavy=true
+    power-class=high
+    
+    # ARM64 Nodes (Raspberry Pi 4/5)
+    arch=arm64
+    node-role/edge=true
+    node-role/iot=true
+    workload/light=true
+    power-class=low
+    power-efficiency=high
+    
+    # ARM Nodes (Pi Zero/older Pis)
+    arch=arm
+    node-role/sensor=true
+    workload/minimal=true
+    power-class=ultra-low
+
+---
+# Taints for specialized workloads
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-taints-config
+  namespace: kube-system
+data:
+  taints: |
+    # Optional: Taint ARM nodes to prevent random scheduling
+    # kubectl taint nodes <arm-node> arch=arm:NoSchedule
+    
+    # Taint storage nodes for database workloads
+    # kubectl taint nodes <nuc> storage=true:NoSchedule

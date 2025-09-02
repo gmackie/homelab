@@ -1,0 +1,756 @@
+# Cilium eBPF Advanced Networking for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cilium-system
+  labels:
+    name: cilium-system
+
+---
+# Cilium configuration for multi-arch with eBPF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cilium-config
+  namespace: cilium-system
+data:
+  # Core Cilium configuration
+  cluster-name: "homelab-multiarch"
+  cluster-id: "1"
+  
+  # eBPF configuration
+  enable-bpf-masquerade: "true"
+  enable-bpf-clock-probe: "true"
+  enable-bpf-tproxy: "true"
+  bpf-map-dynamic-size-ratio: "0.0025"
+  
+  # Architecture-specific optimizations
+  arch-config: |
+    amd64:
+      datapath-mode: "veth"  # Better performance on AMD64
+      bpf-compile-mode: "jit"
+      enable-xdp: "true"
+      mtu: "9000"  # Jumbo frames for high throughput
+      
+    arm64:
+      datapath-mode: "veth"
+      bpf-compile-mode: "jit"
+      enable-xdp: "false"  # XDP may not be stable on all ARM64
+      mtu: "1500"
+      
+    arm:
+      datapath-mode: "veth"
+      bpf-compile-mode: "interpreter"  # JIT might not be available
+      enable-xdp: "false"
+      mtu: "1500"
+  
+  # Network policies
+  enable-policy: "always"
+  policy-mode: "default"
+  
+  # Load balancing
+  loadbalancer-mode: "dsr"  # Direct Server Return for efficiency
+  loadbalancer-algorithm: "maglev"  # Consistent hashing
+  
+  # IPv6 support
+  enable-ipv6: "true"
+  enable-ipv6-masquerade: "true"
+  
+  # Hubble observability
+  enable-hubble: "true"
+  hubble-listen-address: ":4244"
+  hubble-metrics-server: ":9965"
+  hubble-metrics: |
+    dns
+    drop
+    tcp
+    flow
+    icmp
+    http
+    
+  # Bandwidth management
+  enable-bandwidth-manager: "true"
+  
+  # Encryption
+  enable-wireguard: "true"
+  wireguard-userspace-implementation: "false"
+
+---
+# Cilium operator deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cilium-operator
+  namespace: cilium-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cilium-operator
+  template:
+    metadata:
+      labels:
+        app: cilium-operator
+    spec:
+      # Prefer AMD64 for operator
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      serviceAccountName: cilium-operator
+      containers:
+      - name: cilium-operator
+        image: quay.io/cilium/operator:v1.14.0
+        command:
+        - cilium-operator
+        args:
+        - --config-dir=/tmp/cilium/config-map
+        - --debug=$(CILIUM_DEBUG)
+        env:
+        - name: K8S_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: CILIUM_K8S_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: CILIUM_DEBUG
+          value: "false"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: cilium-config
+          mountPath: /tmp/cilium/config-map
+          readOnly: true
+      volumes:
+      - name: cilium-config
+        configMap:
+          name: cilium-config
+
+---
+# Cilium agent DaemonSet for all architectures
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cilium-agent
+  namespace: cilium-system
+spec:
+  selector:
+    matchLabels:
+      app: cilium-agent
+  template:
+    metadata:
+      labels:
+        app: cilium-agent
+    spec:
+      serviceAccountName: cilium-agent
+      hostNetwork: true
+      hostPID: true
+      initContainers:
+      - name: mount-bpf-fs
+        image: quay.io/cilium/cilium:v1.14.0
+        command:
+        - sh
+        - -c
+        - |
+          mount | grep /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: sys-fs-bpf
+          mountPath: /sys/fs/bpf
+          mountPropagation: Bidirectional
+      containers:
+      - name: cilium-agent
+        image: quay.io/cilium/cilium:v1.14.0
+        command:
+        - cilium-agent
+        args:
+        - --config-dir=/tmp/cilium/config-map
+        env:
+        - name: K8S_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: CILIUM_K8S_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        # Architecture detection for optimizations
+        - name: NODE_ARCH
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['kubernetes.io/arch']
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        volumeMounts:
+        - name: bpf-maps
+          mountPath: /sys/fs/bpf
+          mountPropagation: Bidirectional
+        - name: cilium-run
+          mountPath: /var/run/cilium
+        - name: cni-path
+          mountPath: /host/opt/cni/bin
+        - name: etc-cni-netd
+          mountPath: /host/etc/cni/net.d
+        - name: cilium-config
+          mountPath: /tmp/cilium/config-map
+          readOnly: true
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: xtables-lock
+          mountPath: /run/xtables.lock
+        livenessProbe:
+          exec:
+            command:
+            - cilium
+            - status
+            - --brief
+          initialDelaySeconds: 120
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - cilium
+            - status
+            - --brief
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: bpf-maps
+        hostPath:
+          path: /sys/fs/bpf
+      - name: cilium-run
+        hostPath:
+          path: /var/run/cilium
+      - name: cni-path
+        hostPath:
+          path: /opt/cni/bin
+      - name: etc-cni-netd
+        hostPath:
+          path: /etc/cni/net.d
+      - name: cilium-config
+        configMap:
+          name: cilium-config
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
+      - name: xtables-lock
+        hostPath:
+          path: /run/xtables.lock
+      - name: sys-fs-bpf
+        hostPath:
+          path: /sys/fs/bpf
+
+---
+# Hubble relay for observability
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hubble-relay
+  namespace: cilium-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hubble-relay
+  template:
+    metadata:
+      labels:
+        app: hubble-relay
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]  # Prefer ARM64 for power efficiency
+      serviceAccountName: hubble-relay
+      containers:
+      - name: hubble-relay
+        image: quay.io/cilium/hubble-relay:v1.14.0
+        command:
+        - hubble-relay
+        args:
+        - serve
+        ports:
+        - containerPort: 4245
+          name: grpc
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+        readinessProbe:
+          tcpSocket:
+            port: 4245
+          periodSeconds: 5
+        livenessProbe:
+          tcpSocket:
+            port: 4245
+          periodSeconds: 5
+
+---
+# Hubble UI for network visualization
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hubble-ui
+  namespace: cilium-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hubble-ui
+  template:
+    metadata:
+      labels:
+        app: hubble-ui
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: hubble-ui
+        image: quay.io/cilium/hubble-ui:v0.12.0
+        ports:
+        - containerPort: 8081
+          name: http
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+
+---
+# Network policies for security
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: architecture-aware-policy
+  namespace: default
+spec:
+  description: "Architecture-aware network policy"
+  endpointSelector:
+    matchLabels:
+      app: webapp
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "80"
+        protocol: TCP
+      rules:
+        http:
+        - method: "GET"
+          path: "/api/.*"
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        app: database
+    toPorts:
+    - ports:
+      - port: "5432"
+        protocol: TCP
+  # Architecture-specific rules
+  - toEndpoints:
+    - matchExpressions:
+      - key: node.kubernetes.io/arch
+        operator: In
+        values: ["arm64", "arm"]
+    toPorts:
+    - ports:
+      - port: "9090"
+        protocol: TCP
+      description: "Allow metrics collection from ARM nodes"
+
+---
+# Bandwidth management policy
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: bandwidth-limits
+spec:
+  description: "Per-architecture bandwidth limits"
+  endpointSelector: {}
+  egress:
+  - toBandwidth:
+      # AMD64 nodes get more bandwidth
+      - matchExpressions:
+        - key: node.kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        bandwidth: "1000M"
+      # ARM64 nodes get moderate bandwidth
+      - matchExpressions:
+        - key: node.kubernetes.io/arch
+          operator: In
+          values: ["arm64"]
+        bandwidth: "500M"
+      # ARM nodes get limited bandwidth
+      - matchExpressions:
+        - key: node.kubernetes.io/arch
+          operator: In
+          values: ["arm"]
+        bandwidth: "100M"
+
+---
+# eBPF program for custom load balancing
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ebpf-programs
+  namespace: cilium-system
+data:
+  power_aware_lb.c: |
+    #include <linux/bpf.h>
+    #include <linux/if_ether.h>
+    #include <linux/ip.h>
+    #include <linux/tcp.h>
+    #include <bpf/bpf_helpers.h>
+    
+    // Map to track node power consumption
+    struct {
+        __uint(type, BPF_MAP_TYPE_HASH);
+        __uint(max_entries, 100);
+        __type(key, __u32);  // Node ID
+        __type(value, __u64); // Power consumption in mW
+    } node_power_map SEC(".maps");
+    
+    // Map to track node architecture
+    struct {
+        __uint(type, BPF_MAP_TYPE_HASH);
+        __uint(max_entries, 100);
+        __type(key, __u32);  // Node ID
+        __type(value, __u8);  // Architecture: 0=amd64, 1=arm64, 2=arm
+    } node_arch_map SEC(".maps");
+    
+    SEC("xdp")
+    int power_aware_load_balancer(struct xdp_md *ctx) {
+        void *data_end = (void *)(long)ctx->data_end;
+        void *data = (void *)(long)ctx->data;
+        
+        struct ethhdr *eth = data;
+        if ((void *)(eth + 1) > data_end)
+            return XDP_PASS;
+        
+        if (eth->h_proto != htons(ETH_P_IP))
+            return XDP_PASS;
+        
+        struct iphdr *ip = (void *)(eth + 1);
+        if ((void *)(ip + 1) > data_end)
+            return XDP_PASS;
+        
+        if (ip->protocol != IPPROTO_TCP)
+            return XDP_PASS;
+        
+        struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+        if ((void *)(tcp + 1) > data_end)
+            return XDP_PASS;
+        
+        // Simple hash based on source IP and port
+        __u32 hash = ip->saddr ^ tcp->source;
+        
+        // Select backend based on power efficiency
+        __u32 selected_node = 0;
+        __u64 min_power = UINT64_MAX;
+        __u8 prefer_arch = 1; // Prefer ARM64 by default
+        
+        // Iterate through available nodes
+        for (__u32 i = 0; i < 10; i++) {
+            __u64 *power = bpf_map_lookup_elem(&node_power_map, &i);
+            __u8 *arch = bpf_map_lookup_elem(&node_arch_map, &i);
+            
+            if (!power || !arch)
+                continue;
+            
+            // Prefer ARM architectures for power efficiency
+            __u64 adjusted_power = *power;
+            if (*arch == 1) // ARM64
+                adjusted_power = *power * 70 / 100; // 30% preference
+            else if (*arch == 2) // ARM
+                adjusted_power = *power * 50 / 100; // 50% preference
+            
+            if (adjusted_power < min_power) {
+                min_power = adjusted_power;
+                selected_node = i;
+            }
+        }
+        
+        // Redirect to selected backend
+        // (Implementation would redirect packet to selected node)
+        
+        return XDP_PASS;
+    }
+    
+    char _license[] SEC("license") = "GPL";
+
+  connection_tracker.c: |
+    #include <linux/bpf.h>
+    #include <bpf/bpf_helpers.h>
+    
+    // Connection tracking for stateful firewall
+    struct connection {
+        __u32 src_ip;
+        __u32 dst_ip;
+        __u16 src_port;
+        __u16 dst_port;
+        __u8 protocol;
+        __u8 state;
+        __u64 last_seen;
+    };
+    
+    struct {
+        __uint(type, BPF_MAP_TYPE_LRU_HASH);
+        __uint(max_entries, 10000);
+        __type(key, struct connection);
+        __type(value, __u64);
+    } conn_track SEC(".maps");
+    
+    SEC("tc")
+    int track_connections(struct __sk_buff *skb) {
+        // Connection tracking logic
+        return TC_ACT_OK;
+    }
+    
+    char _license[] SEC("license") = "GPL";
+
+---
+# Cilium BGP configuration for multi-homing
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPPeeringPolicy
+metadata:
+  name: homelab-bgp
+  namespace: cilium-system
+spec:
+  nodeSelector:
+    matchLabels:
+      bgp: "enabled"
+  virtualRouters:
+  - localASN: 65001
+    exportPodCIDR: true
+    neighbors:
+    - peerAddress: "192.168.1.1/32"
+      peerASN: 65000
+      eBGPMultihopTTL: 10
+      connectRetryTimeSeconds: 120
+      holdTimeSeconds: 90
+      keepAliveTimeSeconds: 30
+    # Architecture-specific BGP communities
+    - peerAddress: "192.168.1.2/32"
+      peerASN: 65002
+      communities:
+        standard:
+        - "65001:100"  # AMD64 routes
+        - "65001:200"  # ARM64 routes
+        - "65001:300"  # ARM routes
+
+---
+# WireGuard encryption configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cilium-wireguard-keys
+  namespace: cilium-system
+type: Opaque
+data:
+  # Base64 encoded WireGuard keys
+  privateKey: "..."
+  publicKey: "..."
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: hubble-relay
+  namespace: cilium-system
+spec:
+  selector:
+    app: hubble-relay
+  ports:
+  - port: 80
+    targetPort: 4245
+    name: grpc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hubble-ui
+  namespace: cilium-system
+spec:
+  selector:
+    app: hubble-ui
+  ports:
+  - port: 80
+    targetPort: 8081
+    name: http
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cilium-operator
+  namespace: cilium-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cilium-agent
+  namespace: cilium-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hubble-relay
+  namespace: cilium-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cilium-operator
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "services", "endpoints"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["cilium.io"]
+  resources: ["*"]
+  verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cilium-agent
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "services", "endpoints", "configmaps"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["cilium.io"]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cilium-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cilium-operator
+subjects:
+- kind: ServiceAccount
+  name: cilium-operator
+  namespace: cilium-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cilium-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cilium-agent
+subjects:
+- kind: ServiceAccount
+  name: cilium-agent
+  namespace: cilium-system
+
+---
+# Performance tuning ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cilium-performance-tuning
+  namespace: cilium-system
+data:
+  tuning.sh: |
+    #!/bin/bash
+    
+    # Architecture-specific network tuning
+    ARCH=$(uname -m)
+    
+    case $ARCH in
+      x86_64)
+        # AMD64 optimizations
+        echo 2048 > /sys/module/nf_conntrack/parameters/hashsize
+        echo 262144 > /proc/sys/net/netfilter/nf_conntrack_max
+        echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse
+        echo 1 > /proc/sys/net/ipv4/tcp_tw_recycle
+        echo 4096 87380 16777216 > /proc/sys/net/ipv4/tcp_rmem
+        echo 4096 65536 16777216 > /proc/sys/net/ipv4/tcp_wmem
+        ;;
+      aarch64)
+        # ARM64 optimizations
+        echo 1024 > /sys/module/nf_conntrack/parameters/hashsize
+        echo 131072 > /proc/sys/net/netfilter/nf_conntrack_max
+        echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse
+        echo 2048 87380 8388608 > /proc/sys/net/ipv4/tcp_rmem
+        echo 2048 32768 8388608 > /proc/sys/net/ipv4/tcp_wmem
+        ;;
+      armv7l|armv6l)
+        # ARM optimizations (conservative)
+        echo 512 > /sys/module/nf_conntrack/parameters/hashsize
+        echo 65536 > /proc/sys/net/netfilter/nf_conntrack_max
+        echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse
+        echo 1024 87380 4194304 > /proc/sys/net/ipv4/tcp_rmem
+        echo 1024 16384 4194304 > /proc/sys/net/ipv4/tcp_wmem
+        ;;
+    esac
+    
+    # Common optimizations
+    echo 1 > /proc/sys/net/ipv4/tcp_fastopen
+    echo 1 > /proc/sys/net/ipv4/tcp_mtu_probing
+    echo 2 > /proc/sys/net/ipv4/tcp_ecn
+    echo 0 > /proc/sys/net/ipv4/tcp_slow_start_after_idle
+    
+    # eBPF optimizations
+    echo 1 > /proc/sys/net/core/bpf_jit_enable
+    echo 1 > /proc/sys/net/core/bpf_jit_harden
+    
+    echo "Network tuning completed for $ARCH architecture"

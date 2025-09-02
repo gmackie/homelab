@@ -1,0 +1,986 @@
+# ELK Stack (Elasticsearch, Logstash, Kibana) for Multi-Architecture Homelab
+# Using lightweight alternatives where appropriate for ARM support
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+  labels:
+    name: logging
+
+---
+# Fluent Bit configuration (lighter than Logstash for log collection)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: logging
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Daemon Off
+        Flush 5
+        Log_Level info
+        Parsers_File parsers.conf
+        Parsers_File custom_parsers.conf
+        HTTP_Server On
+        HTTP_Listen 0.0.0.0
+        HTTP_Port 2020
+        Health_Check On
+        
+    [INPUT]
+        Name tail
+        Path /var/log/containers/*.log
+        multiline.parser docker, cri
+        Tag kube.*
+        Mem_Buf_Limit 5MB
+        Skip_Long_Lines On
+        
+    [INPUT]
+        Name systemd
+        Tag host.*
+        Systemd_Filter _SYSTEMD_UNIT=kubelet.service
+        Read_From_Tail On
+        
+    [FILTER]
+        Name kubernetes
+        Match kube.*
+        Kube_URL https://kubernetes.default.svc:443
+        Kube_CA_File /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File /var/run/secrets/kubernetes.io/serviceaccount/token
+        Kube_Tag_Prefix kube.var.log.containers.
+        Merge_Log On
+        Keep_Log Off
+        K8S-Logging.Parser On
+        K8S-Logging.Exclude On
+        Labels On
+        Annotations On
+        
+    [FILTER]
+        Name modify
+        Match kube.*
+        Add cluster_name homelab-multiarch
+        Add node_arch ${NODE_ARCH}
+        Add node_name ${NODE_NAME}
+        
+    [FILTER]
+        Name nest
+        Match kube.*
+        Operation lift
+        Nested_under kubernetes
+        Add_prefix k8s_
+        
+    # Architecture-specific routing
+    [FILTER]
+        Name rewrite_tag
+        Match kube.*
+        Rule $k8s_labels['kubernetes.io/arch'] ^(amd64)$ amd64.$TAG false
+        Rule $k8s_labels['kubernetes.io/arch'] ^(arm64)$ arm64.$TAG false
+        Rule $k8s_labels['kubernetes.io/arch'] ^(arm)$ arm.$TAG false
+        
+    [OUTPUT]
+        Name es
+        Match amd64.*
+        Host elasticsearch
+        Port 9200
+        Index logs-amd64
+        Type _doc
+        Suppress_Type_Name On
+        
+    [OUTPUT]
+        Name es
+        Match arm64.*
+        Host elasticsearch
+        Port 9200
+        Index logs-arm64
+        Type _doc
+        Suppress_Type_Name On
+        Buffer_Size 2MB
+        
+    [OUTPUT]
+        Name es
+        Match arm.*
+        Host elasticsearch
+        Port 9200
+        Index logs-arm
+        Type _doc
+        Suppress_Type_Name On
+        Buffer_Size 1MB
+        
+    [OUTPUT]
+        Name prometheus_exporter
+        Match internal_metrics
+        Host 0.0.0.0
+        Port 2021
+
+  parsers.conf: |
+    [PARSER]
+        Name docker
+        Format json
+        Time_Key time
+        Time_Format %Y-%m-%dT%H:%M:%S.%LZ
+        
+    [PARSER]
+        Name cri
+        Format regex
+        Regex ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<message>.*)$
+        Time_Key time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+        
+    [PARSER]
+        Name syslog
+        Format regex
+        Regex ^\<(?<pri>[0-9]+)\>(?<time>[^ ]* {1,2}[^ ]* [^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?<message>.*)$
+        Time_Key time
+        Time_Format %b %d %H:%M:%S
+
+  custom_parsers.conf: |
+    [PARSER]
+        Name nginx
+        Format regex
+        Regex ^(?<remote>[^ ]*) (?<host>[^ ]*) (?<user>[^ ]*) \[(?<time>[^\]]*)\] "(?<method>\S+)(?: +(?<path>[^\"]*?)(?: +\S*)?)?" (?<code>[^ ]*) (?<size>[^ ]*)(?: "(?<referer>[^\"]*)" "(?<agent>[^\"]*)")?$
+        Time_Key time
+        Time_Format %d/%b/%Y:%H:%M:%S %z
+        
+    [PARSER]
+        Name k8s-pod
+        Format json
+        Time_Key time
+        Time_Format %Y-%m-%dT%H:%M:%S.%LZ
+        
+    [PARSER]
+        Name iot-sensor
+        Format json
+        Time_Key timestamp
+        Time_Format %Y-%m-%dT%H:%M:%S
+
+---
+# Fluent Bit DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: logging
+  labels:
+    app: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2020"
+        prometheus.io/path: "/api/v1/metrics/prometheus"
+    spec:
+      serviceAccountName: fluent-bit
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:2.1
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NODE_ARCH
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['kubernetes.io/arch']
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+        volumeMounts:
+        - name: fluent-bit-config
+          mountPath: /fluent-bit/etc/
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: etcmachineid
+          mountPath: /etc/machine-id
+          readOnly: true
+      volumes:
+      - name: fluent-bit-config
+        configMap:
+          name: fluent-bit-config
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: etcmachineid
+        hostPath:
+          path: /etc/machine-id
+
+---
+# Elasticsearch for log storage (shared with Jaeger)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  namespace: logging
+spec:
+  serviceName: elasticsearch
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      # Prefer AMD64 for storage performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ["sh", "-c", "chown -R 1000:1000 /usr/share/elasticsearch/data"]
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: elasticsearch-data
+          mountPath: /usr/share/elasticsearch/data
+      - name: increase-vm-max-map
+        image: busybox
+        command: ["sysctl", "-w", "vm.max_map_count=262144"]
+        securityContext:
+          privileged: true
+      containers:
+      - name: elasticsearch
+        image: elasticsearch:8.10.2
+        env:
+        - name: discovery.type
+          value: single-node
+        - name: xpack.security.enabled
+          value: "false"
+        - name: ES_JAVA_OPTS
+          value: "-Xms1g -Xmx1g"
+        - name: cluster.name
+          value: homelab-logs
+        - name: node.name
+          value: elasticsearch-0
+        - name: network.host
+          value: "0.0.0.0"
+        - name: http.cors.enabled
+          value: "true"
+        - name: http.cors.allow-origin
+          value: "*"
+        ports:
+        - containerPort: 9200
+          name: http
+        - containerPort: 9300
+          name: transport
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+        volumeMounts:
+        - name: elasticsearch-data
+          mountPath: /usr/share/elasticsearch/data
+        livenessProbe:
+          httpGet:
+            path: /_cluster/health
+            port: 9200
+          initialDelaySeconds: 90
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /_cluster/health
+            port: 9200
+          initialDelaySeconds: 30
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: elasticsearch-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ssd
+      resources:
+        requests:
+          storage: 50Gi
+
+---
+# Kibana for visualization
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: logging
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+    spec:
+      # Can run on ARM64 for power efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: kibana
+        image: kibana:8.10.2
+        env:
+        - name: ELASTICSEARCH_HOSTS
+          value: "http://elasticsearch:9200"
+        - name: SERVER_NAME
+          value: "kibana.homelab.local"
+        - name: SERVER_HOST
+          value: "0.0.0.0"
+        - name: MONITORING_UI_CONTAINER_ELASTICSEARCH_ENABLED
+          value: "true"
+        ports:
+        - containerPort: 5601
+          name: http
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        livenessProbe:
+          httpGet:
+            path: /api/status
+            port: 5601
+          initialDelaySeconds: 90
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/status
+            port: 5601
+          initialDelaySeconds: 30
+          periodSeconds: 5
+
+---
+# Log processor for analysis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: log-processor
+  namespace: logging
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: log-processor
+  template:
+    metadata:
+      labels:
+        app: log-processor
+    spec:
+      serviceAccountName: log-processor
+      containers:
+      - name: processor
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install elasticsearch pandas numpy scikit-learn
+          python3 /app/log_processor.py
+        volumeMounts:
+        - name: processor-app
+          mountPath: /app
+        env:
+        - name: ES_HOST
+          value: "elasticsearch"
+        - name: ES_PORT
+          value: "9200"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: processor-app
+        configMap:
+          name: log-processor-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: log-processor-app
+  namespace: logging
+data:
+  log_processor.py: |
+    #!/usr/bin/env python3
+    import json
+    import logging
+    import time
+    from datetime import datetime, timedelta
+    from elasticsearch import Elasticsearch
+    from typing import Dict, List
+    import pandas as pd
+    import numpy as np
+    from sklearn.ensemble import IsolationForest
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class LogProcessor:
+        def __init__(self):
+            self.es = Elasticsearch(['http://elasticsearch:9200'])
+            self.anomaly_detector = IsolationForest(contamination=0.1)
+            
+        def analyze_logs_by_architecture(self) -> Dict:
+            """Analyze log patterns by architecture"""
+            
+            architectures = ['amd64', 'arm64', 'arm']
+            analysis = {}
+            
+            for arch in architectures:
+                query = {
+                    "size": 0,
+                    "query": {
+                        "range": {
+                            "@timestamp": {
+                                "gte": "now-1h"
+                            }
+                        }
+                    },
+                    "aggs": {
+                        "log_levels": {
+                            "terms": {
+                                "field": "level.keyword",
+                                "size": 10
+                            }
+                        },
+                        "top_services": {
+                            "terms": {
+                                "field": "kubernetes.labels.app.keyword",
+                                "size": 10
+                            }
+                        },
+                        "error_rate": {
+                            "filter": {
+                                "terms": {
+                                    "level.keyword": ["ERROR", "CRITICAL", "FATAL"]
+                                }
+                            }
+                        },
+                        "logs_over_time": {
+                            "date_histogram": {
+                                "field": "@timestamp",
+                                "fixed_interval": "5m"
+                            }
+                        }
+                    }
+                }
+                
+                try:
+                    result = self.es.search(index=f"logs-{arch}-*", body=query)
+                    
+                    total_logs = result['hits']['total']['value']
+                    error_count = result['aggregations']['error_rate']['doc_count']
+                    
+                    analysis[arch] = {
+                        'total_logs': total_logs,
+                        'error_rate': (error_count / total_logs * 100) if total_logs > 0 else 0,
+                        'log_levels': [
+                            {'level': b['key'], 'count': b['doc_count']}
+                            for b in result['aggregations']['log_levels']['buckets']
+                        ],
+                        'top_services': [
+                            {'service': b['key'], 'count': b['doc_count']}
+                            for b in result['aggregations']['top_services']['buckets']
+                        ],
+                        'logs_timeline': [
+                            {'time': b['key_as_string'], 'count': b['doc_count']}
+                            for b in result['aggregations']['logs_over_time']['buckets']
+                        ]
+                    }
+                except Exception as e:
+                    logger.error(f"Failed to analyze logs for {arch}: {e}")
+                    analysis[arch] = {'error': str(e)}
+            
+            return analysis
+        
+        def detect_anomalies(self) -> List[Dict]:
+            """Detect anomalies in log patterns"""
+            
+            # Get recent logs
+            query = {
+                "size": 10000,
+                "query": {
+                    "range": {
+                        "@timestamp": {
+                            "gte": "now-1h"
+                        }
+                    }
+                },
+                "_source": ["@timestamp", "message", "level", "kubernetes.labels.app"]
+            }
+            
+            result = self.es.search(index="logs-*", body=query)
+            
+            if not result['hits']['hits']:
+                return []
+            
+            # Convert to DataFrame for analysis
+            logs_data = []
+            for hit in result['hits']['hits']:
+                source = hit['_source']
+                logs_data.append({
+                    'timestamp': source.get('@timestamp'),
+                    'message': source.get('message', ''),
+                    'level': source.get('level', 'INFO'),
+                    'app': source.get('kubernetes', {}).get('labels', {}).get('app', 'unknown')
+                })
+            
+            df = pd.DataFrame(logs_data)
+            
+            # Feature engineering for anomaly detection
+            df['message_length'] = df['message'].str.len()
+            df['is_error'] = df['level'].isin(['ERROR', 'CRITICAL', 'FATAL']).astype(int)
+            df['hour'] = pd.to_datetime(df['timestamp']).dt.hour
+            
+            # Group by app and calculate statistics
+            app_stats = df.groupby('app').agg({
+                'message_length': ['mean', 'std'],
+                'is_error': 'sum'
+            }).reset_index()
+            
+            # Detect anomalies
+            features = app_stats[['message_length', 'is_error']].values
+            
+            if len(features) > 1:
+                anomalies = self.anomaly_detector.fit_predict(features)
+                anomalous_apps = app_stats[anomalies == -1]['app'].tolist()
+                
+                # Get details of anomalous patterns
+                anomaly_details = []
+                for app in anomalous_apps:
+                    app_logs = df[df['app'] == app]
+                    anomaly_details.append({
+                        'app': app,
+                        'error_count': app_logs['is_error'].sum(),
+                        'avg_message_length': app_logs['message_length'].mean(),
+                        'log_count': len(app_logs),
+                        'sample_errors': app_logs[app_logs['is_error'] == 1]['message'].head(3).tolist()
+                    })
+                
+                return anomaly_details
+            
+            return []
+        
+        def calculate_log_storage_efficiency(self) -> Dict:
+            """Calculate storage efficiency by architecture"""
+            
+            indices_stats = self.es.indices.stats()
+            
+            efficiency = {}
+            for index_name, stats in indices_stats['indices'].items():
+                if index_name.startswith('logs-'):
+                    arch = index_name.split('-')[1]
+                    
+                    if arch not in efficiency:
+                        efficiency[arch] = {
+                            'total_docs': 0,
+                            'total_size_bytes': 0,
+                            'indices': []
+                        }
+                    
+                    total_docs = stats['total']['docs']['count']
+                    total_size = stats['total']['store']['size_in_bytes']
+                    
+                    efficiency[arch]['total_docs'] += total_docs
+                    efficiency[arch]['total_size_bytes'] += total_size
+                    efficiency[arch]['indices'].append({
+                        'name': index_name,
+                        'docs': total_docs,
+                        'size_mb': total_size / (1024 * 1024),
+                        'avg_doc_size': total_size / total_docs if total_docs > 0 else 0
+                    })
+            
+            # Calculate efficiency metrics
+            for arch in efficiency:
+                total_docs = efficiency[arch]['total_docs']
+                total_size = efficiency[arch]['total_size_bytes']
+                
+                efficiency[arch]['total_size_mb'] = total_size / (1024 * 1024)
+                efficiency[arch]['avg_doc_size_bytes'] = total_size / total_docs if total_docs > 0 else 0
+                efficiency[arch]['compression_ratio'] = self.estimate_compression_ratio(arch)
+                
+                # Power efficiency (logs processed per watt)
+                arch_power = {'amd64': 45, 'arm64': 7, 'arm': 3}
+                if arch in arch_power:
+                    efficiency[arch]['logs_per_watt'] = total_docs / arch_power[arch]
+            
+            return efficiency
+        
+        def estimate_compression_ratio(self, arch: str) -> float:
+            """Estimate compression ratio for architecture"""
+            # Different architectures might have different log patterns
+            base_ratios = {
+                'amd64': 10.0,  # More verbose logs
+                'arm64': 12.0,  # Moderate compression
+                'arm': 15.0     # Simpler logs, better compression
+            }
+            return base_ratios.get(arch, 10.0)
+        
+        def create_log_dashboards(self):
+            """Create Kibana dashboards for log visualization"""
+            
+            dashboards = [
+                {
+                    "title": "Multi-Architecture Log Analysis",
+                    "panels": [
+                        {
+                            "type": "line",
+                            "title": "Logs by Architecture",
+                            "query": "node_arch:*",
+                            "aggregation": "count",
+                            "group_by": "node_arch"
+                        },
+                        {
+                            "type": "pie",
+                            "title": "Error Distribution",
+                            "query": "level:ERROR OR level:CRITICAL",
+                            "aggregation": "count",
+                            "group_by": "kubernetes.labels.app"
+                        },
+                        {
+                            "type": "heatmap",
+                            "title": "Log Volume Heatmap",
+                            "query": "*",
+                            "x_axis": "@timestamp",
+                            "y_axis": "node_arch"
+                        },
+                        {
+                            "type": "metric",
+                            "title": "Total Logs (24h)",
+                            "query": "*",
+                            "aggregation": "count",
+                            "time_range": "24h"
+                        }
+                    ]
+                },
+                {
+                    "title": "Power Efficiency Dashboard",
+                    "panels": [
+                        {
+                            "type": "bar",
+                            "title": "Logs per Watt by Architecture",
+                            "query": "*",
+                            "custom_calculation": "logs_per_watt"
+                        },
+                        {
+                            "type": "gauge",
+                            "title": "Storage Efficiency",
+                            "query": "*",
+                            "custom_calculation": "compression_ratio"
+                        }
+                    ]
+                }
+            ]
+            
+            # In production, this would create actual Kibana dashboards via API
+            logger.info(f"Dashboard definitions created: {[d['title'] for d in dashboards]}")
+        
+        def run_continuous_analysis(self):
+            """Run continuous log analysis"""
+            while True:
+                try:
+                    # Analyze logs by architecture
+                    arch_analysis = self.analyze_logs_by_architecture()
+                    logger.info(f"Architecture analysis: {json.dumps(arch_analysis, indent=2)}")
+                    
+                    # Detect anomalies
+                    anomalies = self.detect_anomalies()
+                    if anomalies:
+                        logger.warning(f"Anomalies detected: {anomalies}")
+                    
+                    # Calculate storage efficiency
+                    efficiency = self.calculate_log_storage_efficiency()
+                    logger.info(f"Storage efficiency: {json.dumps(efficiency, indent=2)}")
+                    
+                    # Sleep for 5 minutes
+                    time.sleep(300)
+                    
+                except Exception as e:
+                    logger.error(f"Error in analysis loop: {e}")
+                    time.sleep(60)
+    
+    if __name__ == "__main__":
+        processor = LogProcessor()
+        processor.create_log_dashboards()
+        processor.run_continuous_analysis()
+
+---
+# Log retention and rotation
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: log-retention
+  namespace: logging
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: curator
+            image: python:3.11-slim
+            command: ["/bin/bash"]
+            args:
+            - -c
+            - |
+              pip install elasticsearch-curator
+              
+              cat > /tmp/curator.yml << EOF
+              client:
+                hosts:
+                  - elasticsearch
+                port: 9200
+                url_prefix:
+                use_ssl: False
+                certificate:
+                client_cert:
+                client_key:
+                ssl_no_validate: False
+                http_auth:
+                timeout: 30
+                master_only: False
+              
+              logging:
+                loglevel: INFO
+                logfile:
+                logformat: default
+                blacklist: []
+              EOF
+              
+              cat > /tmp/actions.yml << EOF
+              actions:
+                1:
+                  action: delete_indices
+                  description: "Delete logs older than 30 days"
+                  options:
+                    ignore_empty_list: True
+                  filters:
+                  - filtertype: pattern
+                    kind: prefix
+                    value: logs-
+                  - filtertype: age
+                    source: creation_date
+                    direction: older
+                    unit: days
+                    unit_count: 30
+                
+                2:
+                  action: forcemerge
+                  description: "Optimize indices older than 2 days"
+                  options:
+                    max_num_segments: 1
+                    ignore_empty_list: True
+                  filters:
+                  - filtertype: pattern
+                    kind: prefix
+                    value: logs-
+                  - filtertype: age
+                    source: creation_date
+                    direction: older
+                    unit: days
+                    unit_count: 2
+                
+                3:
+                  action: close
+                  description: "Close indices older than 7 days"
+                  options:
+                    ignore_empty_list: True
+                  filters:
+                  - filtertype: pattern
+                    kind: prefix
+                    value: logs-
+                  - filtertype: age
+                    source: creation_date
+                    direction: older
+                    unit: days
+                    unit_count: 7
+              EOF
+              
+              curator --config /tmp/curator.yml /tmp/actions.yml
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "128Mi"
+              limits:
+                cpu: "200m"
+                memory: "256Mi"
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: logging
+spec:
+  selector:
+    app: elasticsearch
+  ports:
+  - name: http
+    port: 9200
+    targetPort: 9200
+  - name: transport
+    port: 9300
+    targetPort: 9300
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: logging
+spec:
+  selector:
+    app: kibana
+  ports:
+  - name: http
+    port: 5601
+    targetPort: 5601
+  type: ClusterIP
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kibana-ingress
+  namespace: logging
+spec:
+  rules:
+  - host: logs.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kibana
+            port:
+              number: 5601
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: logging
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: log-processor
+  namespace: logging
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluent-bit
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "pods", "nodes"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluent-bit
+subjects:
+- kind: ServiceAccount
+  name: fluent-bit
+  namespace: logging
+
+---
+# Log monitoring alerts
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: log-alerts
+  namespace: logging
+data:
+  alert-rules.yaml: |
+    # Alert rules for log monitoring
+    groups:
+    - name: log_alerts
+      rules:
+      - alert: HighErrorRate
+        expr: |
+          rate(fluent_bit_filter_records_total{name="kubernetes"}[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate in logs"
+          description: "Error rate is {{ $value }} errors/sec"
+      
+      - alert: LogIngestionStopped
+        expr: |
+          rate(fluent_bit_output_records_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Log ingestion has stopped"
+          description: "No logs have been ingested for 10 minutes"
+      
+      - alert: ElasticsearchDiskFull
+        expr: |
+          elasticsearch_filesystem_data_available_bytes / elasticsearch_filesystem_data_size_bytes < 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Elasticsearch disk almost full"
+          description: "Less than 10% disk space remaining"

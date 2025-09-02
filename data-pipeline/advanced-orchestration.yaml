@@ -1,0 +1,1362 @@
+# Advanced Data Pipeline Orchestration for Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data-pipeline
+  labels:
+    name: data-pipeline
+
+---
+# Apache Airflow for Workflow Orchestration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-webserver
+  namespace: data-pipeline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-webserver
+  template:
+    metadata:
+      labels:
+        app: airflow-webserver
+    spec:
+      serviceAccountName: airflow
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: webserver
+        image: apache/airflow:2.7.0
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          airflow db init
+          airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@homelab.local
+          airflow webserver
+        ports:
+        - containerPort: 8080
+          name: web
+        env:
+        - name: AIRFLOW__CORE__EXECUTOR
+          value: "CeleryExecutor"
+        - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+          value: "postgresql://airflow:airflow@airflow-postgres:5432/airflow"
+        - name: AIRFLOW__CELERY__BROKER_URL
+          value: "redis://airflow-redis:6379/0"
+        - name: AIRFLOW__CELERY__RESULT_BACKEND
+          value: "db+postgresql://airflow:airflow@airflow-postgres:5432/airflow"
+        - name: AIRFLOW__CORE__FERNET_KEY
+          value: "your-fernet-key-here"
+        - name: AIRFLOW__WEBSERVER__EXPOSE_CONFIG
+          value: "True"
+        volumeMounts:
+        - name: dags
+          mountPath: /opt/airflow/dags
+        - name: logs
+          mountPath: /opt/airflow/logs
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+      volumes:
+      - name: dags
+        persistentVolumeClaim:
+          claimName: airflow-dags
+      - name: logs
+        persistentVolumeClaim:
+          claimName: airflow-logs
+
+---
+# Airflow Scheduler
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-scheduler
+  namespace: data-pipeline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-scheduler
+  template:
+    metadata:
+      labels:
+        app: airflow-scheduler
+    spec:
+      serviceAccountName: airflow
+      containers:
+      - name: scheduler
+        image: apache/airflow:2.7.0
+        command: ["airflow", "scheduler"]
+        env:
+        - name: AIRFLOW__CORE__EXECUTOR
+          value: "CeleryExecutor"
+        - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+          value: "postgresql://airflow:airflow@airflow-postgres:5432/airflow"
+        - name: AIRFLOW__CELERY__BROKER_URL
+          value: "redis://airflow-redis:6379/0"
+        - name: AIRFLOW__CELERY__RESULT_BACKEND
+          value: "db+postgresql://airflow:airflow@airflow-postgres:5432/airflow"
+        volumeMounts:
+        - name: dags
+          mountPath: /opt/airflow/dags
+        - name: logs
+          mountPath: /opt/airflow/logs
+        resources:
+          requests:
+            cpu: "300m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+      volumes:
+      - name: dags
+        persistentVolumeClaim:
+          claimName: airflow-dags
+      - name: logs
+        persistentVolumeClaim:
+          claimName: airflow-logs
+
+---
+# Airflow Worker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-worker
+  namespace: data-pipeline
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: airflow-worker
+  template:
+    metadata:
+      labels:
+        app: airflow-worker
+    spec:
+      serviceAccountName: airflow
+      # Distribute workers across architectures
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: airflow-worker
+              topologyKey: kubernetes.io/arch
+      containers:
+      - name: worker
+        image: apache/airflow:2.7.0
+        command: ["airflow", "celery", "worker"]
+        env:
+        - name: AIRFLOW__CORE__EXECUTOR
+          value: "CeleryExecutor"
+        - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+          value: "postgresql://airflow:airflow@airflow-postgres:5432/airflow"
+        - name: AIRFLOW__CELERY__BROKER_URL
+          value: "redis://airflow-redis:6379/0"
+        - name: AIRFLOW__CELERY__RESULT_BACKEND
+          value: "db+postgresql://airflow:airflow@airflow-postgres:5432/airflow"
+        - name: WORKER_ARCHITECTURE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['kubernetes.io/arch']
+        volumeMounts:
+        - name: dags
+          mountPath: /opt/airflow/dags
+        - name: logs
+          mountPath: /opt/airflow/logs
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+      volumes:
+      - name: dags
+        persistentVolumeClaim:
+          claimName: airflow-dags
+      - name: logs
+        persistentVolumeClaim:
+          claimName: airflow-logs
+
+---
+# DAGs ConfigMap with Sample Pipelines
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airflow-dags
+  namespace: data-pipeline
+data:
+  homelab_ml_pipeline.py: |
+    from datetime import datetime, timedelta
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+    from airflow.operators.bash import BashOperator
+    from airflow.providers.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
+    from airflow.providers.http.operators.http import SimpleHttpOperator
+    import pandas as pd
+    import numpy as np
+    
+    default_args = {
+        'owner': 'homelab',
+        'depends_on_past': False,
+        'email_on_failure': False,
+        'email_on_retry': False,
+        'retries': 1,
+        'retry_delay': timedelta(minutes=5),
+    }
+    
+    dag = DAG(
+        'homelab_ml_pipeline',
+        default_args=default_args,
+        description='Multi-architecture ML data pipeline',
+        schedule_interval=timedelta(hours=1),
+        start_date=datetime(2024, 1, 1),
+        catchup=False,
+        tags=['ml', 'homelab', 'multiarch'],
+    )
+    
+    def extract_sensor_data():
+        """Extract data from IoT sensors"""
+        # Simulate sensor data extraction
+        data = {
+            'timestamp': datetime.now(),
+            'temperature': np.random.normal(25, 5, 100),
+            'humidity': np.random.normal(60, 10, 100),
+            'pressure': np.random.normal(1013, 20, 100)
+        }
+        return data
+    
+    def transform_data(**context):
+        """Transform and clean sensor data"""
+        data = context['task_instance'].xcom_pull(task_ids='extract_data')
+        
+        # Basic data cleaning and transformation
+        df = pd.DataFrame(data)
+        df = df.dropna()
+        df['temperature_celsius'] = df['temperature']
+        df['temperature_fahrenheit'] = df['temperature'] * 9/5 + 32
+        
+        return df.to_dict()
+    
+    def validate_data(**context):
+        """Validate data quality"""
+        data = context['task_instance'].xcom_pull(task_ids='transform_data')
+        df = pd.DataFrame(data)
+        
+        # Data quality checks
+        checks = {
+            'row_count': len(df),
+            'missing_values': df.isnull().sum().sum(),
+            'temperature_range_valid': ((df['temperature_celsius'] >= -50) & (df['temperature_celsius'] <= 50)).all(),
+            'humidity_range_valid': ((df['humidity'] >= 0) & (df['humidity'] <= 100)).all()
+        }
+        
+        if not checks['temperature_range_valid'] or not checks['humidity_range_valid']:
+            raise ValueError("Data quality validation failed")
+        
+        return checks
+    
+    # Extract data from sensors
+    extract_task = PythonOperator(
+        task_id='extract_data',
+        python_callable=extract_sensor_data,
+        dag=dag,
+    )
+    
+    # Transform data
+    transform_task = PythonOperator(
+        task_id='transform_data',
+        python_callable=transform_data,
+        dag=dag,
+    )
+    
+    # Validate data quality
+    validate_task = PythonOperator(
+        task_id='validate_data',
+        python_callable=validate_data,
+        dag=dag,
+    )
+    
+    # Run ML inference on AMD64 nodes
+    ml_inference_task = KubernetesPodOperator(
+        task_id='ml_inference',
+        name='ml-inference-pod',
+        namespace='data-pipeline',
+        image='tensorflow/serving:2.13.0',
+        cmds=['python3'],
+        arguments=['-c', 'print("Running ML inference on architecture:", os.environ.get("NODE_ARCH", "unknown"))'],
+        env_vars={'NODE_ARCH': '{{ var.value.node_architecture }}'},
+        node_selector={'kubernetes.io/arch': 'amd64'},
+        dag=dag,
+    )
+    
+    # Store results on ARM64 for efficiency
+    store_results_task = KubernetesPodOperator(
+        task_id='store_results',
+        name='store-results-pod',
+        namespace='data-pipeline',
+        image='postgres:15-alpine',
+        cmds=['psql'],
+        arguments=['-c', 'INSERT INTO ml_results (timestamp, predictions) VALUES (NOW(), $1)'],
+        node_selector={'kubernetes.io/arch': 'arm64'},
+        dag=dag,
+    )
+    
+    # Send notification
+    notify_task = SimpleHttpOperator(
+        task_id='send_notification',
+        http_conn_id='homelab_webhook',
+        endpoint='/api/notifications',
+        method='POST',
+        data={'pipeline': 'ml_pipeline', 'status': 'completed'},
+        dag=dag,
+    )
+    
+    # Define task dependencies
+    extract_task >> transform_task >> validate_task >> ml_inference_task >> store_results_task >> notify_task
+
+  homelab_backup_pipeline.py: |
+    from datetime import datetime, timedelta
+    from airflow import DAG
+    from airflow.operators.bash import BashOperator
+    from airflow.providers.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
+    from airflow.operators.python import PythonOperator
+    
+    default_args = {
+        'owner': 'homelab',
+        'depends_on_past': False,
+        'email_on_failure': True,
+        'email_on_retry': False,
+        'retries': 2,
+        'retry_delay': timedelta(minutes=10),
+    }
+    
+    dag = DAG(
+        'homelab_backup_pipeline',
+        default_args=default_args,
+        description='Automated backup and maintenance pipeline',
+        schedule_interval='0 2 * * *',  # Daily at 2 AM
+        start_date=datetime(2024, 1, 1),
+        catchup=False,
+        tags=['backup', 'maintenance', 'homelab'],
+    )
+    
+    # Database backup
+    db_backup_task = KubernetesPodOperator(
+        task_id='database_backup',
+        name='db-backup-pod',
+        namespace='data-pipeline',
+        image='postgres:15-alpine',
+        cmds=['pg_dump'],
+        arguments=['-h', 'postgres', '-U', 'postgres', '-d', 'homelab', '-f', '/backup/db_backup.sql'],
+        node_selector={'kubernetes.io/arch': 'amd64'},  # Use AMD64 for DB operations
+        dag=dag,
+    )
+    
+    # Application data backup using Velero
+    velero_backup_task = BashOperator(
+        task_id='velero_backup',
+        bash_command='kubectl create backup cluster-backup-$(date +%Y%m%d-%H%M%S) --include-namespaces=ml-serving,monitoring,event-driven',
+        dag=dag,
+    )
+    
+    # Cleanup old backups
+    cleanup_task = BashOperator(
+        task_id='cleanup_old_backups',
+        bash_command='find /backup -name "*.sql" -mtime +7 -delete',
+        dag=dag,
+    )
+    
+    # System optimization
+    optimize_task = KubernetesPodOperator(
+        task_id='system_optimization',
+        name='optimization-pod',
+        namespace='data-pipeline',
+        image='python:3.11-slim',
+        cmds=['python3'],
+        arguments=['-c', '''
+import subprocess
+import json
+
+# Optimize Docker images
+subprocess.run(["docker", "system", "prune", "-f"])
+
+# Optimize Kubernetes resources
+subprocess.run(["kubectl", "delete", "pods", "--field-selector=status.phase=Succeeded", "--all-namespaces"])
+
+print("System optimization completed")
+        '''],
+        node_selector={'kubernetes.io/arch': 'arm64'},  # Use ARM64 for maintenance
+        dag=dag,
+    )
+    
+    db_backup_task >> velero_backup_task >> cleanup_task >> optimize_task
+
+  homelab_monitoring_pipeline.py: |
+    from datetime import datetime, timedelta
+    from airflow import DAG
+    from airflow.operators.python import PythonOperator
+    from airflow.providers.http.operators.http import SimpleHttpOperator
+    from airflow.providers.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
+    import requests
+    import json
+    
+    default_args = {
+        'owner': 'homelab',
+        'depends_on_past': False,
+        'email_on_failure': False,
+        'retries': 1,
+        'retry_delay': timedelta(minutes=5),
+    }
+    
+    dag = DAG(
+        'homelab_monitoring_pipeline',
+        default_args=default_args,
+        description='System monitoring and alerting pipeline',
+        schedule_interval=timedelta(minutes=15),  # Every 15 minutes
+        start_date=datetime(2024, 1, 1),
+        catchup=False,
+        tags=['monitoring', 'alerting', 'homelab'],
+    )
+    
+    def collect_metrics():
+        """Collect system metrics"""
+        try:
+            # Query Prometheus for key metrics
+            prometheus_url = "http://prometheus.monitoring:9090"
+            
+            queries = {
+                'cpu_usage': 'avg(100 - (irate(node_cpu_seconds_total{mode="idle"}[5m]) * 100))',
+                'memory_usage': 'avg((1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100)',
+                'power_consumption': 'sum(node_power_consumption_watts)',
+                'gpu_utilization': 'avg(DCGM_FI_DEV_GPU_UTIL)',
+                'pod_count': 'count(kube_pod_info)',
+                'failed_pods': 'count(kube_pod_status_phase{phase="Failed"})'
+            }
+            
+            metrics = {}
+            for name, query in queries.items():
+                response = requests.get(f"{prometheus_url}/api/v1/query",
+                                       params={'query': query})
+                if response.status_code == 200:
+                    data = response.json()
+                    if data['data']['result']:
+                        metrics[name] = float(data['data']['result'][0]['value'][1])
+                    else:
+                        metrics[name] = 0
+            
+            return metrics
+            
+        except Exception as e:
+            print(f"Failed to collect metrics: {e}")
+            return {}
+    
+    def analyze_system_health(**context):
+        """Analyze system health based on metrics"""
+        metrics = context['task_instance'].xcom_pull(task_ids='collect_metrics')
+        
+        health_score = 100
+        alerts = []
+        
+        # CPU usage check
+        if metrics.get('cpu_usage', 0) > 90:
+            health_score -= 20
+            alerts.append({'severity': 'critical', 'message': f"High CPU usage: {metrics['cpu_usage']}%"})
+        elif metrics.get('cpu_usage', 0) > 80:
+            health_score -= 10
+            alerts.append({'severity': 'warning', 'message': f"Elevated CPU usage: {metrics['cpu_usage']}%"})
+        
+        # Memory usage check
+        if metrics.get('memory_usage', 0) > 90:
+            health_score -= 20
+            alerts.append({'severity': 'critical', 'message': f"High memory usage: {metrics['memory_usage']}%"})
+        
+        # Power consumption check
+        if metrics.get('power_consumption', 0) > 120:
+            health_score -= 15
+            alerts.append({'severity': 'warning', 'message': f"High power consumption: {metrics['power_consumption']}W"})
+        
+        # Failed pods check
+        if metrics.get('failed_pods', 0) > 0:
+            health_score -= 25
+            alerts.append({'severity': 'critical', 'message': f"{metrics['failed_pods']} failed pods detected"})
+        
+        return {
+            'health_score': health_score,
+            'alerts': alerts,
+            'metrics': metrics
+        }
+    
+    def generate_report(**context):
+        """Generate system health report"""
+        health_data = context['task_instance'].xcom_pull(task_ids='analyze_health')
+        
+        report = {
+            'timestamp': datetime.now().isoformat(),
+            'health_score': health_data['health_score'],
+            'status': 'healthy' if health_data['health_score'] > 80 else 'degraded' if health_data['health_score'] > 60 else 'critical',
+            'alerts': health_data['alerts'],
+            'metrics': health_data['metrics']
+        }
+        
+        # Store report (in real implementation, this would go to a database)
+        print(f"System Health Report: {json.dumps(report, indent=2)}")
+        
+        return report
+    
+    # Collect system metrics
+    collect_task = PythonOperator(
+        task_id='collect_metrics',
+        python_callable=collect_metrics,
+        dag=dag,
+    )
+    
+    # Analyze system health
+    analyze_task = PythonOperator(
+        task_id='analyze_health',
+        python_callable=analyze_system_health,
+        dag=dag,
+    )
+    
+    # Generate health report
+    report_task = PythonOperator(
+        task_id='generate_report',
+        python_callable=generate_report,
+        dag=dag,
+    )
+    
+    # Update dashboard
+    dashboard_update_task = SimpleHttpOperator(
+        task_id='update_dashboard',
+        http_conn_id='dashboard_api',
+        endpoint='/api/health',
+        method='POST',
+        data='{{ task_instance.xcom_pull(task_ids="generate_report") }}',
+        dag=dag,
+    )
+    
+    collect_task >> analyze_task >> report_task >> dashboard_update_task
+
+---
+# PostgreSQL Database for Airflow
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: airflow-postgres
+  namespace: data-pipeline
+spec:
+  serviceName: airflow-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-postgres
+  template:
+    metadata:
+      labels:
+        app: airflow-postgres
+    spec:
+      # Run on AMD64 for database performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: postgres
+        image: postgres:15
+        env:
+        - name: POSTGRES_DB
+          value: "airflow"
+        - name: POSTGRES_USER
+          value: "airflow"
+        - name: POSTGRES_PASSWORD
+          value: "airflow"
+        - name: PGDATA
+          value: "/var/lib/postgresql/data/pgdata"
+        ports:
+        - containerPort: 5432
+          name: postgres
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ssd
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+# Redis for Celery Broker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-redis
+  namespace: data-pipeline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-redis
+  template:
+    metadata:
+      labels:
+        app: airflow-redis
+    spec:
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: redis
+        image: redis:7.0-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        args:
+        - redis-server
+        - --maxmemory
+        - "512mb"
+        - --maxmemory-policy
+        - "allkeys-lru"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+---
+# Flower for Celery Monitoring
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-flower
+  namespace: data-pipeline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-flower
+  template:
+    metadata:
+      labels:
+        app: airflow-flower
+    spec:
+      containers:
+      - name: flower
+        image: apache/airflow:2.7.0
+        command: ["airflow", "celery", "flower"]
+        ports:
+        - containerPort: 5555
+          name: flower
+        env:
+        - name: AIRFLOW__CELERY__BROKER_URL
+          value: "redis://airflow-redis:6379/0"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+
+---
+# Apache Kafka for Stream Processing
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: data-pipeline
+spec:
+  serviceName: kafka
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      # Distribute across architectures for resilience
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: kafka
+              topologyKey: kubernetes.io/arch
+      containers:
+      - name: kafka
+        image: confluentinc/cp-kafka:7.4.0
+        ports:
+        - containerPort: 9092
+          name: kafka
+        env:
+        - name: KAFKA_BROKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: KAFKA_ZOOKEEPER_CONNECT
+          value: "zookeeper:2181"
+        - name: KAFKA_ADVERTISED_LISTENERS
+          value: "PLAINTEXT://$(hostname -f):9092"
+        - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+          value: "PLAINTEXT:PLAINTEXT"
+        - name: KAFKA_INTER_BROKER_LISTENER_NAME
+          value: "PLAINTEXT"
+        - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+          value: "3"
+        - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+          value: "true"
+        volumeMounts:
+        - name: kafka-data
+          mountPath: /var/lib/kafka/data
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+  volumeClaimTemplates:
+  - metadata:
+      name: kafka-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ssd
+      resources:
+        requests:
+          storage: 50Gi
+
+---
+# Zookeeper for Kafka
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zookeeper
+  namespace: data-pipeline
+spec:
+  serviceName: zookeeper
+  replicas: 3
+  selector:
+    matchLabels:
+      app: zookeeper
+  template:
+    metadata:
+      labels:
+        app: zookeeper
+    spec:
+      containers:
+      - name: zookeeper
+        image: confluentinc/cp-zookeeper:7.4.0
+        ports:
+        - containerPort: 2181
+          name: client
+        - containerPort: 2888
+          name: server
+        - containerPort: 3888
+          name: leader-election
+        env:
+        - name: ZOOKEEPER_CLIENT_PORT
+          value: "2181"
+        - name: ZOOKEEPER_TICK_TIME
+          value: "2000"
+        - name: ZOOKEEPER_SERVERS
+          value: "zookeeper-0:2888:3888;zookeeper-1:2888:3888;zookeeper-2:2888:3888"
+        volumeMounts:
+        - name: zookeeper-data
+          mountPath: /var/lib/zookeeper
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+  volumeClaimTemplates:
+  - metadata:
+      name: zookeeper-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ssd
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+# Stream Processing with Kafka Streams
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-processor
+  namespace: data-pipeline
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: stream-processor
+  template:
+    metadata:
+      labels:
+        app: stream-processor
+    spec:
+      serviceAccountName: stream-processor
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: processor
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kafka-python prometheus-client
+          python3 /app/stream_processor.py
+        volumeMounts:
+        - name: processor-app
+          mountPath: /app
+        env:
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          value: "kafka:9092"
+        - name: PROCESSOR_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+      volumes:
+      - name: processor-app
+        configMap:
+          name: stream-processor-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stream-processor-app
+  namespace: data-pipeline
+data:
+  stream_processor.py: |
+    #!/usr/bin/env python3
+    import json
+    import time
+    import logging
+    from datetime import datetime
+    from kafka import KafkaConsumer, KafkaProducer
+    from prometheus_client import Counter, Histogram, Gauge, start_http_server
+    import threading
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Metrics
+    MESSAGES_PROCESSED = Counter('stream_messages_processed_total', 'Messages processed', ['topic', 'status'])
+    PROCESSING_TIME = Histogram('stream_processing_seconds', 'Processing time per message')
+    ACTIVE_CONSUMERS = Gauge('stream_active_consumers', 'Active consumers')
+    LAG_MESSAGES = Gauge('stream_consumer_lag_messages', 'Consumer lag in messages', ['topic'])
+    
+    class StreamProcessor:
+        def __init__(self):
+            self.kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092").split(",")
+            self.processor_id = os.getenv("PROCESSOR_ID", "processor-1")
+            
+            # Initialize Kafka consumer and producer
+            self.consumer = KafkaConsumer(
+                'sensor-data', 'ml-predictions', 'alerts',
+                bootstrap_servers=self.kafka_servers,
+                auto_offset_reset='latest',
+                enable_auto_commit=True,
+                group_id=f'stream-processor-{self.processor_id}',
+                value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+            )
+            
+            self.producer = KafkaProducer(
+                bootstrap_servers=self.kafka_servers,
+                value_serializer=lambda x: json.dumps(x).encode('utf-8')
+            )
+            
+        def process_sensor_data(self, message):
+            """Process sensor data messages"""
+            try:
+                data = message.value
+                
+                # Extract sensor readings
+                temperature = data.get('temperature')
+                humidity = data.get('humidity')
+                timestamp = data.get('timestamp', datetime.utcnow().isoformat())
+                
+                # Simple anomaly detection
+                anomalies = []
+                if temperature and (temperature > 40 or temperature < -20):
+                    anomalies.append({
+                        'type': 'temperature_anomaly',
+                        'value': temperature,
+                        'threshold': '40/-20',
+                        'severity': 'high' if abs(temperature) > 50 else 'medium'
+                    })
+                
+                if humidity and (humidity > 95 or humidity < 5):
+                    anomalies.append({
+                        'type': 'humidity_anomaly',
+                        'value': humidity,
+                        'threshold': '95/5',
+                        'severity': 'medium'
+                    })
+                
+                # Calculate derived metrics
+                processed_data = {
+                    'original_data': data,
+                    'processed_at': datetime.utcnow().isoformat(),
+                    'processor_id': self.processor_id,
+                    'anomalies': anomalies,
+                    'metrics': {
+                        'temperature_celsius': temperature,
+                        'temperature_fahrenheit': temperature * 9/5 + 32 if temperature else None,
+                        'heat_index': self.calculate_heat_index(temperature, humidity),
+                        'comfort_level': self.assess_comfort_level(temperature, humidity)
+                    }
+                }
+                
+                # Send to processed data topic
+                self.producer.send('processed-sensor-data', processed_data)
+                
+                # Send alerts if anomalies detected
+                if anomalies:
+                    alert = {
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'source': 'stream-processor',
+                        'device_id': data.get('device_id', 'unknown'),
+                        'anomalies': anomalies,
+                        'severity': max([a['severity'] for a in anomalies], key=lambda x: ['low', 'medium', 'high'].index(x))
+                    }
+                    self.producer.send('alerts', alert)
+                
+                MESSAGES_PROCESSED.labels(topic='sensor-data', status='success').inc()
+                return processed_data
+                
+            except Exception as e:
+                logger.error(f"Failed to process sensor data: {e}")
+                MESSAGES_PROCESSED.labels(topic='sensor-data', status='error').inc()
+                return None
+        
+        def calculate_heat_index(self, temperature, humidity):
+            """Calculate heat index from temperature and humidity"""
+            if not temperature or not humidity:
+                return None
+            
+            # Simplified heat index calculation
+            t = temperature
+            h = humidity
+            
+            heat_index = -42.379 + 2.04901523*t + 10.14333127*h - 0.22475541*t*h
+            heat_index += -0.00683783*t*t - 0.05481717*h*h + 0.00122874*t*t*h
+            heat_index += 0.00085282*t*h*h - 0.00000199*t*t*h*h
+            
+            return round(heat_index, 2)
+        
+        def assess_comfort_level(self, temperature, humidity):
+            """Assess comfort level based on temperature and humidity"""
+            if not temperature or not humidity:
+                return "unknown"
+            
+            if 20 <= temperature <= 26 and 40 <= humidity <= 60:
+                return "comfortable"
+            elif 18 <= temperature <= 28 and 30 <= humidity <= 70:
+                return "acceptable"
+            else:
+                return "uncomfortable"
+        
+        def process_ml_predictions(self, message):
+            """Process ML prediction results"""
+            try:
+                data = message.value
+                
+                # Extract prediction data
+                predictions = data.get('predictions', [])
+                confidence = data.get('confidence', 0)
+                model_name = data.get('model_name', 'unknown')
+                
+                # Aggregate predictions
+                processed_predictions = {
+                    'original_predictions': predictions,
+                    'aggregated_prediction': max(predictions) if predictions else 0,
+                    'confidence_level': 'high' if confidence > 0.8 else 'medium' if confidence > 0.5 else 'low',
+                    'model_name': model_name,
+                    'processed_at': datetime.utcnow().isoformat(),
+                    'processor_id': self.processor_id
+                }
+                
+                # Send to aggregated predictions topic
+                self.producer.send('aggregated-predictions', processed_predictions)
+                
+                MESSAGES_PROCESSED.labels(topic='ml-predictions', status='success').inc()
+                return processed_predictions
+                
+            except Exception as e:
+                logger.error(f"Failed to process ML predictions: {e}")
+                MESSAGES_PROCESSED.labels(topic='ml-predictions', status='error').inc()
+                return None
+        
+        def process_alerts(self, message):
+            """Process and route alerts"""
+            try:
+                alert = message.value
+                
+                severity = alert.get('severity', 'low')
+                alert_type = alert.get('type', 'unknown')
+                
+                # Enrich alert with additional context
+                enriched_alert = {
+                    **alert,
+                    'processed_at': datetime.utcnow().isoformat(),
+                    'processor_id': self.processor_id,
+                    'routing': {
+                        'channels': self.determine_alert_channels(severity, alert_type),
+                        'escalation_level': self.determine_escalation_level(severity)
+                    }
+                }
+                
+                # Route to appropriate channels
+                if severity in ['high', 'critical']:
+                    self.producer.send('critical-alerts', enriched_alert)
+                else:
+                    self.producer.send('standard-alerts', enriched_alert)
+                
+                MESSAGES_PROCESSED.labels(topic='alerts', status='success').inc()
+                return enriched_alert
+                
+            except Exception as e:
+                logger.error(f"Failed to process alert: {e}")
+                MESSAGES_PROCESSED.labels(topic='alerts', status='error').inc()
+                return None
+        
+        def determine_alert_channels(self, severity, alert_type):
+            """Determine which channels to send alerts to"""
+            channels = ['dashboard']
+            
+            if severity in ['high', 'critical']:
+                channels.extend(['email', 'slack'])
+            
+            if alert_type in ['security', 'backup_failure']:
+                channels.append('pagerduty')
+            
+            return channels
+        
+        def determine_escalation_level(self, severity):
+            """Determine alert escalation level"""
+            escalation_map = {
+                'low': 0,
+                'medium': 1,
+                'high': 2,
+                'critical': 3
+            }
+            return escalation_map.get(severity, 0)
+        
+        def run(self):
+            """Main message processing loop"""
+            logger.info(f"Starting Stream Processor {self.processor_id}")
+            
+            # Start metrics server
+            start_http_server(8080)
+            
+            ACTIVE_CONSUMERS.set(1)
+            
+            try:
+                for message in self.consumer:
+                    with PROCESSING_TIME.time():
+                        topic = message.topic
+                        
+                        if topic == 'sensor-data':
+                            self.process_sensor_data(message)
+                        elif topic == 'ml-predictions':
+                            self.process_ml_predictions(message)
+                        elif topic == 'alerts':
+                            self.process_alerts(message)
+                        else:
+                            logger.warning(f"Unknown topic: {topic}")
+                
+            except KeyboardInterrupt:
+                logger.info("Shutting down stream processor")
+            finally:
+                ACTIVE_CONSUMERS.set(0)
+                self.consumer.close()
+                self.producer.close()
+    
+    if __name__ == "__main__":
+        processor = StreamProcessor()
+        processor.run()
+
+---
+# Persistent Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-dags
+  namespace: data-pipeline
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-logs
+  namespace: data-pipeline
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: longhorn-ssd
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-webserver
+  namespace: data-pipeline
+spec:
+  selector:
+    app: airflow-webserver
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-postgres
+  namespace: data-pipeline
+spec:
+  selector:
+    app: airflow-postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-redis
+  namespace: data-pipeline
+spec:
+  selector:
+    app: airflow-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-flower
+  namespace: data-pipeline
+spec:
+  selector:
+    app: airflow-flower
+  ports:
+  - port: 5555
+    targetPort: 5555
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: data-pipeline
+spec:
+  clusterIP: None
+  selector:
+    app: kafka
+  ports:
+  - port: 9092
+    targetPort: 9092
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zookeeper
+  namespace: data-pipeline
+spec:
+  clusterIP: None
+  selector:
+    app: zookeeper
+  ports:
+  - port: 2181
+    targetPort: 2181
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stream-processor
+  namespace: data-pipeline
+spec:
+  selector:
+    app: stream-processor
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow
+  namespace: data-pipeline
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stream-processor
+  namespace: data-pipeline
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow
+  namespace: data-pipeline
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create", "get", "list"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow
+  namespace: data-pipeline
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: airflow
+subjects:
+- kind: ServiceAccount
+  name: airflow
+  namespace: data-pipeline
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: stream-processor
+  namespace: data-pipeline
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: airflow
+subjects:
+- kind: ServiceAccount
+  name: stream-processor
+  namespace: data-pipeline
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: data-pipeline-ingress
+  namespace: data-pipeline
+spec:
+  rules:
+  - host: airflow.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: airflow-webserver
+            port:
+              number: 8080
+  - host: flower.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: airflow-flower
+            port:
+              number: 5555

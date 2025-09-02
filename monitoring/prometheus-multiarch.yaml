@@ -1,0 +1,456 @@
+# Prometheus monitoring stack optimized for multi-architecture
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    name: monitoring
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: 'homelab-multiarch'
+        environment: 'production'
+
+    rule_files:
+      - "/etc/prometheus/rules/*.yml"
+
+    alerting:
+      alertmanagers:
+      - static_configs:
+        - targets:
+          - alertmanager:9093
+
+    scrape_configs:
+    # Prometheus self-monitoring
+    - job_name: 'prometheus'
+      static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          arch: 'unknown'
+
+    # Node exporter - architecture specific
+    - job_name: 'node-exporter-amd64'
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+        target_label: architecture
+      - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+        action: keep
+        regex: amd64
+      - source_labels: [__address__]
+        regex: '(.*):10250'
+        target_label: __address__
+        replacement: '${1}:9100'
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+      - target_label: node_role
+        replacement: 'compute'
+
+    - job_name: 'node-exporter-arm64'
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+        target_label: architecture
+      - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+        action: keep
+        regex: arm64
+      - source_labels: [__address__]
+        regex: '(.*):10250'
+        target_label: __address__
+        replacement: '${1}:9100'
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+      - target_label: node_role
+        replacement: 'edge'
+
+    - job_name: 'node-exporter-arm'
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+        target_label: architecture
+      - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+        action: keep
+        regex: arm
+      - source_labels: [__address__]
+        regex: '(.*):10250'
+        target_label: __address__
+        replacement: '${1}:9100'
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+      - target_label: node_role
+        replacement: 'sensor'
+
+    # Kubernetes API server
+    - job_name: 'kubernetes-apiservers'
+      kubernetes_sd_configs:
+      - role: endpoints
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: default;kubernetes;https
+
+    # Kubelet metrics
+    - job_name: 'kubernetes-nodes'
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/${1}/proxy/metrics
+
+    # Container metrics from cAdvisor
+    - job_name: 'kubernetes-cadvisor'
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+
+    # Service discovery for application metrics
+    - job_name: 'kubernetes-service-endpoints'
+      kubernetes_sd_configs:
+      - role: endpoints
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+      - action: labelmap
+        regex: __meta_kubernetes_service_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: kubernetes_namespace
+      - source_labels: [__meta_kubernetes_service_name]
+        action: replace
+        target_label: kubernetes_name
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        action: replace
+        target_label: kubernetes_node
+
+    # Dashboard API metrics
+    - job_name: 'dashboard-api'
+      static_configs:
+      - targets: ['dashboard-api.dashboard:8080']
+        labels:
+          service: 'dashboard-api'
+          component: 'api'
+
+    # PiHole metrics
+    - job_name: 'pihole'
+      static_configs:
+      - targets: ['pihole-primary.dns-system:9617', 'pihole-secondary.dns-system:9617']
+        labels:
+          service: 'pihole'
+          component: 'dns'
+          architecture: 'arm64'
+
+  # Architecture-specific alerting rules
+  multiarch-alerts.yml: |
+    groups:
+    - name: architecture.rules
+      rules:
+      # Power consumption estimates
+      - record: homelab:power_consumption:amd64
+        expr: count(up{architecture="amd64"}) * 45
+
+      - record: homelab:power_consumption:arm64
+        expr: count(up{architecture="arm64"}) * 7
+
+      - record: homelab:power_consumption:arm
+        expr: count(up{architecture="arm"}) * 2.5
+
+      - record: homelab:power_consumption:total
+        expr: homelab:power_consumption:amd64 + homelab:power_consumption:arm64 + homelab:power_consumption:arm
+
+      # CPU efficiency by architecture
+      - record: homelab:cpu_efficiency:by_arch
+        expr: avg by (architecture) (100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100))
+
+      # Memory efficiency by architecture
+      - record: homelab:memory_efficiency:by_arch
+        expr: avg by (architecture) ((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100)
+
+    - name: multiarch.alerts
+      rules:
+      # High resource usage on ARM nodes (more sensitive)
+      - alert: HighCPUOnARM
+        expr: homelab:cpu_efficiency:by_arch{architecture=~"arm.*"} > 70
+        for: 5m
+        labels:
+          severity: warning
+          architecture: '{{ $labels.architecture }}'
+        annotations:
+          summary: "High CPU usage on {{ $labels.architecture }} nodes"
+          description: "{{ $labels.architecture }} nodes have averaged {{ $value }}% CPU usage for more than 5 minutes"
+
+      - alert: HighMemoryOnARM
+        expr: homelab:memory_efficiency:by_arch{architecture=~"arm.*"} > 80
+        for: 5m
+        labels:
+          severity: critical
+          architecture: '{{ $labels.architecture }}'
+        annotations:
+          summary: "High memory usage on {{ $labels.architecture }} nodes"
+          description: "{{ $labels.architecture }} nodes have averaged {{ $value }}% memory usage for more than 5 minutes"
+
+      # AMD64 performance alerts (higher thresholds)
+      - alert: HighCPUOnAMD64
+        expr: homelab:cpu_efficiency:by_arch{architecture="amd64"} > 85
+        for: 10m
+        labels:
+          severity: warning
+          architecture: amd64
+        annotations:
+          summary: "High CPU usage on AMD64 compute nodes"
+          description: "AMD64 nodes have averaged {{ $value }}% CPU usage for more than 10 minutes"
+
+      - alert: HighMemoryOnAMD64
+        expr: homelab:memory_efficiency:by_arch{architecture="amd64"} > 90
+        for: 10m
+        labels:
+          severity: critical
+          architecture: amd64
+        annotations:
+          summary: "High memory usage on AMD64 compute nodes"
+          description: "AMD64 nodes have averaged {{ $value }}% memory usage for more than 10 minutes"
+
+      # Power consumption alerts
+      - alert: HighPowerConsumption
+        expr: homelab:power_consumption:total > 100
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cluster power consumption is high"
+          description: "Total cluster power consumption is {{ $value }}W, exceeding 100W threshold"
+
+      # Architecture-specific service alerts
+      - alert: EdgeServiceDown
+        expr: up{architecture="arm64",node_role="edge"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Edge service is down"
+          description: "Edge service {{ $labels.job }} on {{ $labels.instance }} has been down for more than 2 minutes"
+
+      # Cross-architecture redundancy alerts
+      - alert: SingleArchitectureFailure
+        expr: count by (architecture) (up) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Complete {{ $labels.architecture }} architecture failure"
+          description: "All {{ $labels.architecture }} nodes are down - cluster redundancy compromised"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: prometheus
+      # Prefer AMD64 for better performance with large datasets
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: prometheus
+        image: prom/prometheus:latest
+        args:
+        - '--config.file=/etc/prometheus/prometheus.yml'
+        - '--storage.tsdb.path=/prometheus'
+        - '--web.console.libraries=/etc/prometheus/console_libraries'
+        - '--web.console.templates=/etc/prometheus/consoles'
+        - '--web.enable-lifecycle'
+        - '--web.enable-admin-api'
+        - '--storage.tsdb.retention.time=30d'
+        - '--storage.tsdb.retention.size=10GB'
+        ports:
+        - containerPort: 9090
+          name: web
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "200m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: prometheus-config
+          mountPath: /etc/prometheus
+        - name: prometheus-rules
+          mountPath: /etc/prometheus/rules
+        - name: prometheus-storage
+          mountPath: /prometheus
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9090
+          initialDelaySeconds: 30
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+          initialDelaySeconds: 30
+          timeoutSeconds: 10
+      volumes:
+      - name: prometheus-config
+        configMap:
+          name: prometheus-config
+          items:
+          - key: prometheus.yml
+            path: prometheus.yml
+      - name: prometheus-rules
+        configMap:
+          name: prometheus-config
+          items:
+          - key: multiarch-alerts.yml
+            path: multiarch-alerts.yml
+      - name: prometheus-storage
+        persistentVolumeClaim:
+          claimName: prometheus-storage
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-storage
+  namespace: monitoring
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+- nonResourceURLs: ["/metrics"]
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: monitoring
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+spec:
+  type: ClusterIP
+  ports:
+  - port: 9090
+    targetPort: 9090
+    name: web
+  selector:
+    app: prometheus

@@ -1,0 +1,873 @@
+# Touchscreen Monitoring Dashboard - Optimized for 1024x600 display
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: touchscreen
+  labels:
+    name: touchscreen
+
+---
+# Touchscreen Dashboard Backend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: touchscreen-dashboard
+  namespace: touchscreen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: touchscreen-dashboard
+  template:
+    metadata:
+      labels:
+        app: touchscreen-dashboard
+    spec:
+      # Run on ARM for efficiency near the touchscreen
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      containers:
+      - name: dashboard
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+          name: web
+        volumeMounts:
+        - name: dashboard-content
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+        resources:
+          requests:
+            cpu: "25m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+      volumes:
+      - name: dashboard-content
+        configMap:
+          name: touchscreen-content
+      - name: nginx-config
+        configMap:
+          name: touchscreen-nginx
+
+---
+# Touchscreen Dashboard Content
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: touchscreen-content
+  namespace: touchscreen
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=1024, height=600, initial-scale=1.0">
+        <title>Homelab Monitor</title>
+        <link rel="stylesheet" href="style.css">
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <div class="logo">
+                    <h1>🏠 Homelab</h1>
+                    <span class="subtitle">Multi-Architecture Cluster</span>
+                </div>
+                <div class="status" id="clusterStatus">
+                    <span class="status-indicator healthy"></span>
+                    <span>All Systems Operational</span>
+                </div>
+                <div class="time" id="currentTime"></div>
+            </header>
+
+            <div class="main-grid">
+                <!-- System Overview -->
+                <div class="card overview">
+                    <h2>🖥️ System Overview</h2>
+                    <div class="metrics-grid">
+                        <div class="metric">
+                            <span class="metric-label">Nodes</span>
+                            <span class="metric-value" id="nodeCount">—</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Pods</span>
+                            <span class="metric-value" id="podCount">—</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Power</span>
+                            <span class="metric-value" id="powerUsage">79W</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Uptime</span>
+                            <span class="metric-value" id="uptime">99.9%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Architecture Distribution -->
+                <div class="card arch-dist">
+                    <h2>🏗️ Architecture</h2>
+                    <div class="arch-bars">
+                        <div class="arch-bar">
+                            <span class="arch-label">AMD64</span>
+                            <div class="bar">
+                                <div class="bar-fill amd64" style="width: 45%"></div>
+                            </div>
+                            <span class="arch-count">45W</span>
+                        </div>
+                        <div class="arch-bar">
+                            <span class="arch-label">ARM64</span>
+                            <div class="bar">
+                                <div class="bar-fill arm64" style="width: 28%"></div>
+                            </div>
+                            <span class="arch-count">28W</span>
+                        </div>
+                        <div class="arch-bar">
+                            <span class="arch-label">ARM</span>
+                            <div class="bar">
+                                <div class="bar-fill arm" style="width: 6%"></div>
+                            </div>
+                            <span class="arch-count">6W</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Service Status -->
+                <div class="card services">
+                    <h2>🛠️ Services</h2>
+                    <div class="service-list">
+                        <div class="service-item healthy" data-service="homer">
+                            <span class="service-name">Homer Dashboard</span>
+                            <span class="service-status">●</span>
+                        </div>
+                        <div class="service-item healthy" data-service="homeassistant">
+                            <span class="service-name">Home Assistant</span>
+                            <span class="service-status">●</span>
+                        </div>
+                        <div class="service-item healthy" data-service="jellyfin">
+                            <span class="service-name">Jellyfin</span>
+                            <span class="service-status">●</span>
+                        </div>
+                        <div class="service-item healthy" data-service="pihole">
+                            <span class="service-name">Pi-hole</span>
+                            <span class="service-status">●</span>
+                        </div>
+                        <div class="service-item healthy" data-service="portainer">
+                            <span class="service-name">Portainer</span>
+                            <span class="service-status">●</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Temperature Monitoring -->
+                <div class="card temperature">
+                    <h2>🌡️ Temperature</h2>
+                    <div class="temp-grid">
+                        <div class="temp-item">
+                            <span class="temp-label">Living Room</span>
+                            <span class="temp-value" id="tempLiving">22.5°C</span>
+                        </div>
+                        <div class="temp-item">
+                            <span class="temp-label">Bedroom</span>
+                            <span class="temp-value" id="tempBedroom">21.8°C</span>
+                        </div>
+                        <div class="temp-item">
+                            <span class="temp-label">Server Room</span>
+                            <span class="temp-value critical" id="tempServer">24.5°C</span>
+                        </div>
+                        <div class="temp-item">
+                            <span class="temp-label">Average</span>
+                            <span class="temp-value" id="tempAverage">22.9°C</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Quick Actions -->
+                <div class="card actions">
+                    <h2>⚡ Quick Actions</h2>
+                    <div class="action-buttons">
+                        <button class="action-btn" onclick="openService('homer')">
+                            📱 Dashboard
+                        </button>
+                        <button class="action-btn" onclick="openService('grafana')">
+                            📊 Metrics
+                        </button>
+                        <button class="action-btn" onclick="openService('homeassistant')">
+                            🏠 Smart Home
+                        </button>
+                        <button class="action-btn" onclick="toggleScreensaver()">
+                            🌙 Screensaver
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <footer>
+                <div class="footer-stats">
+                    <span>💾 Storage: 85% • 🌐 Network: 1Gb/s • 🔋 Efficiency: 92%</span>
+                </div>
+            </footer>
+        </div>
+
+        <!-- Screensaver Overlay -->
+        <div class="screensaver" id="screensaver">
+            <div class="screensaver-content">
+                <div class="clock">
+                    <div class="time-display" id="screensaverTime">00:00</div>
+                    <div class="date-display" id="screensaverDate">Monday, January 1</div>
+                </div>
+                <div class="system-stats">
+                    <div class="stat-item">
+                        <span class="stat-label">Load</span>
+                        <div class="stat-bar">
+                            <div class="stat-fill" id="loadBar"></div>
+                        </div>
+                    </div>
+                    <div class="floating-icons">
+                        <div class="floating-icon">🏠</div>
+                        <div class="floating-icon">📊</div>
+                        <div class="floating-icon">🎬</div>
+                        <div class="floating-icon">🛠️</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script src="dashboard.js"></script>
+    </body>
+    </html>
+
+  style.css: |
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+    }
+
+    body {
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        background: linear-gradient(135deg, #1e3c72, #2a5298);
+        color: white;
+        width: 1024px;
+        height: 600px;
+        overflow: hidden;
+        user-select: none;
+    }
+
+    .container {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        padding: 10px;
+    }
+
+    header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 15px;
+        height: 60px;
+    }
+
+    .logo h1 {
+        font-size: 24px;
+        margin-bottom: 2px;
+    }
+
+    .logo .subtitle {
+        font-size: 12px;
+        opacity: 0.8;
+    }
+
+    .status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+    }
+
+    .status-indicator {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        animation: pulse 2s infinite;
+    }
+
+    .status-indicator.healthy { background: #4CAF50; }
+    .status-indicator.warning { background: #FF9800; }
+    .status-indicator.error { background: #F44336; }
+
+    .time {
+        font-size: 18px;
+        font-weight: 600;
+    }
+
+    .main-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        grid-template-rows: 1fr 1fr;
+        gap: 10px;
+        flex: 1;
+        margin-bottom: 10px;
+    }
+
+    .card {
+        background: rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(10px);
+        border-radius: 12px;
+        padding: 15px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .card h2 {
+        font-size: 16px;
+        margin-bottom: 10px;
+        opacity: 0.9;
+    }
+
+    /* Overview Card */
+    .metrics-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 15px;
+        height: calc(100% - 30px);
+    }
+
+    .metric {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .metric-label {
+        font-size: 12px;
+        opacity: 0.8;
+        margin-bottom: 5px;
+    }
+
+    .metric-value {
+        font-size: 24px;
+        font-weight: bold;
+    }
+
+    /* Architecture Card */
+    .arch-bars {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        height: calc(100% - 30px);
+    }
+
+    .arch-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+    }
+
+    .arch-label {
+        width: 50px;
+        font-weight: 600;
+    }
+
+    .bar {
+        flex: 1;
+        height: 20px;
+        background: rgba(255, 255, 255, 0.2);
+        border-radius: 10px;
+        overflow: hidden;
+    }
+
+    .bar-fill {
+        height: 100%;
+        border-radius: 10px;
+        transition: width 0.5s ease;
+    }
+
+    .bar-fill.amd64 { background: linear-gradient(90deg, #FF6B6B, #FF5252); }
+    .bar-fill.arm64 { background: linear-gradient(90deg, #4ECDC4, #26A69A); }
+    .bar-fill.arm { background: linear-gradient(90deg, #45B7D1, #2196F3); }
+
+    .arch-count {
+        width: 35px;
+        text-align: right;
+        font-weight: 600;
+    }
+
+    /* Services Card */
+    .service-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        height: calc(100% - 30px);
+    }
+
+    .service-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 8px 10px;
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+        font-size: 12px;
+        cursor: pointer;
+        transition: background 0.2s ease;
+    }
+
+    .service-item:hover {
+        background: rgba(255, 255, 255, 0.2);
+    }
+
+    .service-status {
+        font-size: 16px;
+    }
+
+    .service-item.healthy .service-status { color: #4CAF50; }
+    .service-item.warning .service-status { color: #FF9800; }
+    .service-item.error .service-status { color: #F44336; }
+
+    /* Temperature Card */
+    .temp-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        height: calc(100% - 30px);
+    }
+
+    .temp-item {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 8px;
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+    }
+
+    .temp-label {
+        font-size: 10px;
+        opacity: 0.8;
+        margin-bottom: 5px;
+    }
+
+    .temp-value {
+        font-size: 16px;
+        font-weight: bold;
+    }
+
+    .temp-value.critical {
+        color: #FF5252;
+        animation: pulse 2s infinite;
+    }
+
+    /* Actions Card */
+    .action-buttons {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        height: calc(100% - 30px);
+    }
+
+    .action-btn {
+        background: rgba(255, 255, 255, 0.2);
+        border: none;
+        border-radius: 8px;
+        color: white;
+        font-size: 11px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+    }
+
+    .action-btn:hover {
+        background: rgba(255, 255, 255, 0.3);
+        transform: translateY(-1px);
+    }
+
+    /* Footer */
+    footer {
+        text-align: center;
+        font-size: 11px;
+        opacity: 0.7;
+    }
+
+    /* Screensaver */
+    .screensaver {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(45deg, #000 25%, transparent 25%), 
+                    linear-gradient(-45deg, #000 25%, transparent 25%), 
+                    linear-gradient(45deg, transparent 75%, #000 75%), 
+                    linear-gradient(-45deg, transparent 75%, #000 75%);
+        background-size: 20px 20px;
+        background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+        background-color: #0a0a0a;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+    }
+
+    .screensaver.active {
+        display: flex;
+    }
+
+    .screensaver-content {
+        text-align: center;
+    }
+
+    .time-display {
+        font-size: 72px;
+        font-weight: 300;
+        margin-bottom: 10px;
+        text-shadow: 2px 2px 10px rgba(255, 255, 255, 0.3);
+    }
+
+    .date-display {
+        font-size: 24px;
+        opacity: 0.8;
+        margin-bottom: 40px;
+    }
+
+    .system-stats {
+        margin-top: 40px;
+    }
+
+    .stat-item {
+        margin-bottom: 20px;
+    }
+
+    .stat-label {
+        font-size: 18px;
+        margin-bottom: 10px;
+    }
+
+    .stat-bar {
+        width: 300px;
+        height: 4px;
+        background: rgba(255, 255, 255, 0.2);
+        border-radius: 2px;
+        margin: 0 auto;
+    }
+
+    .stat-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #4CAF50, #2196F3);
+        border-radius: 2px;
+        transition: width 2s ease;
+    }
+
+    .floating-icons {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        pointer-events: none;
+    }
+
+    .floating-icon {
+        position: absolute;
+        font-size: 24px;
+        opacity: 0.3;
+        animation: float 20s linear infinite;
+    }
+
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+
+    @keyframes float {
+        0% {
+            transform: translateY(100vh) rotate(0deg);
+            opacity: 0;
+        }
+        10% {
+            opacity: 0.3;
+        }
+        90% {
+            opacity: 0.3;
+        }
+        100% {
+            transform: translateY(-100px) rotate(360deg);
+            opacity: 0;
+        }
+    }
+
+  dashboard.js: |
+    class TouchscreenDashboard {
+        constructor() {
+            this.screensaverTimeout = null;
+            this.screensaverDelay = 60000; // 1 minute
+            this.isScreensaverActive = false;
+            
+            this.init();
+        }
+
+        init() {
+            this.updateTime();
+            this.setupEventListeners();
+            this.startDataUpdates();
+            this.resetScreensaverTimer();
+            
+            setInterval(() => this.updateTime(), 1000);
+        }
+
+        setupEventListeners() {
+            // Reset screensaver on any interaction
+            document.addEventListener('click', () => this.resetScreensaverTimer());
+            document.addEventListener('mousemove', () => this.resetScreensaverTimer());
+            document.addEventListener('keydown', () => this.resetScreensaverTimer());
+            
+            // Service clicks
+            document.querySelectorAll('.service-item').forEach(item => {
+                item.addEventListener('click', () => {
+                    const service = item.dataset.service;
+                    this.openService(service);
+                });
+            });
+        }
+
+        updateTime() {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('en-US', { 
+                hour12: false, 
+                hour: '2-digit', 
+                minute: '2-digit' 
+            });
+            const dateStr = now.toLocaleDateString('en-US', { 
+                weekday: 'long', 
+                month: 'long', 
+                day: 'numeric' 
+            });
+
+            document.getElementById('currentTime').textContent = timeStr;
+            document.getElementById('screensaverTime').textContent = timeStr;
+            document.getElementById('screensaverDate').textContent = dateStr;
+        }
+
+        openService(service) {
+            const urls = {
+                'homer': 'http://homer.homelab.local',
+                'homeassistant': 'http://homeassistant.homelab.local',
+                'jellyfin': 'http://jellyfin.homelab.local',
+                'grafana': 'http://grafana.homelab.local',
+                'pihole': 'http://pihole.homelab.local/admin',
+                'portainer': 'http://portainer.homelab.local'
+            };
+
+            if (urls[service]) {
+                window.location.href = urls[service];
+            }
+        }
+
+        toggleScreensaver() {
+            const screensaver = document.getElementById('screensaver');
+            this.isScreensaverActive = !this.isScreensaverActive;
+            
+            if (this.isScreensaverActive) {
+                screensaver.classList.add('active');
+                this.startFloatingIcons();
+                this.animateLoadBar();
+            } else {
+                screensaver.classList.remove('active');
+                this.resetScreensaverTimer();
+            }
+        }
+
+        resetScreensaverTimer() {
+            if (this.isScreensaverActive) {
+                this.toggleScreensaver();
+                return;
+            }
+
+            clearTimeout(this.screensaverTimeout);
+            this.screensaverTimeout = setTimeout(() => {
+                this.toggleScreensaver();
+            }, this.screensaverDelay);
+        }
+
+        startFloatingIcons() {
+            const icons = ['🏠', '📊', '🎬', '🛠️', '🌡️', '💾', '🔋', '📱'];
+            const container = document.querySelector('.floating-icons');
+            
+            setInterval(() => {
+                if (this.isScreensaverActive) {
+                    const icon = document.createElement('div');
+                    icon.className = 'floating-icon';
+                    icon.textContent = icons[Math.floor(Math.random() * icons.length)];
+                    icon.style.left = Math.random() * 100 + '%';
+                    icon.style.animationDuration = (Math.random() * 10 + 15) + 's';
+                    
+                    container.appendChild(icon);
+                    
+                    setTimeout(() => {
+                        if (container.contains(icon)) {
+                            container.removeChild(icon);
+                        }
+                    }, 25000);
+                }
+            }, 2000);
+        }
+
+        animateLoadBar() {
+            const loadBar = document.getElementById('loadBar');
+            setInterval(() => {
+                if (this.isScreensaverActive) {
+                    const load = Math.random() * 100;
+                    loadBar.style.width = load + '%';
+                }
+            }, 3000);
+        }
+
+        startDataUpdates() {
+            // Simulate data updates
+            setInterval(() => {
+                this.updateMetrics();
+                this.updateTemperatures();
+                this.updateServiceStatus();
+            }, 5000);
+        }
+
+        updateMetrics() {
+            // Simulate real-time data
+            const metrics = {
+                nodeCount: Math.floor(Math.random() * 2) + 3, // 3-4 nodes
+                podCount: Math.floor(Math.random() * 10) + 45, // 45-55 pods
+                powerUsage: Math.floor(Math.random() * 10) + 75 // 75-85W
+            };
+
+            document.getElementById('nodeCount').textContent = metrics.nodeCount;
+            document.getElementById('podCount').textContent = metrics.podCount;
+            document.getElementById('powerUsage').textContent = metrics.powerUsage + 'W';
+        }
+
+        updateTemperatures() {
+            const temps = {
+                living: (Math.random() * 3 + 21).toFixed(1),
+                bedroom: (Math.random() * 3 + 20).toFixed(1),
+                server: (Math.random() * 2 + 24).toFixed(1),
+                average: (Math.random() * 2 + 22).toFixed(1)
+            };
+
+            document.getElementById('tempLiving').textContent = temps.living + '°C';
+            document.getElementById('tempBedroom').textContent = temps.bedroom + '°C';
+            document.getElementById('tempServer').textContent = temps.server + '°C';
+            document.getElementById('tempAverage').textContent = temps.average + '°C';
+        }
+
+        updateServiceStatus() {
+            // All services healthy for demo
+            document.querySelectorAll('.service-item').forEach(item => {
+                item.className = 'service-item healthy';
+            });
+        }
+    }
+
+    // Global functions
+    function openService(service) {
+        window.dashboard.openService(service);
+    }
+
+    function toggleScreensaver() {
+        window.dashboard.toggleScreensaver();
+    }
+
+    // Initialize dashboard
+    window.dashboard = new TouchscreenDashboard();
+
+---
+# Nginx Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: touchscreen-nginx
+  namespace: touchscreen
+data:
+  nginx.conf: |
+    events {
+        worker_connections 1024;
+    }
+    
+    http {
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+        
+        gzip on;
+        gzip_types text/css application/javascript;
+        
+        server {
+            listen 80;
+            server_name _;
+            root /usr/share/nginx/html;
+            index index.html;
+            
+            # Cache static assets
+            location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg)$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+            }
+            
+            # Main page
+            location / {
+                try_files $uri $uri/ /index.html;
+            }
+        }
+    }
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: touchscreen-dashboard
+  namespace: touchscreen
+spec:
+  selector:
+    app: touchscreen-dashboard
+  ports:
+  - port: 80
+    targetPort: 80
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: touchscreen-ingress
+  namespace: touchscreen
+spec:
+  rules:
+  - host: touchscreen.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: touchscreen-dashboard
+            port:
+              number: 80

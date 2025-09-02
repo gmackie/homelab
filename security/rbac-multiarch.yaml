@@ -1,0 +1,317 @@
+# Role-Based Access Control for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security-system
+
+---
+# Service Account for Dashboard API with architecture-specific permissions
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dashboard-api-sa
+  namespace: dashboard
+automountServiceAccountToken: true
+
+---
+# ClusterRole for dashboard to read multi-arch node information
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dashboard-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "services", "persistentvolumes", "persistentvolumeclaims"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dashboard-reader-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dashboard-reader
+subjects:
+- kind: ServiceAccount
+  name: dashboard-api-sa
+  namespace: dashboard
+
+---
+# Network Policies for Architecture-Specific Security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amd64-database-policy
+  namespace: database
+spec:
+  podSelector:
+    matchLabels:
+      arch: amd64
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: web
+    - namespaceSelector:
+        matchLabels:
+          name: dashboard
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 5432
+  egress:
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: backup-system
+    ports:
+    - protocol: TCP
+      port: 80
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: arm64-edge-policy
+  namespace: dns-system
+spec:
+  podSelector:
+    matchLabels:
+      arch: arm64
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from: []  # Allow DNS queries from anywhere
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: traefik-system
+    ports:
+    - protocol: TCP
+      port: 80
+  egress:
+  - to: []  # Allow outbound DNS queries
+
+---
+# Pod Security Standards
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pod-security-standards
+  namespace: security-system
+data:
+  policy.yaml: |
+    # Restricted policy for ARM64 edge nodes (limited resources)
+    apiVersion: kyverno.io/v1
+    kind: ClusterPolicy
+    metadata:
+      name: require-pod-resources-arm64
+    spec:
+      validationFailureAction: enforce
+      background: true
+      rules:
+      - name: check-resources-arm64
+        match:
+          any:
+          - resources:
+              kinds:
+              - Pod
+          exclude:
+          - clusterRoles:
+            - "system:*"
+        validate:
+          message: "ARM64 pods must have resource limits"
+          pattern:
+            spec:
+              nodeSelector:
+                kubernetes.io/arch: arm64
+              containers:
+              - name: "*"
+                resources:
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"
+                  requests:
+                    memory: "?*"
+                    cpu: "?*"
+    ---
+    # Privileged policy for AMD64 compute nodes
+    apiVersion: kyverno.io/v1
+    kind: ClusterPolicy
+    metadata:
+      name: amd64-privileged-access
+    spec:
+      validationFailureAction: enforce
+      background: true
+      rules:
+      - name: allow-privileged-amd64
+        match:
+          any:
+          - resources:
+              kinds:
+              - Pod
+        validate:
+          message: "Only AMD64 nodes can run privileged containers"
+          pattern:
+            spec:
+              nodeSelector:
+                kubernetes.io/arch: amd64
+              containers:
+              - name: "*"
+                securityContext:
+                  privileged: true
+
+---
+# Architecture-specific secrets management
+apiVersion: v1
+kind: Secret
+metadata:
+  name: amd64-node-secrets
+  namespace: security-system
+  labels:
+    arch: amd64
+type: Opaque
+data:
+  # Database credentials (base64 encoded)
+  db-password: aG9tZWxhYi1kYi1wYXNzd29yZA==
+  backup-key: YmFja3VwLWVuY3J5cHRpb24ta2V5
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: arm64-node-secrets
+  namespace: security-system
+  labels:
+    arch: arm64
+type: Opaque
+data:
+  # Edge service credentials (base64 encoded)
+  dns-admin-password: ZG5zLWFkbWluLXBhc3N3b3Jk
+  monitoring-token: bW9uaXRvcmluZy10b2tlbi1hcm02NA==
+
+---
+# Security scanning for multi-arch images
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: security-scan
+  namespace: security-system
+spec:
+  schedule: "0 6 * * *"  # Daily at 6 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: amd64  # Run scans on powerful nodes
+          containers:
+          - name: trivy-scan
+            image: aquasec/trivy:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Starting security scan for multi-arch images..."
+              
+              # Scan common multi-arch images
+              IMAGES=(
+                "nginx:alpine"
+                "postgres:15"
+                "traefik:v3.0"
+                "pihole/pihole:latest"
+                "prometheus:latest"
+                "grafana/grafana:latest"
+              )
+              
+              for image in "${IMAGES[@]}"; do
+                echo "Scanning $image..."
+                trivy image --format json --output "/reports/scan-$(echo $image | tr '/' '-' | tr ':' '-').json" "$image" || echo "Scan failed for $image"
+              done
+              
+              echo "Security scan completed"
+            volumeMounts:
+            - name: scan-reports
+              mountPath: /reports
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "200m"
+              limits:
+                memory: "1Gi"
+                cpu: "500m"
+          volumes:
+          - name: scan-reports
+            persistentVolumeClaim:
+              claimName: security-reports-pvc
+          restartPolicy: OnFailure
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: security-reports-pvc
+  namespace: security-system
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: longhorn-ssd
+
+---
+# Architecture-aware admission controller webhook
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionWebhook
+metadata:
+  name: architecture-validator
+rules:
+- operations: [ "CREATE" ]
+  apiGroups: ["apps"]
+  apiVersions: ["v1"]
+  resources: ["deployments", "statefulsets", "daemonsets"]
+webhooks:
+- name: arch-validator.homelab.local
+  clientConfig:
+    service:
+      name: arch-validator
+      namespace: security-system
+      path: "/validate"
+  rules:
+  - operations: [ "CREATE" ]
+    apiGroups: ["apps"]
+    apiVersions: ["v1"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+  admissionReviewVersions: ["v1", "v1beta1"]
+  sideEffects: None
+  failurePolicy: Fail

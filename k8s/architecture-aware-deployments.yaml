@@ -1,0 +1,347 @@
+---
+# Nginx on both architectures (multi-arch image)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-multi-arch
+  namespace: web
+  labels:
+    app: nginx
+    deployment-strategy: multi-arch
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      # Let scheduler decide - nginx supports both architectures
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+      # Prefer ARM nodes for power efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 80
+            preference:
+              matchExpressions:
+              - key: arch
+                operator: In
+                values: ["arm64"]
+          - weight: 20
+            preference:
+              matchExpressions:
+              - key: arch
+                operator: In
+                values: ["amd64"]
+
+---
+# Database - Force to AMD64 for performance
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: database
+  labels:
+    app: postgres
+    deployment-strategy: amd64-only
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      nodeSelector:
+        arch: amd64
+        node-role/storage: "true"
+      tolerations:
+      - key: storage
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: postgres
+        image: postgres:15
+        env:
+        - name: POSTGRES_DB
+          value: homelab
+        - name: POSTGRES_USER
+          value: admin
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: password
+        ports:
+        - containerPort: 5432
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "local-path"
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+# IoT/Edge service - Prefer ARM
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sensor-collector
+  namespace: iot
+  labels:
+    app: sensor-collector
+    deployment-strategy: arm-preferred
+spec:
+  selector:
+    matchLabels:
+      app: sensor-collector
+  template:
+    metadata:
+      labels:
+        app: sensor-collector
+    spec:
+      nodeSelector:
+        arch: arm64
+        node-role/edge: "true"
+      hostNetwork: true
+      containers:
+      - name: sensor-collector
+        image: homelab/sensor-collector:latest
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NODE_ARCH
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['kubernetes.io/arch']
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "10m"
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+        volumeMounts:
+        - name: device-access
+          mountPath: /dev
+          readOnly: true
+      volumes:
+      - name: device-access
+        hostPath:
+          path: /dev
+
+---
+# DNS service - ARM only for power efficiency
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pihole
+  namespace: dns
+  labels:
+    app: pihole
+    deployment-strategy: arm-only
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pihole
+  template:
+    metadata:
+      labels:
+        app: pihole
+    spec:
+      nodeSelector:
+        arch: arm64
+        power-efficiency: high
+      # Anti-affinity to spread across ARM nodes
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values: ["pihole"]
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: pihole
+        image: pihole/pihole:latest
+        env:
+        - name: TZ
+          value: "UTC"
+        - name: WEBPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: pihole-secret
+              key: password
+        ports:
+        - containerPort: 53
+          name: dns-udp
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        - containerPort: 80
+          name: web
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+
+---
+# Monitoring - Mixed deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+    deployment-strategy: mixed-arch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      # Prefer AMD64 for better performance, but can run on ARM
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: arch
+                operator: In
+                values: ["amd64"]
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: prometheus
+        image: prom/prometheus:latest
+        args:
+        - '--config.file=/etc/prometheus/prometheus.yml'
+        - '--storage.tsdb.path=/prometheus'
+        - '--web.console.libraries=/etc/prometheus/console_libraries'
+        - '--web.console.templates=/etc/prometheus/consoles'
+        - '--web.enable-lifecycle'
+        ports:
+        - containerPort: 9090
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        volumeMounts:
+        - name: prometheus-config
+          mountPath: /etc/prometheus
+        - name: prometheus-storage
+          mountPath: /prometheus
+      volumes:
+      - name: prometheus-config
+        configMap:
+          name: prometheus-config
+      - name: prometheus-storage
+        persistentVolumeClaim:
+          claimName: prometheus-storage
+
+---
+# Multi-arch service with architecture-specific variants
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard-api
+  namespace: dashboard
+  labels:
+    app: dashboard-api
+    deployment-strategy: arch-specific
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dashboard-api
+  template:
+    metadata:
+      labels:
+        app: dashboard-api
+    spec:
+      containers:
+      - name: dashboard-api
+        # Multi-arch image built with buildx
+        image: homelab/dashboard-api:latest
+        env:
+        - name: NODE_ARCH
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['kubernetes.io/arch']
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+      # Spread across all architectures for redundancy
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["dashboard-api"]
+              topologyKey: kubernetes.io/arch

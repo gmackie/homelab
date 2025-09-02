@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: homelab-dashboard
+  namespace: dashboard
+  labels:
+    app: homelab-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: homelab-dashboard
+  template:
+    metadata:
+      labels:
+        app: homelab-dashboard
+    spec:
+      containers:
+      - name: dashboard
+        image: homelab-dashboard:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+          name: http
+        env:
+        - name: VITE_API_URL
+          value: "http://192.168.1.100:8080"  # Replace with your host IP
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5

@@ -1,0 +1,668 @@
+# AI/ML Intelligent Workload Scheduling for Multi-Architecture Cluster
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-ml-workloads
+  labels:
+    name: ai-ml-workloads
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-scheduler-config
+  namespace: ai-ml-workloads
+data:
+  scheduler-config.yaml: |
+    apiVersion: kubescheduler.config.k8s.io/v1beta3
+    kind: KubeSchedulerConfiguration
+    profiles:
+    - schedulerName: ml-scheduler
+      plugins:
+        score:
+          enabled:
+          - name: NodeResourcesFit
+          - name: NodeAffinity
+          - name: InterPodAffinity
+          disabled:
+          - name: NodeResourcesFit
+      pluginConfig:
+      - name: NodeResourcesFit
+        args:
+          scoringStrategy:
+            type: LeastAllocated
+            resources:
+            - name: cpu
+              weight: 1
+            - name: memory
+              weight: 1
+            - name: nvidia.com/gpu
+              weight: 10
+
+  workload-profiles.yaml: |
+    # AI/ML workload profiles for different architectures
+    profiles:
+      heavy-training:
+        description: "Large model training workloads"
+        architecture_preference:
+          - amd64: 100  # Strongly prefer AMD64 for heavy compute
+        resource_requirements:
+          cpu_min: "4000m"
+          memory_min: "8Gi"
+          gpu_preferred: true
+        node_selector:
+          workload-class: "compute-intensive"
+      
+      inference:
+        description: "Real-time model inference"
+        architecture_preference:
+          - arm64: 80   # Prefer ARM64 for power efficiency
+          - amd64: 60   # Fallback to AMD64
+        resource_requirements:
+          cpu_min: "500m"
+          memory_min: "1Gi"
+          latency_sensitive: true
+        node_selector:
+          workload-class: "latency-optimized"
+      
+      edge-ai:
+        description: "Edge AI processing"
+        architecture_preference:
+          - arm64: 100  # Perfect for ARM64
+          - arm: 80     # Good for ARM
+        resource_requirements:
+          cpu_min: "100m"
+          memory_min: "256Mi"
+          power_efficient: true
+        node_selector:
+          workload-class: "edge-computing"
+      
+      data-preprocessing:
+        description: "Data preprocessing and ETL"
+        architecture_preference:
+          - amd64: 90   # Good CPU performance needed
+          - arm64: 70   # Can work on ARM64
+        resource_requirements:
+          cpu_min: "1000m"
+          memory_min: "2Gi"
+          storage_intensive: true
+        node_selector:
+          workload-class: "data-processing"
+
+---
+# Custom scheduler for ML workloads
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-scheduler
+  namespace: ai-ml-workloads
+  labels:
+    app: ml-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ml-scheduler
+  template:
+    metadata:
+      labels:
+        app: ml-scheduler
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64  # Run scheduler on powerful node
+      serviceAccountName: ml-scheduler
+      containers:
+      - name: kube-scheduler
+        image: registry.k8s.io/kube-scheduler:v1.28.0
+        command:
+        - kube-scheduler
+        - --config=/etc/kubernetes/scheduler-config.yaml
+        - --v=2
+        volumeMounts:
+        - name: scheduler-config
+          mountPath: /etc/kubernetes
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 10259
+            scheme: HTTPS
+          initialDelaySeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 10259
+            scheme: HTTPS
+      volumes:
+      - name: scheduler-config
+        configMap:
+          name: ml-scheduler-config
+
+---
+# Workload analyzer for intelligent scheduling
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-workload-analyzer
+  namespace: ai-ml-workloads
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ml-workload-analyzer
+  template:
+    metadata:
+      labels:
+        app: ml-workload-analyzer
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+      - name: analyzer
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes pyyaml numpy scikit-learn
+          python3 /app/workload_analyzer.py
+        volumeMounts:
+        - name: analyzer-script
+          mountPath: /app
+        env:
+        - name: KUBERNETES_NAMESPACE
+          value: "ai-ml-workloads"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+      volumes:
+      - name: analyzer-script
+        configMap:
+          name: workload-analyzer-script
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workload-analyzer-script
+  namespace: ai-ml-workloads
+data:
+  workload_analyzer.py: |
+    #!/usr/bin/env python3
+    import time
+    import json
+    import yaml
+    import logging
+    from kubernetes import client, config, watch
+    from typing import Dict, List, Optional
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class MLWorkloadAnalyzer:
+        def __init__(self):
+            try:
+                config.load_incluster_config()
+            except:
+                config.load_kube_config()
+            
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            self.custom_v1 = client.CustomObjectsApi()
+            
+            # Load workload profiles
+            with open('/app/workload-profiles.yaml', 'r') as f:
+                self.profiles = yaml.safe_load(f)['profiles']
+            
+        def analyze_workload(self, pod_spec) -> Dict:
+            """Analyze a pod spec and determine optimal architecture"""
+            analysis = {
+                'recommended_arch': 'amd64',
+                'confidence': 0.5,
+                'reasoning': [],
+                'resource_profile': 'general'
+            }
+            
+            # Analyze resource requirements
+            containers = pod_spec.get('containers', [])
+            total_cpu = 0
+            total_memory = 0
+            
+            for container in containers:
+                resources = container.get('resources', {})
+                requests = resources.get('requests', {})
+                
+                # Parse CPU
+                cpu_str = requests.get('cpu', '0')
+                if cpu_str.endswith('m'):
+                    total_cpu += int(cpu_str[:-1])
+                else:
+                    total_cpu += int(float(cpu_str) * 1000)
+                
+                # Parse memory
+                memory_str = requests.get('memory', '0')
+                if memory_str.endswith('Gi'):
+                    total_memory += float(memory_str[:-2]) * 1024
+                elif memory_str.endswith('Mi'):
+                    total_memory += float(memory_str[:-2])
+                elif memory_str.endswith('G'):
+                    total_memory += float(memory_str[:-1]) * 1024
+                elif memory_str.endswith('M'):
+                    total_memory += float(memory_str[:-1])
+            
+            # Analyze container images for ML frameworks
+            ml_frameworks = {
+                'tensorflow': 'heavy-training',
+                'pytorch': 'heavy-training',
+                'scikit-learn': 'data-preprocessing',
+                'opencv': 'edge-ai',
+                'onnx': 'inference',
+                'tensorrt': 'inference',
+                'torchserve': 'inference'
+            }
+            
+            detected_frameworks = []
+            for container in containers:
+                image = container.get('image', '').lower()
+                for framework in ml_frameworks:
+                    if framework in image:
+                        detected_frameworks.append(ml_frameworks[framework])
+                        break
+            
+            # Determine workload profile
+            if detected_frameworks:
+                # Use most common framework profile
+                profile_name = max(set(detected_frameworks), key=detected_frameworks.count)
+                analysis['resource_profile'] = profile_name
+                profile = self.profiles.get(profile_name, {})
+                
+                # Get architecture preference from profile
+                arch_prefs = profile.get('architecture_preference', [])
+                if arch_prefs:
+                    # Get highest weighted architecture
+                    best_arch = max(arch_prefs[0].items(), key=lambda x: x[1])
+                    analysis['recommended_arch'] = best_arch[0]
+                    analysis['confidence'] = min(0.9, best_arch[1] / 100.0)
+                    analysis['reasoning'].append(f"Framework {detected_frameworks[0]} detected")
+            
+            # Resource-based recommendations
+            if total_cpu > 4000:  # > 4 CPU cores
+                analysis['recommended_arch'] = 'amd64'
+                analysis['confidence'] = max(analysis['confidence'], 0.8)
+                analysis['reasoning'].append("High CPU requirements favor AMD64")
+            elif total_cpu < 500:  # < 0.5 CPU cores
+                analysis['recommended_arch'] = 'arm64'
+                analysis['confidence'] = max(analysis['confidence'], 0.7)
+                analysis['reasoning'].append("Low CPU requirements suit ARM64")
+            
+            if total_memory > 8192:  # > 8GB RAM
+                analysis['recommended_arch'] = 'amd64'
+                analysis['confidence'] = max(analysis['confidence'], 0.8)
+                analysis['reasoning'].append("High memory requirements favor AMD64")
+            elif total_memory < 512:  # < 512MB RAM
+                analysis['recommended_arch'] = 'arm64'
+                analysis['confidence'] = max(analysis['confidence'], 0.7)
+                analysis['reasoning'].append("Low memory requirements suit ARM64/ARM")
+            
+            # Check for GPU requirements
+            for container in containers:
+                resources = container.get('resources', {})
+                limits = resources.get('limits', {})
+                if 'nvidia.com/gpu' in limits:
+                    analysis['recommended_arch'] = 'amd64'
+                    analysis['confidence'] = 0.95
+                    analysis['reasoning'].append("GPU requirements mandate AMD64")
+                    break
+            
+            return analysis
+        
+        def create_scheduling_annotation(self, analysis: Dict) -> Dict:
+            """Create scheduling annotations based on analysis"""
+            annotations = {}
+            
+            # Architecture preference
+            arch = analysis['recommended_arch']
+            confidence = analysis['confidence']
+            
+            if confidence > 0.8:
+                # Hard constraint
+                annotations['scheduler.alpha.kubernetes.io/node-selector'] = f"kubernetes.io/arch={arch}"
+            else:
+                # Soft preference
+                weight = int(confidence * 100)
+                annotations['scheduler.alpha.kubernetes.io/preferred-node-affinity'] = json.dumps({
+                    "preferredDuringSchedulingIgnoredDuringExecution": [
+                        {
+                            "weight": weight,
+                            "preference": {
+                                "matchExpressions": [
+                                    {
+                                        "key": "kubernetes.io/arch",
+                                        "operator": "In",
+                                        "values": [arch]
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                })
+            
+            # Add workload class
+            profile = analysis['resource_profile']
+            if profile in self.profiles:
+                workload_class = self.profiles[profile].get('node_selector', {}).get('workload-class')
+                if workload_class:
+                    annotations['workload-class'] = workload_class
+            
+            # Add analysis metadata
+            annotations['ml-scheduler/analysis'] = json.dumps({
+                'arch': arch,
+                'confidence': confidence,
+                'profile': profile,
+                'reasoning': analysis['reasoning']
+            })
+            
+            return annotations
+        
+        def watch_pods(self):
+            """Watch for new pods and analyze them"""
+            logger.info("Starting ML workload analyzer...")
+            
+            w = watch.Watch()
+            
+            for event in w.stream(self.v1.list_namespaced_pod, namespace='ai-ml-workloads'):
+                event_type = event['type']
+                pod = event['object']
+                
+                if event_type == 'ADDED' and pod.status.phase == 'Pending':
+                    pod_name = pod.metadata.name
+                    namespace = pod.metadata.namespace
+                    
+                    logger.info(f"Analyzing new ML workload: {namespace}/{pod_name}")
+                    
+                    # Analyze the pod
+                    analysis = self.analyze_workload(pod.spec.to_dict())
+                    
+                    # Create scheduling annotations
+                    annotations = self.create_scheduling_annotation(analysis)
+                    
+                    logger.info(f"Analysis for {pod_name}: {analysis}")
+                    
+                    # Update pod with annotations (if not already scheduled)
+                    if not pod.spec.node_name:
+                        try:
+                            # Patch the pod with scheduling annotations
+                            patch_body = {
+                                "metadata": {
+                                    "annotations": annotations
+                                }
+                            }
+                            
+                            self.v1.patch_namespaced_pod(
+                                name=pod_name,
+                                namespace=namespace,
+                                body=patch_body
+                            )
+                            
+                            logger.info(f"Updated scheduling annotations for {pod_name}")
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to update pod {pod_name}: {e}")
+    
+    if __name__ == "__main__":
+        analyzer = MLWorkloadAnalyzer()
+        
+        while True:
+            try:
+                analyzer.watch_pods()
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                time.sleep(10)
+
+---
+# Priority classes for different ML workloads
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ml-training-high
+value: 1000
+globalDefault: false
+description: "High priority for critical ML training jobs"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ml-inference-medium
+value: 500
+globalDefault: false
+description: "Medium priority for inference workloads"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ml-batch-low
+value: 100
+globalDefault: false
+description: "Low priority for batch processing jobs"
+
+---
+# Node labeling for workload classes
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: label-nodes-for-ml
+  namespace: ai-ml-workloads
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      restartPolicy: OnFailure
+      containers:
+      - name: node-labeler
+        image: bitnami/kubectl:latest
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          echo "Labeling nodes for ML workload classes..."
+          
+          # Label AMD64 nodes for compute-intensive workloads
+          kubectl get nodes -l kubernetes.io/arch=amd64 -o name | while read node; do
+            echo "Labeling $node for compute-intensive workloads"
+            kubectl label $node workload-class=compute-intensive --overwrite
+            kubectl label $node ml-capability=high-compute --overwrite
+          done
+          
+          # Label ARM64 nodes for latency-optimized and edge workloads
+          kubectl get nodes -l kubernetes.io/arch=arm64 -o name | while read node; do
+            echo "Labeling $node for latency-optimized workloads"
+            kubectl label $node workload-class=latency-optimized --overwrite
+            kubectl label $node ml-capability=inference --overwrite
+            kubectl label $node workload-class=edge-computing --overwrite
+          done
+          
+          # Label ARM nodes for edge computing
+          kubectl get nodes -l kubernetes.io/arch=arm -o name | while read node; do
+            echo "Labeling $node for edge computing"
+            kubectl label $node workload-class=edge-computing --overwrite
+            kubectl label $node ml-capability=edge-ai --overwrite
+          done
+          
+          # Label nodes with NVMe storage for data processing
+          kubectl get nodes -o json | jq -r '.items[] | select(.status.nodeInfo.osImage | test("nvme")) | .metadata.name' | while read node; do
+            echo "Labeling $node for data processing (NVMe detected)"
+            kubectl label node $node workload-class=data-processing --overwrite
+            kubectl label node $node storage-class=high-iops --overwrite
+          done
+          
+          echo "Node labeling completed"
+
+---
+# RBAC for ML scheduler
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ml-scheduler
+  namespace: ai-ml-workloads
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ml-scheduler
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: [""]
+  resources: ["bindings"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch", "update"]
+- apiGroups: ["scheduling.k8s.io"]
+  resources: ["priorityclasses"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ml-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ml-scheduler
+subjects:
+- kind: ServiceAccount
+  name: ml-scheduler
+  namespace: ai-ml-workloads
+
+---
+# Example ML workloads with intelligent scheduling
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-training-example
+  namespace: ai-ml-workloads
+  annotations:
+    ml-workload-type: "heavy-training"
+spec:
+  template:
+    metadata:
+      annotations:
+        ml-scheduler/profile: "heavy-training"
+    spec:
+      schedulerName: ml-scheduler
+      priorityClassName: ml-training-high
+      containers:
+      - name: trainer
+        image: tensorflow/tensorflow:latest-gpu
+        command: ["python3", "-c", "print('Training model...'); import time; time.sleep(60)"]
+        resources:
+          requests:
+            cpu: "4000m"
+            memory: "8Gi"
+          limits:
+            cpu: "8000m"
+            memory: "16Gi"
+            nvidia.com/gpu: 1
+      restartPolicy: Never
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-service-example
+  namespace: ai-ml-workloads
+  annotations:
+    ml-workload-type: "inference"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: inference-service
+  template:
+    metadata:
+      labels:
+        app: inference-service
+      annotations:
+        ml-scheduler/profile: "inference"
+    spec:
+      schedulerName: ml-scheduler
+      priorityClassName: ml-inference-medium
+      containers:
+      - name: inference
+        image: tensorflow/serving:latest
+        ports:
+        - containerPort: 8501
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+        readinessProbe:
+          httpGet:
+            path: /v1/models
+            port: 8501
+          initialDelaySeconds: 30
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: edge-ai-processing
+  namespace: ai-ml-workloads
+  annotations:
+    ml-workload-type: "edge-ai"
+spec:
+  schedule: "*/5 * * * *"  # Every 5 minutes
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          annotations:
+            ml-scheduler/profile: "edge-ai"
+        spec:
+          schedulerName: ml-scheduler
+          priorityClassName: ml-batch-low
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["arm64", "arm"]
+          containers:
+          - name: edge-processor
+            image: python:3.11-slim
+            command: ["python3", "-c", "print('Processing edge AI data...'); import time; time.sleep(30)"]
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "256Mi"
+              limits:
+                cpu: "300m"
+                memory: "512Mi"
+          restartPolicy: OnFailure

@@ -1,0 +1,1286 @@
+# Security Scanning and Compliance Automation for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security-scanning
+  labels:
+    name: security-scanning
+
+---
+# Security scanning configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-config
+  namespace: security-scanning
+data:
+  scanning-policy.yaml: |
+    # Security scanning policies
+    policies:
+      vulnerability_scanning:
+        enabled: true
+        severity_threshold: "MEDIUM"
+        scan_frequency: "daily"
+        architectures:
+          amd64:
+            scanner: "trivy"
+            parallel_scans: 4
+          arm64:
+            scanner: "trivy"
+            parallel_scans: 2
+          arm:
+            scanner: "trivy-light"
+            parallel_scans: 1
+      
+      compliance_checks:
+        enabled: true
+        frameworks:
+          - "CIS Kubernetes Benchmark"
+          - "NIST 800-53"
+          - "PCI-DSS"
+          - "GDPR"
+        scan_frequency: "weekly"
+      
+      secret_scanning:
+        enabled: true
+        patterns:
+          - "api[_-]?key"
+          - "secret[_-]?key"
+          - "password"
+          - "token"
+          - "private[_-]?key"
+        exclude_paths:
+          - "/tmp/*"
+          - "/var/cache/*"
+      
+      network_scanning:
+        enabled: true
+        scan_types:
+          - "port_scan"
+          - "vulnerability_assessment"
+          - "ssl_certificate_check"
+        frequency: "daily"
+      
+      runtime_protection:
+        enabled: true
+        monitoring:
+          - "file_integrity"
+          - "process_monitoring"
+          - "network_connections"
+          - "privilege_escalation"
+    
+    severity_mapping:
+      CRITICAL: 
+        score_range: [9.0, 10.0]
+        action: "block_and_alert"
+        auto_remediate: true
+      HIGH:
+        score_range: [7.0, 8.9]
+        action: "alert"
+        auto_remediate: true
+      MEDIUM:
+        score_range: [4.0, 6.9]
+        action: "warn"
+        auto_remediate: false
+      LOW:
+        score_range: [0.1, 3.9]
+        action: "log"
+        auto_remediate: false
+
+  compliance-rules.yaml: |
+    # Compliance automation rules
+    cis_kubernetes:
+      version: "1.8.0"
+      checks:
+        - id: "1.1.1"
+          description: "Ensure API server pod specification file permissions"
+          command: "stat -c %a /etc/kubernetes/manifests/kube-apiserver.yaml"
+          expected: "644"
+          severity: "HIGH"
+        - id: "1.2.1"
+          description: "Ensure --anonymous-auth is set to false"
+          command: "kubectl get pod -n kube-system -l component=kube-apiserver -o yaml | grep anonymous-auth"
+          expected: "false"
+          severity: "CRITICAL"
+        - id: "2.1.1"
+          description: "Minimize wildcard use in RBAC"
+          command: "kubectl get clusterrolebindings -o yaml | grep -c '*'"
+          expected: "0"
+          severity: "HIGH"
+          
+    nist_800_53:
+      controls:
+        - id: "AC-2"
+          family: "Access Control"
+          title: "Account Management"
+          checks:
+            - "Verify service accounts are properly scoped"
+            - "Check for unused service accounts"
+            - "Validate RBAC permissions"
+        - id: "AU-2"
+          family: "Audit and Accountability"
+          title: "Audit Events"
+          checks:
+            - "Ensure audit logging is enabled"
+            - "Verify audit log retention"
+            - "Check audit log integrity"
+
+---
+# Trivy vulnerability scanner deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trivy-scanner
+  namespace: security-scanning
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trivy-scanner
+  template:
+    metadata:
+      labels:
+        app: trivy-scanner
+    spec:
+      # Prefer AMD64 for scanning performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      serviceAccountName: trivy-scanner
+      containers:
+      - name: trivy
+        image: aquasecurity/trivy:latest
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          # Start Trivy server mode
+          trivy server --listen 0.0.0.0:4954 &
+          
+          # Run continuous scanning
+          while true; do
+            echo "Starting security scan..."
+            python3 /app/security_scanner.py
+            sleep 3600  # Run every hour
+          done
+        ports:
+        - containerPort: 4954
+          name: trivy
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+        volumeMounts:
+        - name: scanner-app
+          mountPath: /app
+        - name: security-config
+          mountPath: /config
+        - name: trivy-cache
+          mountPath: /root/.cache/trivy
+        - name: docker-socket
+          mountPath: /var/run/docker.sock
+        env:
+        - name: TRIVY_SEVERITY
+          value: "CRITICAL,HIGH,MEDIUM"
+        - name: TRIVY_QUIET
+          value: "false"
+        - name: TRIVY_DEBUG
+          value: "false"
+      volumes:
+      - name: scanner-app
+        configMap:
+          name: scanner-application
+      - name: security-config
+        configMap:
+          name: security-config
+      - name: trivy-cache
+        emptyDir: {}
+      - name: docker-socket
+        hostPath:
+          path: /var/run/docker.sock
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scanner-application
+  namespace: security-scanning
+data:
+  security_scanner.py: |
+    #!/usr/bin/env python3
+    import json
+    import logging
+    import subprocess
+    import yaml
+    import time
+    from datetime import datetime, timedelta
+    from kubernetes import client, config
+    from typing import Dict, List, Optional
+    import hashlib
+    import re
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class SecurityScanner:
+        def __init__(self):
+            try:
+                config.load_incluster_config()
+            except:
+                config.load_kube_config()
+            
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            self.batch_v1 = client.BatchV1Api()
+            
+            # Load security configuration
+            with open('/config/scanning-policy.yaml', 'r') as f:
+                self.scan_config = yaml.safe_load(f)
+            
+            with open('/config/compliance-rules.yaml', 'r') as f:
+                self.compliance_rules = yaml.safe_load(f)
+            
+            self.scan_results = {}
+            self.compliance_results = {}
+        
+        def scan_container_images(self):
+            """Scan all container images in the cluster"""
+            logger.info("Starting container image vulnerability scan...")
+            
+            # Get all pods
+            pods = self.v1.list_pod_for_all_namespaces()
+            
+            scanned_images = set()
+            vulnerabilities = []
+            
+            for pod in pods.items:
+                for container in pod.spec.containers:
+                    image = container.image
+                    
+                    if image in scanned_images:
+                        continue
+                    
+                    scanned_images.add(image)
+                    
+                    # Scan with Trivy
+                    scan_result = self.trivy_scan_image(image)
+                    
+                    if scan_result:
+                        vulnerabilities.append({
+                            'image': image,
+                            'namespace': pod.metadata.namespace,
+                            'pod': pod.metadata.name,
+                            'vulnerabilities': scan_result,
+                            'scanned_at': datetime.now().isoformat()
+                        })
+            
+            self.scan_results['container_images'] = {
+                'total_images': len(scanned_images),
+                'vulnerabilities': vulnerabilities,
+                'scan_time': datetime.now().isoformat()
+            }
+            
+            # Process results
+            self.process_vulnerability_results(vulnerabilities)
+        
+        def trivy_scan_image(self, image: str) -> Optional[Dict]:
+            """Scan container image with Trivy"""
+            try:
+                cmd = [
+                    'trivy', 'image',
+                    '--format', 'json',
+                    '--severity', 'CRITICAL,HIGH,MEDIUM',
+                    '--quiet',
+                    image
+                ]
+                
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+                
+                if result.returncode == 0:
+                    return json.loads(result.stdout)
+                else:
+                    logger.error(f"Failed to scan image {image}: {result.stderr}")
+                    return None
+                    
+            except subprocess.TimeoutExpired:
+                logger.error(f"Scan timeout for image {image}")
+                return None
+            except Exception as e:
+                logger.error(f"Error scanning image {image}: {e}")
+                return None
+        
+        def scan_kubernetes_config(self):
+            """Scan Kubernetes configuration for security issues"""
+            logger.info("Scanning Kubernetes configuration...")
+            
+            issues = []
+            
+            # Check RBAC
+            rbac_issues = self.check_rbac_security()
+            issues.extend(rbac_issues)
+            
+            # Check network policies
+            netpol_issues = self.check_network_policies()
+            issues.extend(netpol_issues)
+            
+            # Check pod security
+            pod_issues = self.check_pod_security()
+            issues.extend(pod_issues)
+            
+            # Check secrets
+            secret_issues = self.check_secret_security()
+            issues.extend(secret_issues)
+            
+            self.scan_results['kubernetes_config'] = {
+                'issues': issues,
+                'total_issues': len(issues),
+                'scan_time': datetime.now().isoformat()
+            }
+        
+        def check_rbac_security(self) -> List[Dict]:
+            """Check RBAC configuration for security issues"""
+            issues = []
+            
+            # Check for overly permissive cluster roles
+            cluster_roles = client.RbacAuthorizationV1Api().list_cluster_role()
+            
+            for role in cluster_roles.items:
+                if role.rules:
+                    for rule in role.rules:
+                        # Check for wildcard permissions
+                        if rule.verbs and '*' in rule.verbs:
+                            issues.append({
+                                'type': 'rbac',
+                                'severity': 'HIGH',
+                                'resource': f"ClusterRole/{role.metadata.name}",
+                                'issue': 'Wildcard verb permissions',
+                                'recommendation': 'Use specific verbs instead of wildcards'
+                            })
+                        
+                        if rule.resources and '*' in rule.resources:
+                            issues.append({
+                                'type': 'rbac',
+                                'severity': 'HIGH',
+                                'resource': f"ClusterRole/{role.metadata.name}",
+                                'issue': 'Wildcard resource permissions',
+                                'recommendation': 'Use specific resources instead of wildcards'
+                            })
+            
+            return issues
+        
+        def check_network_policies(self) -> List[Dict]:
+            """Check network policy configuration"""
+            issues = []
+            
+            # Get all namespaces
+            namespaces = self.v1.list_namespace()
+            
+            for ns in namespaces.items:
+                # Skip system namespaces
+                if ns.metadata.name in ['kube-system', 'kube-public', 'kube-node-lease']:
+                    continue
+                
+                # Check if namespace has network policies
+                netpols = client.NetworkingV1Api().list_namespaced_network_policy(
+                    namespace=ns.metadata.name
+                )
+                
+                if not netpols.items:
+                    issues.append({
+                        'type': 'network_policy',
+                        'severity': 'MEDIUM',
+                        'resource': f"Namespace/{ns.metadata.name}",
+                        'issue': 'No network policies defined',
+                        'recommendation': 'Implement network policies to restrict traffic'
+                    })
+            
+            return issues
+        
+        def check_pod_security(self) -> List[Dict]:
+            """Check pod security settings"""
+            issues = []
+            
+            pods = self.v1.list_pod_for_all_namespaces()
+            
+            for pod in pods.items:
+                # Skip system pods
+                if pod.metadata.namespace in ['kube-system', 'kube-public']:
+                    continue
+                
+                for container in pod.spec.containers:
+                    # Check for running as root
+                    if container.security_context:
+                        if container.security_context.run_as_user == 0:
+                            issues.append({
+                                'type': 'pod_security',
+                                'severity': 'HIGH',
+                                'resource': f"Pod/{pod.metadata.namespace}/{pod.metadata.name}",
+                                'issue': 'Container running as root',
+                                'recommendation': 'Use non-root user'
+                            })
+                        
+                        # Check for privileged containers
+                        if container.security_context.privileged:
+                            issues.append({
+                                'type': 'pod_security',
+                                'severity': 'CRITICAL',
+                                'resource': f"Pod/{pod.metadata.namespace}/{pod.metadata.name}",
+                                'issue': 'Privileged container',
+                                'recommendation': 'Avoid privileged containers unless absolutely necessary'
+                            })
+            
+            return issues
+        
+        def check_secret_security(self) -> List[Dict]:
+            """Check for exposed secrets"""
+            issues = []
+            
+            # Check ConfigMaps for potential secrets
+            configmaps = self.v1.list_config_map_for_all_namespaces()
+            
+            secret_patterns = [
+                r'api[_-]?key',
+                r'secret',
+                r'password',
+                r'token',
+                r'private[_-]?key'
+            ]
+            
+            for cm in configmaps.items:
+                if cm.data:
+                    for key, value in cm.data.items():
+                        for pattern in secret_patterns:
+                            if re.search(pattern, key, re.IGNORECASE) or \
+                               re.search(pattern, value, re.IGNORECASE):
+                                issues.append({
+                                    'type': 'secret_exposure',
+                                    'severity': 'CRITICAL',
+                                    'resource': f"ConfigMap/{cm.metadata.namespace}/{cm.metadata.name}",
+                                    'issue': f'Potential secret in ConfigMap: {key}',
+                                    'recommendation': 'Use Kubernetes Secrets instead of ConfigMaps for sensitive data'
+                                })
+            
+            return issues
+        
+        def run_compliance_checks(self):
+            """Run compliance checks against various frameworks"""
+            logger.info("Running compliance checks...")
+            
+            results = {}
+            
+            # CIS Kubernetes Benchmark
+            if 'cis_kubernetes' in self.compliance_rules:
+                results['cis_kubernetes'] = self.check_cis_kubernetes()
+            
+            # NIST 800-53
+            if 'nist_800_53' in self.compliance_rules:
+                results['nist_800_53'] = self.check_nist_controls()
+            
+            self.compliance_results = results
+        
+        def check_cis_kubernetes(self) -> Dict:
+            """Check CIS Kubernetes Benchmark compliance"""
+            results = {
+                'framework': 'CIS Kubernetes Benchmark',
+                'version': self.compliance_rules['cis_kubernetes']['version'],
+                'checks': []
+            }
+            
+            for check in self.compliance_rules['cis_kubernetes']['checks']:
+                try:
+                    # Run check command
+                    result = subprocess.run(
+                        check['command'],
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    
+                    passed = check['expected'] in result.stdout
+                    
+                    results['checks'].append({
+                        'id': check['id'],
+                        'description': check['description'],
+                        'passed': passed,
+                        'severity': check['severity'],
+                        'output': result.stdout.strip()
+                    })
+                    
+                except Exception as e:
+                    results['checks'].append({
+                        'id': check['id'],
+                        'description': check['description'],
+                        'passed': False,
+                        'severity': check['severity'],
+                        'error': str(e)
+                    })
+            
+            # Calculate compliance score
+            total_checks = len(results['checks'])
+            passed_checks = sum(1 for c in results['checks'] if c['passed'])
+            results['compliance_score'] = (passed_checks / total_checks * 100) if total_checks > 0 else 0
+            
+            return results
+        
+        def check_nist_controls(self) -> Dict:
+            """Check NIST 800-53 controls"""
+            results = {
+                'framework': 'NIST 800-53',
+                'controls': []
+            }
+            
+            for control in self.compliance_rules['nist_800_53']['controls']:
+                control_result = {
+                    'id': control['id'],
+                    'family': control['family'],
+                    'title': control['title'],
+                    'checks': []
+                }
+                
+                for check_desc in control['checks']:
+                    # Implement specific NIST control checks
+                    passed = self.evaluate_nist_control(control['id'], check_desc)
+                    
+                    control_result['checks'].append({
+                        'description': check_desc,
+                        'passed': passed
+                    })
+                
+                results['controls'].append(control_result)
+            
+            return results
+        
+        def evaluate_nist_control(self, control_id: str, check_desc: str) -> bool:
+            """Evaluate specific NIST control"""
+            # Implement control-specific logic
+            # This is a simplified example
+            if control_id == 'AC-2':
+                # Check account management
+                service_accounts = self.v1.list_service_account_for_all_namespaces()
+                # Check for proper scoping, unused accounts, etc.
+                return len(service_accounts.items) > 0
+            elif control_id == 'AU-2':
+                # Check audit logging
+                # Verify audit logs are enabled and configured
+                return True
+            
+            return False
+        
+        def process_vulnerability_results(self, vulnerabilities: List[Dict]):
+            """Process and take action on vulnerability scan results"""
+            severity_counts = {
+                'CRITICAL': 0,
+                'HIGH': 0,
+                'MEDIUM': 0,
+                'LOW': 0
+            }
+            
+            for vuln_report in vulnerabilities:
+                if 'vulnerabilities' in vuln_report and vuln_report['vulnerabilities']:
+                    for result in vuln_report['vulnerabilities'].get('Results', []):
+                        for vuln in result.get('Vulnerabilities', []):
+                            severity = vuln.get('Severity', 'UNKNOWN')
+                            if severity in severity_counts:
+                                severity_counts[severity] += 1
+                            
+                            # Take action based on severity
+                            self.handle_vulnerability(vuln_report, vuln)
+            
+            logger.info(f"Vulnerability summary: {severity_counts}")
+        
+        def handle_vulnerability(self, report: Dict, vulnerability: Dict):
+            """Handle individual vulnerability based on policy"""
+            severity = vulnerability.get('Severity', 'UNKNOWN')
+            severity_config = self.scan_config['policies']['severity_mapping'].get(severity, {})
+            
+            action = severity_config.get('action', 'log')
+            
+            if action == 'block_and_alert':
+                # Critical vulnerability - block deployment
+                self.block_vulnerable_deployment(report)
+                self.send_alert('CRITICAL', f"Critical vulnerability found: {vulnerability.get('VulnerabilityID')}")
+            elif action == 'alert':
+                # High severity - send alert
+                self.send_alert('HIGH', f"High severity vulnerability: {vulnerability.get('VulnerabilityID')}")
+            elif action == 'warn':
+                # Medium severity - log warning
+                logger.warning(f"Medium severity vulnerability: {vulnerability}")
+            else:
+                # Low severity - just log
+                logger.info(f"Low severity vulnerability: {vulnerability}")
+            
+            # Auto-remediation if enabled
+            if severity_config.get('auto_remediate', False):
+                self.attempt_remediation(report, vulnerability)
+        
+        def block_vulnerable_deployment(self, report: Dict):
+            """Block deployment with critical vulnerabilities"""
+            namespace = report.get('namespace')
+            pod_name = report.get('pod')
+            
+            if namespace and pod_name:
+                try:
+                    # Scale down deployment
+                    deployment = self.get_deployment_from_pod(namespace, pod_name)
+                    if deployment:
+                        self.apps_v1.patch_namespaced_deployment_scale(
+                            name=deployment,
+                            namespace=namespace,
+                            body={'spec': {'replicas': 0}}
+                        )
+                        logger.warning(f"Scaled down vulnerable deployment: {namespace}/{deployment}")
+                except Exception as e:
+                    logger.error(f"Failed to block deployment: {e}")
+        
+        def get_deployment_from_pod(self, namespace: str, pod_name: str) -> Optional[str]:
+            """Get deployment name from pod"""
+            try:
+                pod = self.v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+                if pod.metadata.owner_references:
+                    for owner in pod.metadata.owner_references:
+                        if owner.kind == 'ReplicaSet':
+                            rs = self.apps_v1.read_namespaced_replica_set(
+                                name=owner.name,
+                                namespace=namespace
+                            )
+                            if rs.metadata.owner_references:
+                                for rs_owner in rs.metadata.owner_references:
+                                    if rs_owner.kind == 'Deployment':
+                                        return rs_owner.name
+            except:
+                pass
+            return None
+        
+        def attempt_remediation(self, report: Dict, vulnerability: Dict):
+            """Attempt to auto-remediate vulnerability"""
+            vuln_id = vulnerability.get('VulnerabilityID')
+            fixed_version = vulnerability.get('FixedVersion')
+            
+            if fixed_version:
+                logger.info(f"Auto-remediation available for {vuln_id}: upgrade to {fixed_version}")
+                # In a real implementation, this would trigger an image update
+                # For now, just log the recommendation
+        
+        def send_alert(self, severity: str, message: str):
+            """Send security alert"""
+            alert = {
+                'severity': severity,
+                'message': message,
+                'timestamp': datetime.now().isoformat(),
+                'source': 'security-scanner'
+            }
+            
+            logger.warning(f"SECURITY ALERT [{severity}]: {message}")
+            # In production, this would send to alerting system
+        
+        def generate_report(self) -> Dict:
+            """Generate comprehensive security report"""
+            report = {
+                'scan_timestamp': datetime.now().isoformat(),
+                'cluster_info': self.get_cluster_info(),
+                'vulnerability_scan': self.scan_results.get('container_images', {}),
+                'configuration_scan': self.scan_results.get('kubernetes_config', {}),
+                'compliance': self.compliance_results,
+                'summary': self.generate_summary()
+            }
+            
+            return report
+        
+        def get_cluster_info(self) -> Dict:
+            """Get cluster information"""
+            nodes = self.v1.list_node()
+            
+            arch_distribution = {}
+            for node in nodes.items:
+                arch = node.metadata.labels.get('kubernetes.io/arch', 'unknown')
+                arch_distribution[arch] = arch_distribution.get(arch, 0) + 1
+            
+            return {
+                'total_nodes': len(nodes.items),
+                'architecture_distribution': arch_distribution,
+                'scan_time': datetime.now().isoformat()
+            }
+        
+        def generate_summary(self) -> Dict:
+            """Generate scan summary"""
+            summary = {
+                'total_issues': 0,
+                'critical_issues': 0,
+                'high_issues': 0,
+                'medium_issues': 0,
+                'low_issues': 0,
+                'compliance_score': 0
+            }
+            
+            # Count vulnerabilities
+            if 'container_images' in self.scan_results:
+                for vuln_report in self.scan_results['container_images'].get('vulnerabilities', []):
+                    if 'vulnerabilities' in vuln_report and vuln_report['vulnerabilities']:
+                        for result in vuln_report['vulnerabilities'].get('Results', []):
+                            for vuln in result.get('Vulnerabilities', []):
+                                severity = vuln.get('Severity', 'UNKNOWN')
+                                if severity == 'CRITICAL':
+                                    summary['critical_issues'] += 1
+                                elif severity == 'HIGH':
+                                    summary['high_issues'] += 1
+                                elif severity == 'MEDIUM':
+                                    summary['medium_issues'] += 1
+                                elif severity == 'LOW':
+                                    summary['low_issues'] += 1
+                                summary['total_issues'] += 1
+            
+            # Calculate compliance score
+            if self.compliance_results:
+                scores = []
+                for framework, results in self.compliance_results.items():
+                    if 'compliance_score' in results:
+                        scores.append(results['compliance_score'])
+                if scores:
+                    summary['compliance_score'] = sum(scores) / len(scores)
+            
+            return summary
+        
+        def run(self):
+            """Main scanning loop"""
+            logger.info("Starting security scanner...")
+            
+            # Run scans
+            self.scan_container_images()
+            self.scan_kubernetes_config()
+            self.run_compliance_checks()
+            
+            # Generate report
+            report = self.generate_report()
+            
+            # Save report
+            with open('/tmp/security-report.json', 'w') as f:
+                json.dump(report, f, indent=2)
+            
+            logger.info(f"Security scan completed. Summary: {report['summary']}")
+    
+    if __name__ == "__main__":
+        scanner = SecurityScanner()
+        scanner.run()
+
+---
+# Falco runtime security
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: security-scanning
+spec:
+  selector:
+    matchLabels:
+      app: falco
+  template:
+    metadata:
+      labels:
+        app: falco
+    spec:
+      serviceAccountName: falco
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: falco
+        image: falcosecurity/falco:latest
+        securityContext:
+          privileged: true
+        args:
+        - /usr/bin/falco
+        - -K
+        - /var/run/secrets/kubernetes.io/serviceaccount/token
+        - -k
+        - https://$(KUBERNETES_SERVICE_HOST)
+        - --cri
+        - /run/containerd/containerd.sock
+        - -pk
+        env:
+        - name: FALCO_GRPC_ENABLED
+          value: "true"
+        - name: FALCO_GRPC_BIND_ADDRESS
+          value: "0.0.0.0:5060"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: docker-socket
+          mountPath: /host/var/run/docker.sock
+        - name: containerd-socket
+          mountPath: /run/containerd/containerd.sock
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: boot
+          mountPath: /host/boot
+          readOnly: true
+        - name: lib-modules
+          mountPath: /host/lib/modules
+          readOnly: true
+        - name: usr
+          mountPath: /host/usr
+          readOnly: true
+        - name: etc
+          mountPath: /host/etc
+          readOnly: true
+        - name: falco-config
+          mountPath: /etc/falco
+      volumes:
+      - name: docker-socket
+        hostPath:
+          path: /var/run/docker.sock
+      - name: containerd-socket
+        hostPath:
+          path: /run/containerd/containerd.sock
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: boot
+        hostPath:
+          path: /boot
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
+      - name: usr
+        hostPath:
+          path: /usr
+      - name: etc
+        hostPath:
+          path: /etc
+      - name: falco-config
+        configMap:
+          name: falco-config
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-config
+  namespace: security-scanning
+data:
+  falco.yaml: |
+    # Falco configuration for runtime security
+    
+    rules_file:
+      - /etc/falco/falco_rules.yaml
+      - /etc/falco/falco_rules.local.yaml
+      - /etc/falco/k8s_audit_rules.yaml
+      - /etc/falco/custom_rules.yaml
+    
+    json_output: false
+    json_include_output_property: true
+    log_stderr: true
+    log_syslog: false
+    log_level: info
+    
+    priority: warning
+    
+    stdout_output:
+      enabled: true
+    
+    syslog_output:
+      enabled: false
+    
+    file_output:
+      enabled: false
+      keep_alive: false
+      filename: /var/log/falco.log
+    
+    http_output:
+      enabled: true
+      url: http://security-webhook:8080/falco
+    
+    grpc:
+      enabled: true
+      bind_address: "0.0.0.0:5060"
+      threadiness: 8
+    
+    grpc_output:
+      enabled: false
+  
+  custom_rules.yaml: |
+    # Custom Falco rules for homelab
+    
+    - rule: Unauthorized Process in Container
+      desc: Detect unauthorized process execution in containers
+      condition: >
+        container and
+        proc.name in (unauthorized_processes) and
+        not proc.pname in (allowed_parents)
+      output: >
+        Unauthorized process started in container
+        (user=%user.name command=%proc.cmdline container=%container.name image=%container.image.repository)
+      priority: WARNING
+      tags: [container, process]
+    
+    - rule: Sensitive File Access
+      desc: Detect access to sensitive files
+      condition: >
+        open_read and
+        fd.name in (sensitive_files) and
+        not proc.name in (allowed_readers)
+      output: >
+        Sensitive file accessed
+        (user=%user.name command=%proc.cmdline file=%fd.name container=%container.name)
+      priority: WARNING
+      tags: [filesystem, secrets]
+    
+    - rule: Cryptocurrency Mining Detection
+      desc: Detect potential cryptocurrency mining
+      condition: >
+        spawned_process and
+        (proc.name in (miners) or
+         proc.cmdline contains "stratum+tcp" or
+         proc.cmdline contains "xmr" or
+         proc.cmdline contains "monero")
+      output: >
+        Potential cryptocurrency mining detected
+        (user=%user.name command=%proc.cmdline container=%container.name)
+      priority: CRITICAL
+      tags: [mining, malware]
+    
+    - list: unauthorized_processes
+      items: [wget, curl, nc, ncat, netcat, telnet]
+    
+    - list: allowed_parents
+      items: [systemd, containerd, dockerd]
+    
+    - list: sensitive_files
+      items: [/etc/shadow, /etc/passwd, /root/.ssh/id_rsa, /var/run/secrets/kubernetes.io]
+    
+    - list: allowed_readers
+      items: [sshd, sudo]
+    
+    - list: miners
+      items: [xmrig, minerd, minergate, ethminer]
+
+---
+# OPA Gatekeeper for policy enforcement
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gatekeeper-system
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gatekeeper-controller
+  namespace: gatekeeper-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gatekeeper
+  template:
+    metadata:
+      labels:
+        app: gatekeeper
+    spec:
+      serviceAccountName: gatekeeper
+      containers:
+      - name: opa
+        image: openpolicyagent/gatekeeper:v3.14.0
+        args:
+        - --port=8443
+        - --logtostderr
+        - --exempt-namespace=gatekeeper-system
+        ports:
+        - containerPort: 8443
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+---
+# Policy templates
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredsecuritycontext
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredSecurityContext
+      validation:
+        openAPIV3Schema:
+          type: object
+  targets:
+  - target: admission.k8s.gatekeeper.sh
+    rego: |
+      package k8srequiredsecuritycontext
+      
+      violation[{"msg": msg}] {
+        container := input.review.object.spec.containers[_]
+        not container.securityContext.runAsNonRoot
+        msg := sprintf("Container %v is not running as non-root", [container.name])
+      }
+      
+      violation[{"msg": msg}] {
+        container := input.review.object.spec.containers[_]
+        container.securityContext.privileged
+        msg := sprintf("Container %v is running as privileged", [container.name])
+      }
+      
+      violation[{"msg": msg}] {
+        container := input.review.object.spec.containers[_]
+        not container.securityContext.readOnlyRootFilesystem
+        msg := sprintf("Container %v does not have read-only root filesystem", [container.name])
+      }
+
+---
+# Apply security constraint
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: K8sRequiredSecurityContext
+metadata:
+  name: must-have-security-context
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+    - apiGroups: ["apps"]
+      kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+    namespaces: ["default", "production"]
+  excludedNamespaces: ["kube-system", "kube-public"]
+
+---
+# Security webhook for alerts
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-webhook
+  namespace: security-scanning
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: security-webhook
+  template:
+    metadata:
+      labels:
+        app: security-webhook
+    spec:
+      containers:
+      - name: webhook
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install flask requests
+          python3 /app/webhook.py
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: webhook-app
+          mountPath: /app
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: webhook-app
+        configMap:
+          name: webhook-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-app
+  namespace: security-scanning
+data:
+  webhook.py: |
+    #!/usr/bin/env python3
+    from flask import Flask, request, jsonify
+    import json
+    import logging
+    from datetime import datetime
+    
+    app = Flask(__name__)
+    logging.basicConfig(level=logging.INFO)
+    
+    @app.route('/falco', methods=['POST'])
+    def falco_webhook():
+        """Handle Falco alerts"""
+        data = request.json
+        logging.warning(f"FALCO ALERT: {data}")
+        
+        # Process Falco alert
+        # In production, this would send to alerting system
+        
+        return jsonify({'status': 'received'}), 200
+    
+    @app.route('/trivy', methods=['POST'])
+    def trivy_webhook():
+        """Handle Trivy vulnerability reports"""
+        data = request.json
+        logging.info(f"TRIVY REPORT: {data}")
+        
+        # Process vulnerability report
+        
+        return jsonify({'status': 'received'}), 200
+    
+    @app.route('/compliance', methods=['POST'])
+    def compliance_webhook():
+        """Handle compliance reports"""
+        data = request.json
+        logging.info(f"COMPLIANCE REPORT: {data}")
+        
+        # Process compliance report
+        
+        return jsonify({'status': 'received'}), 200
+    
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=8080)
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: trivy-scanner
+  namespace: security-scanning
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: falco
+  namespace: security-scanning
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gatekeeper
+  namespace: gatekeeper-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: trivy-scanner
+rules:
+- apiGroups: [""]
+  resources: ["pods", "namespaces", "services", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "statefulsets", "replicasets"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+  verbs: ["get", "list"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: trivy-scanner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: trivy-scanner
+subjects:
+- kind: ServiceAccount
+  name: trivy-scanner
+  namespace: security-scanning
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: security-webhook
+  namespace: security-scanning
+spec:
+  selector:
+    app: security-webhook
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trivy-scanner
+  namespace: security-scanning
+spec:
+  selector:
+    app: trivy-scanner
+  ports:
+  - port: 4954
+    targetPort: 4954
+
+---
+# CronJob for scheduled scans
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scheduled-security-scan
+  namespace: security-scanning
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: trivy-scanner
+          restartPolicy: OnFailure
+          containers:
+          - name: scanner
+            image: python:3.11-slim
+            command: ["/bin/bash"]
+            args:
+            - -c
+            - |
+              pip install kubernetes pyyaml
+              python3 /app/security_scanner.py
+              
+              # Upload report
+              curl -X POST http://security-webhook:8080/compliance \
+                -H "Content-Type: application/json" \
+                -d @/tmp/security-report.json
+            volumeMounts:
+            - name: scanner-app
+              mountPath: /app
+            - name: security-config
+              mountPath: /config
+          volumes:
+          - name: scanner-app
+            configMap:
+              name: scanner-application
+          - name: security-config
+            configMap:
+              name: security-config

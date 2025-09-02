@@ -1,0 +1,1007 @@
+# Jaeger Distributed Tracing for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tracing
+  labels:
+    name: tracing
+
+---
+# Jaeger configuration for multi-arch deployment
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jaeger-config
+  namespace: tracing
+data:
+  collector-config.yaml: |
+    # Jaeger collector configuration
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      jaeger:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:14250
+          thrift_binary:
+            endpoint: 0.0.0.0:6832
+          thrift_compact:
+            endpoint: 0.0.0.0:6831
+          thrift_http:
+            endpoint: 0.0.0.0:14268
+    
+    processors:
+      batch:
+        timeout: 1s
+        send_batch_size: 1024
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 512
+      resource:
+        attributes:
+          - key: cluster.name
+            value: homelab-multiarch
+          - key: deployment.environment
+            value: production
+      
+      # Architecture detection processor
+      attributes:
+        actions:
+          - key: node.architecture
+            from_attribute: node.kubernetes.io/arch
+            action: insert
+          - key: power.class
+            from_attribute: node.power-class
+            action: insert
+    
+    exporters:
+      elasticsearch:
+        endpoints: [http://elasticsearch:9200]
+        index: jaeger-span
+        num_workers: 2
+        queue_size: 1000
+      
+      prometheus:
+        endpoint: 0.0.0.0:8888
+        namespace: jaeger
+    
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      pprof:
+        endpoint: 0.0.0.0:1777
+      zpages:
+        endpoint: 0.0.0.0:55679
+    
+    service:
+      extensions: [health_check, pprof, zpages]
+      pipelines:
+        traces:
+          receivers: [otlp, jaeger]
+          processors: [memory_limiter, batch, resource, attributes]
+          exporters: [elasticsearch]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [prometheus]
+
+  sampling-config.yaml: |
+    # Adaptive sampling configuration
+    sampling_strategies:
+      default_strategy:
+        type: adaptive
+        max_traces_per_second: 100
+        
+      per_architecture_strategies:
+        - architecture: amd64
+          type: probabilistic
+          param: 0.1  # Sample 10% on AMD64 (high volume)
+        - architecture: arm64
+          type: probabilistic
+          param: 0.2  # Sample 20% on ARM64
+        - architecture: arm
+          type: probabilistic
+          param: 0.5  # Sample 50% on ARM (low volume)
+      
+      per_service_strategies:
+        - service: "critical-service"
+          type: probabilistic
+          param: 1.0  # Sample 100% for critical services
+        - service: "iot-sensor"
+          type: probabilistic
+          param: 0.01  # Sample 1% for high-volume IoT
+        - service: "edge-*"
+          type: adaptive
+          max_traces_per_second: 10
+
+---
+# Jaeger Collector deployment (handles high volume)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger-collector
+  namespace: tracing
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: jaeger-collector
+  template:
+    metadata:
+      labels:
+        app: jaeger-collector
+    spec:
+      # Prefer AMD64 for processing power
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: [jaeger-collector]
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: jaeger-collector
+        image: jaegertracing/jaeger-collector:1.48
+        args:
+        - --config-file=/conf/collector-config.yaml
+        - --sampling.strategies-file=/conf/sampling-config.yaml
+        env:
+        - name: SPAN_STORAGE_TYPE
+          value: elasticsearch
+        - name: ES_SERVER_URLS
+          value: http://elasticsearch:9200
+        - name: COLLECTOR_ZIPKIN_HOST_PORT
+          value: ":9411"
+        - name: COLLECTOR_OTLP_ENABLED
+          value: "true"
+        ports:
+        - containerPort: 14250  # gRPC
+          name: grpc
+        - containerPort: 14268  # HTTP
+          name: http
+        - containerPort: 14269  # Admin
+          name: admin
+        - containerPort: 4317   # OTLP gRPC
+          name: otlp-grpc
+        - containerPort: 4318   # OTLP HTTP
+          name: otlp-http
+        - containerPort: 9411   # Zipkin
+          name: zipkin
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        volumeMounts:
+        - name: jaeger-config
+          mountPath: /conf
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 14269
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 14269
+      volumes:
+      - name: jaeger-config
+        configMap:
+          name: jaeger-config
+
+---
+# Jaeger Query service (UI)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger-query
+  namespace: tracing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger-query
+  template:
+    metadata:
+      labels:
+        app: jaeger-query
+    spec:
+      # Can run on ARM64 for power efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: jaeger-query
+        image: jaegertracing/jaeger-query:1.48
+        env:
+        - name: SPAN_STORAGE_TYPE
+          value: elasticsearch
+        - name: ES_SERVER_URLS
+          value: http://elasticsearch:9200
+        - name: QUERY_BASE_PATH
+          value: /jaeger
+        ports:
+        - containerPort: 16686
+          name: http
+        - containerPort: 16687
+          name: admin
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 16687
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 16687
+
+---
+# Jaeger Agent DaemonSet (runs on every node)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: jaeger-agent
+  namespace: tracing
+spec:
+  selector:
+    matchLabels:
+      app: jaeger-agent
+  template:
+    metadata:
+      labels:
+        app: jaeger-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5778"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: jaeger-agent
+        image: jaegertracing/jaeger-agent:1.48
+        args:
+        - --reporter.grpc.host-port=jaeger-collector:14250
+        - --reporter.type=grpc
+        - --agent.tags=cluster=homelab,architecture=$(NODE_ARCH)
+        - --log-level=info
+        env:
+        - name: NODE_ARCH
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['kubernetes.io/arch']
+        - name: JAEGER_AGENT_PORT
+          value: "5775"
+        ports:
+        - containerPort: 5775
+          protocol: UDP
+          name: zk-compact-trft
+        - containerPort: 5778
+          protocol: TCP
+          name: config-rest
+        - containerPort: 6831
+          protocol: UDP
+          name: jg-compact-trft
+        - containerPort: 6832
+          protocol: UDP
+          name: jg-binary-trft
+        - containerPort: 14271
+          protocol: TCP
+          name: admin
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 14271
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 14271
+
+---
+# Elasticsearch for trace storage
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  namespace: tracing
+spec:
+  serviceName: elasticsearch
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      # Prefer AMD64 for storage performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: elasticsearch
+        image: elasticsearch:8.10.2
+        env:
+        - name: discovery.type
+          value: single-node
+        - name: xpack.security.enabled
+          value: "false"
+        - name: ES_JAVA_OPTS
+          value: "-Xms512m -Xmx512m"
+        - name: cluster.name
+          value: jaeger-cluster
+        ports:
+        - containerPort: 9200
+          name: http
+        - containerPort: 9300
+          name: transport
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+        volumeMounts:
+        - name: elasticsearch-data
+          mountPath: /usr/share/elasticsearch/data
+  volumeClaimTemplates:
+  - metadata:
+      name: elasticsearch-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ssd
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+# OpenTelemetry Collector for multi-arch support
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector
+  namespace: tracing
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:0.82.0
+        command: ["/otelcol-contrib"]
+        args: ["--config=/conf/otel-collector-config.yaml"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NODE_ARCH
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['kubernetes.io/arch']
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - containerPort: 4317  # OTLP gRPC
+        - containerPort: 4318  # OTLP HTTP
+        - containerPort: 8888  # Prometheus metrics
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        volumeMounts:
+        - name: otel-config
+          mountPath: /conf
+      volumes:
+      - name: otel-config
+        configMap:
+          name: otel-collector-config
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: tracing
+data:
+  otel-collector-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      
+      # Kubernetes metrics
+      k8s_cluster:
+        auth_type: serviceAccount
+        node_conditions_to_report: [Ready, MemoryPressure, DiskPressure]
+        resource_attributes:
+          k8s.cluster.name: homelab-multiarch
+      
+      # Host metrics
+      hostmetrics:
+        collection_interval: 30s
+        scrapers:
+          cpu:
+          disk:
+          filesystem:
+          load:
+          memory:
+          network:
+          process:
+    
+    processors:
+      batch:
+        timeout: 10s
+        send_batch_size: 1024
+      
+      memory_limiter:
+        check_interval: 5s
+        limit_mib: 200
+        spike_limit_mib: 50
+      
+      # Add architecture information
+      resource:
+        attributes:
+          - key: node.name
+            value: ${NODE_NAME}
+            action: upsert
+          - key: node.arch
+            value: ${NODE_ARCH}
+            action: upsert
+          - key: cluster.name
+            value: homelab-multiarch
+            action: upsert
+      
+      # Filter by architecture
+      filter/arch:
+        traces:
+          span:
+            - 'attributes["node.arch"] == "arm" and name =~ ".*sensor.*"'
+            - 'attributes["node.arch"] == "arm64" and name =~ ".*edge.*"'
+            - 'attributes["node.arch"] == "amd64" and name =~ ".*compute.*"'
+    
+    exporters:
+      jaeger:
+        endpoint: jaeger-collector:14250
+        tls:
+          insecure: true
+      
+      prometheus:
+        endpoint: 0.0.0.0:8888
+        namespace: otel
+        const_labels:
+          cluster: homelab
+      
+      logging:
+        loglevel: info
+    
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      pprof:
+        endpoint: 0.0.0.0:1777
+    
+    service:
+      extensions: [health_check, pprof]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch, resource, filter/arch]
+          exporters: [jaeger, logging]
+        metrics:
+          receivers: [otlp, k8s_cluster, hostmetrics]
+          processors: [memory_limiter, batch, resource]
+          exporters: [prometheus]
+
+---
+# Trace analytics dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trace-analytics
+  namespace: tracing
+data:
+  analytics.py: |
+    #!/usr/bin/env python3
+    import json
+    import logging
+    from datetime import datetime, timedelta
+    from elasticsearch import Elasticsearch
+    from typing import Dict, List
+    import numpy as np
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class TraceAnalytics:
+        def __init__(self):
+            self.es = Elasticsearch(['http://elasticsearch:9200'])
+            
+        def analyze_architecture_performance(self) -> Dict:
+            """Analyze performance by architecture"""
+            
+            query = {
+                "size": 0,
+                "aggs": {
+                    "by_architecture": {
+                        "terms": {
+                            "field": "node.arch",
+                            "size": 10
+                        },
+                        "aggs": {
+                            "avg_duration": {
+                                "avg": {
+                                    "field": "duration"
+                                }
+                            },
+                            "p99_duration": {
+                                "percentiles": {
+                                    "field": "duration",
+                                    "percents": [99]
+                                }
+                            },
+                            "error_rate": {
+                                "filter": {
+                                    "term": {
+                                        "status.code": "ERROR"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            result = self.es.search(index="jaeger-span-*", body=query)
+            
+            analysis = {}
+            for bucket in result['aggregations']['by_architecture']['buckets']:
+                arch = bucket['key']
+                analysis[arch] = {
+                    'avg_duration_ms': bucket['avg_duration']['value'],
+                    'p99_duration_ms': bucket['p99_duration']['values']['99.0'],
+                    'error_rate': bucket['error_rate']['doc_count'] / bucket['doc_count'],
+                    'trace_count': bucket['doc_count']
+                }
+            
+            return analysis
+        
+        def identify_bottlenecks(self) -> List[Dict]:
+            """Identify performance bottlenecks"""
+            
+            query = {
+                "size": 100,
+                "query": {
+                    "range": {
+                        "duration": {
+                            "gte": 1000  # Find traces longer than 1 second
+                        }
+                    }
+                },
+                "sort": [
+                    {"duration": {"order": "desc"}}
+                ]
+            }
+            
+            result = self.es.search(index="jaeger-span-*", body=query)
+            
+            bottlenecks = []
+            for hit in result['hits']['hits']:
+                span = hit['_source']
+                bottlenecks.append({
+                    'service': span.get('service.name'),
+                    'operation': span.get('operation.name'),
+                    'duration_ms': span.get('duration'),
+                    'architecture': span.get('node.arch'),
+                    'trace_id': span.get('trace.id')
+                })
+            
+            return bottlenecks
+        
+        def calculate_service_dependencies(self) -> Dict:
+            """Calculate service dependency graph"""
+            
+            query = {
+                "size": 0,
+                "aggs": {
+                    "services": {
+                        "terms": {
+                            "field": "service.name",
+                            "size": 100
+                        },
+                        "aggs": {
+                            "dependencies": {
+                                "terms": {
+                                    "field": "references.service.name",
+                                    "size": 100
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            result = self.es.search(index="jaeger-span-*", body=query)
+            
+            dependencies = {}
+            for service_bucket in result['aggregations']['services']['buckets']:
+                service = service_bucket['key']
+                deps = []
+                
+                for dep_bucket in service_bucket['dependencies']['buckets']:
+                    deps.append({
+                        'service': dep_bucket['key'],
+                        'call_count': dep_bucket['doc_count']
+                    })
+                
+                dependencies[service] = deps
+            
+            return dependencies
+        
+        def power_efficiency_analysis(self) -> Dict:
+            """Analyze power efficiency of trace processing"""
+            
+            # Calculate traces per watt by architecture
+            arch_power = {
+                'amd64': 45,  # Watts per node
+                'arm64': 7,
+                'arm': 3
+            }
+            
+            arch_performance = self.analyze_architecture_performance()
+            
+            efficiency = {}
+            for arch, metrics in arch_performance.items():
+                if arch in arch_power:
+                    traces_per_watt = metrics['trace_count'] / arch_power[arch]
+                    efficiency[arch] = {
+                        'traces_per_watt': traces_per_watt,
+                        'avg_latency_per_watt': metrics['avg_duration_ms'] / arch_power[arch],
+                        'power_consumption': arch_power[arch],
+                        'efficiency_score': traces_per_watt / metrics['avg_duration_ms']
+                    }
+            
+            return efficiency
+    
+    if __name__ == "__main__":
+        analytics = TraceAnalytics()
+        
+        # Run analysis
+        arch_perf = analytics.analyze_architecture_performance()
+        bottlenecks = analytics.identify_bottlenecks()
+        dependencies = analytics.calculate_service_dependencies()
+        efficiency = analytics.power_efficiency_analysis()
+        
+        # Output results
+        print("Architecture Performance:", json.dumps(arch_perf, indent=2))
+        print("Bottlenecks:", json.dumps(bottlenecks, indent=2))
+        print("Service Dependencies:", json.dumps(dependencies, indent=2))
+        print("Power Efficiency:", json.dumps(efficiency, indent=2))
+
+---
+# Instrumentation library for applications
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: instrumentation-lib
+  namespace: tracing
+data:
+  auto_instrument.sh: |
+    #!/bin/bash
+    
+    # Auto-instrumentation script for different languages
+    
+    LANG=$1
+    APP_NAME=$2
+    
+    case $LANG in
+      python)
+        pip install opentelemetry-distro opentelemetry-exporter-jaeger
+        opentelemetry-bootstrap -a install
+        export OTEL_SERVICE_NAME=$APP_NAME
+        export OTEL_EXPORTER_JAEGER_ENDPOINT=http://jaeger-collector:14250
+        export OTEL_TRACES_EXPORTER=jaeger
+        exec opentelemetry-instrument "$@"
+        ;;
+      
+      node)
+        npm install @opentelemetry/api @opentelemetry/auto-instrumentations-node
+        export OTEL_SERVICE_NAME=$APP_NAME
+        export OTEL_EXPORTER_JAEGER_ENDPOINT=http://jaeger-collector:14250
+        export NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register"
+        exec "$@"
+        ;;
+      
+      go)
+        # Go requires compile-time instrumentation
+        echo "Go applications require compile-time instrumentation"
+        echo "Add OpenTelemetry SDK to your code"
+        ;;
+      
+      java)
+        wget https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar
+        export OTEL_SERVICE_NAME=$APP_NAME
+        export OTEL_EXPORTER_JAEGER_ENDPOINT=http://jaeger-collector:14250
+        exec java -javaagent:./opentelemetry-javaagent.jar "$@"
+        ;;
+      
+      *)
+        echo "Unsupported language: $LANG"
+        exit 1
+        ;;
+    esac
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-collector
+  namespace: tracing
+spec:
+  selector:
+    app: jaeger-collector
+  ports:
+  - name: grpc
+    port: 14250
+    targetPort: 14250
+  - name: http
+    port: 14268
+    targetPort: 14268
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+  - name: otlp-http
+    port: 4318
+    targetPort: 4318
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-query
+  namespace: tracing
+spec:
+  selector:
+    app: jaeger-query
+  ports:
+  - name: http
+    port: 80
+    targetPort: 16686
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: tracing
+spec:
+  selector:
+    app: elasticsearch
+  ports:
+  - name: http
+    port: 9200
+    targetPort: 9200
+  - name: transport
+    port: 9300
+    targetPort: 9300
+  type: ClusterIP
+
+---
+# Ingress for Jaeger UI
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jaeger-ingress
+  namespace: tracing
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+spec:
+  rules:
+  - host: tracing.homelab.local
+    http:
+      paths:
+      - path: /(.*)
+        pathType: Prefix
+        backend:
+          service:
+            name: jaeger-query
+            port:
+              number: 80
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jaeger
+  namespace: tracing
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: tracing
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "nodes/metrics", "pods", "endpoints", "services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "statefulsets", "replicasets"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector
+subjects:
+- kind: ServiceAccount
+  name: otel-collector
+  namespace: tracing
+
+---
+# Example traced application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example-traced-app
+  namespace: default
+  labels:
+    app: example-traced
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: example-traced
+  template:
+    metadata:
+      labels:
+        app: example-traced
+      annotations:
+        linkerd.io/inject: enabled  # Service mesh integration
+    spec:
+      containers:
+      - name: app
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install flask opentelemetry-distro opentelemetry-exporter-jaeger opentelemetry-instrumentation-flask
+          
+          cat > app.py << 'EOF'
+          from flask import Flask
+          from opentelemetry import trace
+          from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+          from opentelemetry.sdk.resources import Resource
+          from opentelemetry.sdk.trace import TracerProvider
+          from opentelemetry.sdk.trace.export import BatchSpanProcessor
+          from opentelemetry.instrumentation.flask import FlaskInstrumentor
+          import time
+          import random
+          
+          # Setup tracing
+          resource = Resource.create({"service.name": "example-traced-app"})
+          provider = TracerProvider(resource=resource)
+          trace.set_tracer_provider(provider)
+          
+          jaeger_exporter = JaegerExporter(
+              agent_host_name="jaeger-agent",
+              agent_port=6831,
+          )
+          
+          span_processor = BatchSpanProcessor(jaeger_exporter)
+          provider.add_span_processor(span_processor)
+          
+          app = Flask(__name__)
+          FlaskInstrumentor().instrument_app(app)
+          
+          tracer = trace.get_tracer(__name__)
+          
+          @app.route('/')
+          def hello():
+              with tracer.start_as_current_span("process_request"):
+                  # Simulate some work
+                  time.sleep(random.uniform(0.01, 0.1))
+                  
+                  with tracer.start_as_current_span("database_query"):
+                      time.sleep(random.uniform(0.005, 0.05))
+                  
+                  with tracer.start_as_current_span("cache_lookup"):
+                      time.sleep(random.uniform(0.001, 0.01))
+                  
+                  return "Hello from traced app!"
+          
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=5000)
+          EOF
+          
+          python app.py
+        ports:
+        - containerPort: 5000
+        env:
+        - name: OTEL_SERVICE_NAME
+          value: "example-traced-app"
+        - name: OTEL_EXPORTER_JAEGER_ENDPOINT
+          value: "http://jaeger-collector:14250"
+        - name: OTEL_TRACES_EXPORTER
+          value: "jaeger"
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"

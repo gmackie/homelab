@@ -1,0 +1,1293 @@
+# IoT Sensor Integration Platform for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: iot-sensors
+  labels:
+    name: iot-sensors
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iot-config
+  namespace: iot-sensors
+data:
+  sensor-types.yaml: |
+    # IoT sensor type definitions
+    sensor_types:
+      temperature:
+        description: "Temperature sensors (DS18B20, DHT22, etc.)"
+        data_format: "float"
+        unit: "celsius"
+        update_frequency: "30s"
+        storage_retention: "30d"
+        alerting:
+          high_threshold: 35.0
+          low_threshold: 5.0
+        compatible_architectures: ["arm", "arm64"]
+      
+      humidity:
+        description: "Humidity sensors (DHT22, SHT30, etc.)"
+        data_format: "float"
+        unit: "percent"
+        update_frequency: "30s"
+        storage_retention: "30d"
+        alerting:
+          high_threshold: 80.0
+          low_threshold: 20.0
+        compatible_architectures: ["arm", "arm64"]
+      
+      motion:
+        description: "Motion/PIR sensors"
+        data_format: "boolean"
+        unit: "detected"
+        update_frequency: "1s"
+        storage_retention: "7d"
+        alerting:
+          motion_detected: true
+        compatible_architectures: ["arm", "arm64"]
+      
+      air_quality:
+        description: "Air quality sensors (MQ-135, etc.)"
+        data_format: "float"
+        unit: "ppm"
+        update_frequency: "60s"
+        storage_retention: "90d"
+        alerting:
+          high_threshold: 1000.0
+        compatible_architectures: ["arm64"]
+      
+      power_meter:
+        description: "Power consumption meters"
+        data_format: "float"
+        unit: "watts"
+        update_frequency: "10s"
+        storage_retention: "365d"
+        alerting:
+          high_threshold: 2000.0
+        compatible_architectures: ["arm", "arm64"]
+      
+      water_leak:
+        description: "Water leak detection sensors"
+        data_format: "boolean"
+        unit: "detected"
+        update_frequency: "5s"
+        storage_retention: "365d"
+        alerting:
+          leak_detected: true
+        compatible_architectures: ["arm", "arm64"]
+      
+      sound_level:
+        description: "Sound level meters"
+        data_format: "float"
+        unit: "decibels"
+        update_frequency: "1s"
+        storage_retention: "7d"
+        alerting:
+          high_threshold: 80.0
+        compatible_architectures: ["arm64"]
+      
+      door_window:
+        description: "Door and window sensors"
+        data_format: "boolean"
+        unit: "open"
+        update_frequency: "1s"
+        storage_retention: "365d"
+        alerting:
+          opened: true
+        compatible_architectures: ["arm", "arm64"]
+
+  zone-mapping.yaml: |
+    # IoT zone definitions and sensor assignments
+    zones:
+      living_room:
+        description: "Main living area"
+        sensors:
+          - type: "temperature"
+            location: "center"
+            node_preference: "pi-living-01"
+          - type: "humidity"
+            location: "center"
+            node_preference: "pi-living-01"
+          - type: "motion"
+            location: "entrance"
+            node_preference: "pi-living-02"
+          - type: "air_quality"
+            location: "center"
+            node_preference: "pi64-living-01"
+          - type: "sound_level"
+            location: "tv_area"
+            node_preference: "pi64-living-01"
+      
+      kitchen:
+        description: "Kitchen and dining area"
+        sensors:
+          - type: "temperature"
+            location: "counter"
+            node_preference: "pi-kitchen-01"
+          - type: "humidity"
+            location: "sink"
+            node_preference: "pi-kitchen-01"
+          - type: "water_leak"
+            location: "under_sink"
+            node_preference: "pi-kitchen-02"
+          - type: "motion"
+            location: "entrance"
+            node_preference: "pi-kitchen-02"
+      
+      bedrooms:
+        description: "Sleeping areas"
+        sensors:
+          - type: "temperature"
+            location: "master"
+            node_preference: "pi-bedroom-01"
+          - type: "humidity"
+            location: "master"
+            node_preference: "pi-bedroom-01"
+          - type: "door_window"
+            location: "master_window"
+            node_preference: "pi-bedroom-02"
+          - type: "motion"
+            location: "hallway"
+            node_preference: "pi-bedroom-02"
+      
+      garage:
+        description: "Garage and workshop"
+        sensors:
+          - type: "temperature"
+            location: "center"
+            node_preference: "pi64-garage-01"
+          - type: "motion"
+            location: "entrance"
+            node_preference: "pi-garage-01"
+          - type: "door_window"
+            location: "main_door"
+            node_preference: "pi-garage-01"
+          - type: "power_meter"
+            location: "electrical_panel"
+            node_preference: "pi64-garage-01"
+      
+      outdoor:
+        description: "Outdoor areas"
+        sensors:
+          - type: "temperature"
+            location: "front_yard"
+            node_preference: "pi-outdoor-01"
+          - type: "humidity"
+            location: "front_yard"
+            node_preference: "pi-outdoor-01"
+          - type: "motion"
+            location: "driveway"
+            node_preference: "pi-outdoor-02"
+          - type: "water_leak"
+            location: "basement"
+            node_preference: "pi-outdoor-02"
+
+  mqtt-config.yaml: |
+    # MQTT broker configuration for IoT communication
+    broker:
+      host: "iot-mqtt-broker"
+      port: 1883
+      username: "homelab"
+      password: "secure_password_123"
+      
+    topics:
+      sensor_data: "homelab/sensors/{zone}/{sensor_type}/{sensor_id}/data"
+      sensor_status: "homelab/sensors/{zone}/{sensor_type}/{sensor_id}/status"
+      commands: "homelab/commands/{zone}/{sensor_type}/{sensor_id}"
+      alerts: "homelab/alerts/{zone}/{sensor_type}"
+      
+    qos_levels:
+      sensor_data: 1
+      alerts: 2
+      commands: 2
+
+---
+# MQTT Broker for IoT communication
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iot-mqtt-broker
+  namespace: iot-sensors
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iot-mqtt-broker
+  template:
+    metadata:
+      labels:
+        app: iot-mqtt-broker
+    spec:
+      # Prefer ARM64 for power efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: mosquitto
+        image: eclipse-mosquitto:2.0
+        ports:
+        - containerPort: 1883
+          name: mqtt
+        - containerPort: 9001
+          name: websocket
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: mosquitto-config
+          mountPath: /mosquitto/config
+        - name: mosquitto-data
+          mountPath: /mosquitto/data
+      volumes:
+      - name: mosquitto-config
+        configMap:
+          name: mosquitto-config
+      - name: mosquitto-data
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto-config
+  namespace: iot-sensors
+data:
+  mosquitto.conf: |
+    # Mosquitto MQTT Broker Configuration
+    
+    # Network settings
+    listener 1883
+    listener 9001
+    protocol websockets
+    
+    # Authentication
+    allow_anonymous false
+    password_file /mosquitto/config/passwd
+    
+    # Persistence
+    persistence true
+    persistence_location /mosquitto/data/
+    
+    # Logging
+    log_dest stdout
+    log_type all
+    
+    # Connection limits
+    max_connections 1000
+    
+    # Message size limits
+    message_size_limit 1048576
+    
+  passwd: |
+    # MQTT users (password is 'secure_password_123' hashed)
+    homelab:$7$101$+8QCjXaGHX6FGMM+$+8QCjXaGHX6FGMM+Example+Hash
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iot-mqtt-broker
+  namespace: iot-sensors
+spec:
+  selector:
+    app: iot-mqtt-broker
+  ports:
+  - name: mqtt
+    port: 1883
+    targetPort: 1883
+  - name: websocket
+    port: 9001
+    targetPort: 9001
+  type: ClusterIP
+
+---
+# IoT Data Collector and Processor
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iot-data-processor
+  namespace: iot-sensors
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: iot-data-processor
+  template:
+    metadata:
+      labels:
+        app: iot-data-processor
+    spec:
+      # Distribute across ARM64 nodes
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: [iot-data-processor]
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: processor
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install paho-mqtt influxdb-client redis pyyaml asyncio
+          python3 /app/iot_processor.py
+        volumeMounts:
+        - name: processor-app
+          mountPath: /app
+        - name: iot-config
+          mountPath: /config
+        env:
+        - name: MQTT_BROKER
+          value: "iot-mqtt-broker"
+        - name: MQTT_PORT
+          value: "1883"
+        - name: MQTT_USERNAME
+          value: "homelab"
+        - name: MQTT_PASSWORD
+          value: "secure_password_123"
+        - name: INFLUXDB_URL
+          value: "http://iot-influxdb:8086"
+        - name: REDIS_URL
+          value: "redis://iot-redis:6379"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "300m"
+        ports:
+        - containerPort: 8080
+          name: api
+      volumes:
+      - name: processor-app
+        configMap:
+          name: iot-processor-app
+      - name: iot-config
+        configMap:
+          name: iot-config
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iot-processor-app
+  namespace: iot-sensors
+data:
+  iot_processor.py: |
+    #!/usr/bin/env python3
+    import asyncio
+    import json
+    import logging
+    import os
+    import time
+    import yaml
+    from datetime import datetime, timedelta
+    from typing import Dict, List, Optional
+    import paho.mqtt.client as mqtt
+    import redis
+    from aiohttp import web
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class IoTDataProcessor:
+        def __init__(self):
+            # Load IoT configuration
+            with open('/config/sensor-types.yaml', 'r') as f:
+                self.sensor_config = yaml.safe_load(f)
+            
+            with open('/config/zone-mapping.yaml', 'r') as f:
+                self.zone_config = yaml.safe_load(f)
+            
+            with open('/config/mqtt-config.yaml', 'r') as f:
+                self.mqtt_config = yaml.safe_load(f)
+            
+            # Connect to Redis for caching and state
+            redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+            self.redis_client = redis.from_url(redis_url)
+            
+            # MQTT client setup
+            self.mqtt_client = mqtt.Client()
+            self.mqtt_client.on_connect = self.on_mqtt_connect
+            self.mqtt_client.on_message = self.on_mqtt_message
+            self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+            
+            # Sensor data storage
+            self.sensor_readings = {}
+            self.alert_rules = {}
+            
+            # Initialize alert rules from config
+            self.setup_alert_rules()
+        
+        def setup_alert_rules(self):
+            """Setup alerting rules from sensor configuration"""
+            for sensor_type, config in self.sensor_config['sensor_types'].items():
+                if 'alerting' in config:
+                    self.alert_rules[sensor_type] = config['alerting']
+        
+        def on_mqtt_connect(self, client, userdata, flags, rc):
+            """MQTT connection callback"""
+            if rc == 0:
+                logger.info("Connected to MQTT broker")
+                
+                # Subscribe to all sensor data topics
+                for zone_name in self.zone_config['zones'].keys():
+                    for sensor_type in self.sensor_config['sensor_types'].keys():
+                        topic = f"homelab/sensors/{zone_name}/{sensor_type}/+/data"
+                        client.subscribe(topic, qos=1)
+                        logger.info(f"Subscribed to topic: {topic}")
+                
+            else:
+                logger.error(f"Failed to connect to MQTT broker, return code {rc}")
+        
+        def on_mqtt_disconnect(self, client, userdata, rc):
+            """MQTT disconnection callback"""
+            logger.warning(f"Disconnected from MQTT broker, return code {rc}")
+        
+        def on_mqtt_message(self, client, userdata, msg):
+            """Process incoming MQTT sensor data"""
+            try:
+                topic_parts = msg.topic.split('/')
+                if len(topic_parts) >= 6:
+                    zone = topic_parts[2]
+                    sensor_type = topic_parts[3]
+                    sensor_id = topic_parts[4]
+                    data_type = topic_parts[5]
+                    
+                    if data_type == 'data':
+                        payload = json.loads(msg.payload.decode())
+                        self.process_sensor_data(zone, sensor_type, sensor_id, payload)
+                
+            except Exception as e:
+                logger.error(f"Error processing MQTT message: {e}")
+        
+        def process_sensor_data(self, zone: str, sensor_type: str, sensor_id: str, data: Dict):
+            """Process and store sensor data"""
+            timestamp = datetime.now()
+            
+            # Create sensor key
+            sensor_key = f"{zone}:{sensor_type}:{sensor_id}"
+            
+            # Validate data format
+            sensor_config = self.sensor_config['sensor_types'].get(sensor_type)
+            if not sensor_config:
+                logger.warning(f"Unknown sensor type: {sensor_type}")
+                return
+            
+            # Extract value based on data format
+            value = data.get('value')
+            if value is None:
+                logger.warning(f"No value in sensor data: {data}")
+                return
+            
+            # Store in memory cache
+            self.sensor_readings[sensor_key] = {
+                'zone': zone,
+                'sensor_type': sensor_type,
+                'sensor_id': sensor_id,
+                'value': value,
+                'timestamp': timestamp.isoformat(),
+                'unit': sensor_config.get('unit', ''),
+                'raw_data': data
+            }
+            
+            # Store in Redis with expiration
+            retention = sensor_config.get('storage_retention', '30d')
+            retention_seconds = self.parse_retention(retention)
+            
+            self.redis_client.setex(
+                f"sensor:{sensor_key}:latest",
+                retention_seconds,
+                json.dumps(self.sensor_readings[sensor_key])
+            )
+            
+            # Store in time series
+            self.redis_client.zadd(
+                f"sensor:{sensor_key}:timeseries",
+                {json.dumps({
+                    'value': value,
+                    'timestamp': timestamp.isoformat(),
+                    'metadata': data
+                }): timestamp.timestamp()}
+            )
+            
+            # Cleanup old time series data
+            cutoff_time = timestamp - timedelta(seconds=retention_seconds)
+            self.redis_client.zremrangebyscore(
+                f"sensor:{sensor_key}:timeseries",
+                0,
+                cutoff_time.timestamp()
+            )
+            
+            # Check for alerts
+            self.check_alerts(zone, sensor_type, sensor_id, value)
+            
+            logger.debug(f"Processed sensor data: {sensor_key} = {value}")
+        
+        def parse_retention(self, retention_str: str) -> int:
+            """Parse retention string to seconds"""
+            if retention_str.endswith('d'):
+                return int(retention_str[:-1]) * 24 * 3600
+            elif retention_str.endswith('h'):
+                return int(retention_str[:-1]) * 3600
+            elif retention_str.endswith('m'):
+                return int(retention_str[:-1]) * 60
+            else:
+                return int(retention_str)
+        
+        def check_alerts(self, zone: str, sensor_type: str, sensor_id: str, value):
+            """Check if sensor value triggers any alerts"""
+            alert_rules = self.alert_rules.get(sensor_type)
+            if not alert_rules:
+                return
+            
+            sensor_key = f"{zone}:{sensor_type}:{sensor_id}"
+            alerts_triggered = []
+            
+            # Check threshold-based alerts
+            for rule_name, threshold in alert_rules.items():
+                if rule_name.endswith('_threshold'):
+                    if rule_name.startswith('high_') and value > threshold:
+                        alerts_triggered.append({
+                            'type': 'high_threshold',
+                            'rule': rule_name,
+                            'threshold': threshold,
+                            'value': value,
+                            'severity': 'warning'
+                        })
+                    elif rule_name.startswith('low_') and value < threshold:
+                        alerts_triggered.append({
+                            'type': 'low_threshold',
+                            'rule': rule_name,
+                            'threshold': threshold,
+                            'value': value,
+                            'severity': 'warning'
+                        })
+            
+            # Check boolean alerts
+            for rule_name, trigger_value in alert_rules.items():
+                if rule_name in ['motion_detected', 'leak_detected', 'opened'] and value == trigger_value:
+                    alerts_triggered.append({
+                        'type': 'state_change',
+                        'rule': rule_name,
+                        'value': value,
+                        'severity': 'info' if rule_name == 'opened' else 'critical'
+                    })
+            
+            # Send alerts
+            for alert in alerts_triggered:
+                self.send_alert(zone, sensor_type, sensor_id, alert)
+        
+        def send_alert(self, zone: str, sensor_type: str, sensor_id: str, alert: Dict):
+            """Send alert to monitoring system"""
+            alert_data = {
+                'zone': zone,
+                'sensor_type': sensor_type,
+                'sensor_id': sensor_id,
+                'alert': alert,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Publish to MQTT alerts topic
+            topic = f"homelab/alerts/{zone}/{sensor_type}"
+            self.mqtt_client.publish(topic, json.dumps(alert_data), qos=2)
+            
+            # Store in Redis alerts list
+            self.redis_client.lpush('iot:alerts', json.dumps(alert_data))
+            self.redis_client.ltrim('iot:alerts', 0, 999)  # Keep last 1000 alerts
+            
+            logger.warning(f"ALERT [{alert['severity']}]: {zone}/{sensor_type}/{sensor_id} - {alert}")
+        
+        async def api_handler(self, request):
+            """Handle API requests"""
+            path = request.path
+            
+            if path == '/health':
+                return web.json_response({'status': 'healthy'})
+            
+            elif path == '/sensors':
+                # Return all current sensor readings
+                return web.json_response(self.sensor_readings)
+            
+            elif path.startswith('/sensors/'):
+                # Get specific sensor data
+                parts = path.split('/')
+                if len(parts) >= 5:
+                    zone = parts[2]
+                    sensor_type = parts[3]
+                    sensor_id = parts[4]
+                    
+                    sensor_key = f"{zone}:{sensor_type}:{sensor_id}"
+                    
+                    if sensor_key in self.sensor_readings:
+                        # Get time series data
+                        timeseries_key = f"sensor:{sensor_key}:timeseries"
+                        timeseries_data = self.redis_client.zrevrange(
+                            timeseries_key, 0, 99, withscores=True
+                        )
+                        
+                        readings = []
+                        for data_json, timestamp in timeseries_data:
+                            data = json.loads(data_json)
+                            data['timestamp'] = datetime.fromtimestamp(timestamp).isoformat()
+                            readings.append(data)
+                        
+                        return web.json_response({
+                            'current': self.sensor_readings[sensor_key],
+                            'history': readings
+                        })
+                    else:
+                        return web.json_response({'error': 'Sensor not found'}, status=404)
+            
+            elif path == '/zones':
+                # Return sensor data grouped by zone
+                zones_data = {}
+                for sensor_key, reading in self.sensor_readings.items():
+                    zone = reading['zone']
+                    if zone not in zones_data:
+                        zones_data[zone] = []
+                    zones_data[zone].append(reading)
+                
+                return web.json_response(zones_data)
+            
+            elif path == '/alerts':
+                # Return recent alerts
+                alerts_data = self.redis_client.lrange('iot:alerts', 0, 49)
+                alerts = [json.loads(alert) for alert in alerts_data]
+                return web.json_response(alerts)
+            
+            else:
+                return web.json_response({'error': 'Not found'}, status=404)
+        
+        async def connect_mqtt(self):
+            """Connect to MQTT broker"""
+            broker_host = os.getenv('MQTT_BROKER', 'localhost')
+            broker_port = int(os.getenv('MQTT_PORT', '1883'))
+            username = os.getenv('MQTT_USERNAME')
+            password = os.getenv('MQTT_PASSWORD')
+            
+            if username and password:
+                self.mqtt_client.username_pw_set(username, password)
+            
+            try:
+                self.mqtt_client.connect(broker_host, broker_port, 60)
+                self.mqtt_client.loop_start()
+                logger.info(f"MQTT client connected to {broker_host}:{broker_port}")
+            except Exception as e:
+                logger.error(f"Failed to connect to MQTT broker: {e}")
+        
+        async def run(self):
+            """Main run loop"""
+            logger.info("Starting IoT Data Processor...")
+            
+            # Connect to MQTT
+            await self.connect_mqtt()
+            
+            # Set up web server
+            app = web.Application()
+            app.router.add_get('/{path:.*}', self.api_handler)
+            
+            # Start web server
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, '0.0.0.0', 8080)
+            await site.start()
+            logger.info("IoT API server started on port 8080")
+            
+            # Keep running
+            while True:
+                await asyncio.sleep(3600)
+    
+    if __name__ == "__main__":
+        processor = IoTDataProcessor()
+        asyncio.run(processor.run())
+
+---
+# Redis for IoT data caching
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iot-redis
+  namespace: iot-sensors
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iot-redis
+  template:
+    metadata:
+      labels:
+        app: iot-redis
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "300m"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: iot-redis-data
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: iot-redis-data
+  namespace: iot-sensors
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iot-redis
+  namespace: iot-sensors
+spec:
+  selector:
+    app: iot-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+# InfluxDB for time series data
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iot-influxdb
+  namespace: iot-sensors
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iot-influxdb
+  template:
+    metadata:
+      labels:
+        app: iot-influxdb
+    spec:
+      # Prefer AMD64 for database performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: influxdb
+        image: influxdb:2.7
+        ports:
+        - containerPort: 8086
+        env:
+        - name: DOCKER_INFLUXDB_INIT_MODE
+          value: "setup"
+        - name: DOCKER_INFLUXDB_INIT_USERNAME
+          value: "homelab"
+        - name: DOCKER_INFLUXDB_INIT_PASSWORD
+          value: "homelab_password_123"
+        - name: DOCKER_INFLUXDB_INIT_ORG
+          value: "homelab"
+        - name: DOCKER_INFLUXDB_INIT_BUCKET
+          value: "iot_sensors"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: influxdb-data
+          mountPath: /var/lib/influxdb2
+      volumes:
+      - name: influxdb-data
+        persistentVolumeClaim:
+          claimName: iot-influxdb-data
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: iot-influxdb-data
+  namespace: iot-sensors
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: longhorn-hdd
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iot-influxdb
+  namespace: iot-sensors
+spec:
+  selector:
+    app: iot-influxdb
+  ports:
+  - port: 8086
+    targetPort: 8086
+
+---
+# IoT Dashboard
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iot-dashboard
+  namespace: iot-sensors
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iot-dashboard
+  template:
+    metadata:
+      labels:
+        app: iot-dashboard
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: dashboard
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: dashboard-content
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: dashboard-content
+        configMap:
+          name: iot-dashboard-content
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iot-dashboard-content
+  namespace: iot-sensors
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>🏠 IoT Sensor Dashboard</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+            .container { max-width: 1400px; margin: 0 auto; }
+            .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
+            .zone-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+            .zone-card { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            .zone-title { color: #333; border-bottom: 2px solid #667eea; padding-bottom: 10px; margin-bottom: 15px; }
+            .sensor-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; margin: 5px 0; background: #f8f9fa; border-radius: 5px; }
+            .sensor-value { font-weight: bold; color: #667eea; }
+            .sensor-unit { font-size: 0.9em; color: #666; }
+            .alert-high { background: #ffe6e6 !important; border-left: 4px solid #ff4757; }
+            .alert-normal { background: #e6ffe6 !important; border-left: 4px solid #2ed573; }
+            .status-indicator { width: 10px; height: 10px; border-radius: 50%; margin-right: 10px; }
+            .status-online { background: #2ed573; }
+            .status-offline { background: #ff4757; }
+            .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
+            .stat-card { background: white; padding: 20px; border-radius: 10px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            .stat-number { font-size: 2em; font-weight: bold; color: #667eea; }
+            .stat-label { color: #666; margin-top: 5px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🏠 Homelab IoT Sensor Dashboard</h1>
+                <p>Real-time monitoring of smart home sensors across multiple zones</p>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-number" id="total-sensors">-</div>
+                    <div class="stat-label">Total Sensors</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="active-sensors">-</div>
+                    <div class="stat-label">Active Sensors</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="total-alerts">-</div>
+                    <div class="stat-label">Recent Alerts</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="avg-temp">-</div>
+                    <div class="stat-label">Avg Temperature</div>
+                </div>
+            </div>
+            
+            <div id="zones-container" class="zone-grid">
+                <!-- Zones will be loaded here -->
+            </div>
+            
+            <div class="zone-card" style="margin-top: 20px;">
+                <h3>🚨 Recent Alerts</h3>
+                <div id="alerts-container">
+                    <p>Loading alerts...</p>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            // API endpoints
+            const API_BASE = '/api';
+            
+            // Global data
+            let sensorsData = {};
+            let alertsData = [];
+            
+            // Update functions
+            async function loadSensorData() {
+                try {
+                    const response = await fetch(`${API_BASE}/zones`);
+                    sensorsData = await response.json();
+                    updateZoneDisplay();
+                    updateStats();
+                } catch (error) {
+                    console.error('Failed to load sensor data:', error);
+                }
+            }
+            
+            async function loadAlerts() {
+                try {
+                    const response = await fetch(`${API_BASE}/alerts`);
+                    alertsData = await response.json();
+                    updateAlertsDisplay();
+                } catch (error) {
+                    console.error('Failed to load alerts:', error);
+                }
+            }
+            
+            function updateZoneDisplay() {
+                const container = document.getElementById('zones-container');
+                container.innerHTML = '';
+                
+                for (const [zoneName, sensors] of Object.entries(sensorsData)) {
+                    const zoneCard = document.createElement('div');
+                    zoneCard.className = 'zone-card';
+                    
+                    zoneCard.innerHTML = `
+                        <h3 class="zone-title">${zoneName.replace('_', ' ').toUpperCase()}</h3>
+                        <div id="zone-${zoneName}">
+                            ${sensors.map(sensor => createSensorHTML(sensor)).join('')}
+                        </div>
+                    `;
+                    
+                    container.appendChild(zoneCard);
+                }
+            }
+            
+            function createSensorHTML(sensor) {
+                const isOnline = new Date() - new Date(sensor.timestamp) < 300000; // 5 minutes
+                const statusClass = isOnline ? 'status-online' : 'status-offline';
+                
+                let alertClass = 'alert-normal';
+                if (sensor.sensor_type === 'temperature' && (sensor.value > 30 || sensor.value < 10)) {
+                    alertClass = 'alert-high';
+                } else if (sensor.sensor_type === 'humidity' && (sensor.value > 70 || sensor.value < 30)) {
+                    alertClass = 'alert-high';
+                }
+                
+                return `
+                    <div class="sensor-item ${alertClass}">
+                        <div>
+                            <div class="status-indicator ${statusClass}"></div>
+                            <strong>${sensor.sensor_type.replace('_', ' ')}</strong>
+                            <small>(${sensor.sensor_id})</small>
+                        </div>
+                        <div>
+                            <span class="sensor-value">${sensor.value}</span>
+                            <span class="sensor-unit">${sensor.unit}</span>
+                        </div>
+                    </div>
+                `;
+            }
+            
+            function updateStats() {
+                let totalSensors = 0;
+                let activeSensors = 0;
+                let tempReadings = [];
+                
+                for (const sensors of Object.values(sensorsData)) {
+                    totalSensors += sensors.length;
+                    
+                    for (const sensor of sensors) {
+                        const isActive = new Date() - new Date(sensor.timestamp) < 300000;
+                        if (isActive) activeSensors++;
+                        
+                        if (sensor.sensor_type === 'temperature') {
+                            tempReadings.push(sensor.value);
+                        }
+                    }
+                }
+                
+                const avgTemp = tempReadings.length > 0 
+                    ? (tempReadings.reduce((a, b) => a + b, 0) / tempReadings.length).toFixed(1)
+                    : 'N/A';
+                
+                document.getElementById('total-sensors').textContent = totalSensors;
+                document.getElementById('active-sensors').textContent = activeSensors;
+                document.getElementById('total-alerts').textContent = alertsData.length;
+                document.getElementById('avg-temp').textContent = avgTemp + '°C';
+            }
+            
+            function updateAlertsDisplay() {
+                const container = document.getElementById('alerts-container');
+                
+                if (alertsData.length === 0) {
+                    container.innerHTML = '<p>No recent alerts</p>';
+                    return;
+                }
+                
+                container.innerHTML = alertsData.slice(0, 10).map(alert => `
+                    <div class="sensor-item alert-high" style="margin: 10px 0;">
+                        <div>
+                            <strong>${alert.zone}/${alert.sensor_type}</strong>
+                            <br>
+                            <small>${alert.alert.type}: ${alert.alert.rule}</small>
+                        </div>
+                        <div>
+                            <strong>${alert.alert.value}</strong>
+                            <br>
+                            <small>${new Date(alert.timestamp).toLocaleString()}</small>
+                        </div>
+                    </div>
+                `).join('');
+            }
+            
+            // Initialize dashboard
+            async function initDashboard() {
+                await loadSensorData();
+                await loadAlerts();
+                
+                // Refresh data every 30 seconds
+                setInterval(async () => {
+                    await loadSensorData();
+                    await loadAlerts();
+                }, 30000);
+            }
+            
+            // Start dashboard when page loads
+            window.addEventListener('load', initDashboard);
+        </script>
+    </body>
+    </html>
+
+---
+# Sensor simulator for testing
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: iot-sensor-simulator
+  namespace: iot-sensors
+spec:
+  schedule: "*/1 * * * *"  # Every minute
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          restartPolicy: OnFailure
+          containers:
+          - name: simulator
+            image: python:3.11-alpine
+            command: ["/bin/sh"]
+            args:
+            - -c
+            - |
+              pip install paho-mqtt
+              python3 -c "
+              import json
+              import random
+              import time
+              from datetime import datetime
+              import paho.mqtt.client as mqtt
+              
+              # Connect to MQTT
+              client = mqtt.Client()
+              client.username_pw_set('homelab', 'secure_password_123')
+              client.connect('iot-mqtt-broker', 1883, 60)
+              
+              # Simulate sensor data
+              zones = ['living_room', 'kitchen', 'bedrooms', 'garage', 'outdoor']
+              
+              for zone in zones:
+                  # Temperature sensor
+                  temp = random.uniform(18, 28) + (5 * random.random() if zone == 'outdoor' else 0)
+                  topic = f'homelab/sensors/{zone}/temperature/sensor_01/data'
+                  data = {'value': round(temp, 1), 'timestamp': datetime.now().isoformat()}
+                  client.publish(topic, json.dumps(data))
+                  
+                  # Humidity sensor
+                  humidity = random.uniform(30, 70)
+                  topic = f'homelab/sensors/{zone}/humidity/sensor_01/data'
+                  data = {'value': round(humidity, 1), 'timestamp': datetime.now().isoformat()}
+                  client.publish(topic, json.dumps(data))
+                  
+                  # Motion sensor (random motion events)
+                  if random.random() < 0.1:  # 10% chance of motion
+                      topic = f'homelab/sensors/{zone}/motion/sensor_01/data'
+                      data = {'value': True, 'timestamp': datetime.now().isoformat()}
+                      client.publish(topic, json.dumps(data))
+                  
+                  time.sleep(0.1)
+              
+              client.disconnect()
+              print('Simulated sensor data sent')
+              "
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "64Mi"
+              limits:
+                cpu: "100m"
+                memory: "128Mi"
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: iot-data-processor
+  namespace: iot-sensors
+spec:
+  selector:
+    app: iot-data-processor
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: api
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iot-dashboard
+  namespace: iot-sensors
+spec:
+  selector:
+    app: iot-dashboard
+  ports:
+  - port: 80
+    targetPort: 80
+    name: web
+
+---
+# Ingress for IoT dashboard
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: iot-dashboard-ingress
+  namespace: iot-sensors
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    cert-manager.io/cluster-issuer: homelab-ca-issuer
+spec:
+  tls:
+  - hosts:
+    - iot.homelab.local
+    secretName: iot-dashboard-tls
+  rules:
+  - host: iot.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: iot-dashboard
+            port:
+              number: 80
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: iot-data-processor
+            port:
+              number: 8080

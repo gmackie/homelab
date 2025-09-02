@@ -1,0 +1,1033 @@
+# Tekton Pipelines CI/CD for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tekton-pipelines
+  labels:
+    name: tekton-pipelines
+
+---
+# Tekton configuration for multi-arch builds
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tekton-config
+  namespace: tekton-pipelines
+data:
+  pipeline-config.yaml: |
+    # Multi-architecture pipeline configuration
+    architectures:
+      - amd64
+      - arm64
+      - arm
+    
+    build_strategies:
+      multi_arch:
+        enabled: true
+        platforms: "linux/amd64,linux/arm64,linux/arm/v7"
+        builder_image: "docker.io/docker/buildx-bin:latest"
+        
+      per_arch:
+        enabled: true
+        separate_builds: true
+        optimization_level: "size"  # Optimize for smaller images
+        
+    registry:
+      url: "registry.homelab.local"
+      namespace: "homelab"
+      auth_secret: "registry-auth"
+      
+    quality_gates:
+      security_scan: true
+      vulnerability_threshold: "HIGH"
+      code_coverage_threshold: 80
+      performance_test: true
+      
+    deployment_strategies:
+      canary:
+        enabled: true
+        traffic_split: [10, 50, 100]
+        success_rate_threshold: 99
+        
+      blue_green:
+        enabled: true
+        auto_promote: false
+        
+    notifications:
+      slack:
+        webhook_url: ""
+        channels: ["#deployments", "#alerts"]
+      email:
+        smtp_server: ""
+        recipients: ["admin@homelab.local"]
+
+---
+# Multi-architecture build task
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: buildah-multiarch
+  namespace: tekton-pipelines
+spec:
+  description: Build multi-architecture container images
+  params:
+  - name: IMAGE
+    description: Reference of the image buildah will produce
+  - name: BUILDER_IMAGE
+    description: The location of the buildah builder image
+    default: quay.io/buildah/stable:v1.23.1
+  - name: STORAGE_DRIVER
+    description: Set buildah storage driver
+    default: vfs
+  - name: DOCKERFILE
+    description: Path to the Dockerfile to build
+    default: ./Dockerfile
+  - name: CONTEXT
+    description: Path to the build context
+    default: .
+  - name: TLSVERIFY
+    description: Verify the TLS on the registry endpoint
+    default: "true"
+  - name: FORMAT
+    description: The format of the built container
+    default: "oci"
+  - name: PLATFORMS
+    description: Target platforms for multi-arch build
+    default: "linux/amd64,linux/arm64,linux/arm/v7"
+  workspaces:
+  - name: source
+  results:
+  - name: IMAGE_DIGEST
+    description: Digest of the image just built
+  - name: IMAGE_URL
+    description: URL of the image just built
+  steps:
+  - name: build
+    image: $(params.BUILDER_IMAGE)
+    workingDir: $(workspaces.source.path)
+    script: |
+      #!/bin/bash
+      set -e
+      
+      echo "Starting multi-architecture build..."
+      echo "Platforms: $(params.PLATFORMS)"
+      echo "Image: $(params.IMAGE)"
+      
+      # Create buildah manifest
+      buildah manifest create $(params.IMAGE)
+      
+      # Build for each platform
+      IFS=',' read -ra PLATFORMS <<< "$(params.PLATFORMS)"
+      for platform in "${PLATFORMS[@]}"; do
+        echo "Building for platform: $platform"
+        
+        # Extract arch from platform
+        arch=$(echo $platform | cut -d'/' -f2)
+        variant=""
+        if [[ $platform == *"/v7" ]]; then
+          arch="arm"
+          variant="v7"
+        fi
+        
+        # Build image for specific platform
+        buildah bud \
+          --format $(params.FORMAT) \
+          --storage-driver=$(params.STORAGE_DRIVER) \
+          --platform $platform \
+          --tag $(params.IMAGE)-$arch \
+          --file $(params.DOCKERFILE) \
+          $(params.CONTEXT)
+        
+        # Add to manifest
+        buildah manifest add $(params.IMAGE) $(params.IMAGE)-$arch
+      done
+      
+      # Push manifest
+      buildah manifest push --all \
+        --digestfile /tmp/image-digest \
+        $(params.IMAGE) \
+        docker://$(params.IMAGE)
+      
+      # Output results
+      cat /tmp/image-digest | tee $(results.IMAGE_DIGEST.path)
+      echo -n "$(params.IMAGE)" | tee $(results.IMAGE_URL.path)
+      
+      echo "Multi-architecture build completed successfully"
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: varlibcontainers
+      mountPath: /var/lib/containers
+  volumes:
+  - name: varlibcontainers
+    emptyDir: {}
+
+---
+# Security scanning task
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: trivy-scan
+  namespace: tekton-pipelines
+spec:
+  description: Scan container images for vulnerabilities
+  params:
+  - name: IMAGE
+    description: Reference of the image to scan
+  - name: SEVERITY
+    description: Severities of vulnerabilities to be displayed
+    default: "CRITICAL,HIGH,MEDIUM"
+  workspaces:
+  - name: source
+    optional: true
+  results:
+  - name: SCAN_RESULT
+    description: Scan result (PASS/FAIL)
+  steps:
+  - name: trivy-scan
+    image: aquasecurity/trivy:latest
+    script: |
+      #!/bin/sh
+      set -e
+      
+      echo "Scanning image: $(params.IMAGE)"
+      echo "Severity levels: $(params.SEVERITY)"
+      
+      # Scan image and save results
+      trivy image \
+        --format json \
+        --output /tmp/trivy-report.json \
+        --severity $(params.SEVERITY) \
+        --quiet \
+        $(params.IMAGE)
+      
+      # Check if vulnerabilities found
+      VULN_COUNT=$(cat /tmp/trivy-report.json | jq '.Results[]?.Vulnerabilities? | length' | awk '{sum += $1} END {print sum+0}')
+      
+      echo "Vulnerabilities found: $VULN_COUNT"
+      
+      if [ "$VULN_COUNT" -gt 0 ]; then
+        echo "Security scan FAILED - vulnerabilities found"
+        echo "FAIL" | tee $(results.SCAN_RESULT.path)
+        cat /tmp/trivy-report.json | jq '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")'
+        exit 1
+      else
+        echo "Security scan PASSED - no vulnerabilities found"
+        echo "PASS" | tee $(results.SCAN_RESULT.path)
+      fi
+
+---
+# Performance testing task
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: performance-test
+  namespace: tekton-pipelines
+spec:
+  description: Run performance tests
+  params:
+  - name: SERVICE_URL
+    description: URL of the service to test
+  - name: ARCHITECTURE
+    description: Target architecture for testing
+  - name: DURATION
+    description: Test duration
+    default: "60s"
+  - name: CONCURRENT_USERS
+    description: Number of concurrent users
+    default: "10"
+  results:
+  - name: TEST_RESULT
+    description: Performance test result (PASS/FAIL)
+  - name: RESPONSE_TIME
+    description: Average response time
+  steps:
+  - name: k6-load-test
+    image: grafana/k6:latest
+    script: |
+      #!/bin/sh
+      set -e
+      
+      echo "Running performance test on $(params.SERVICE_URL)"
+      echo "Architecture: $(params.ARCHITECTURE)"
+      echo "Duration: $(params.DURATION)"
+      echo "Concurrent users: $(params.CONCURRENT_USERS)"
+      
+      # Create k6 test script
+      cat > /tmp/loadtest.js << 'EOF'
+      import http from 'k6/http';
+      import { check, sleep } from 'k6';
+      
+      export let options = {
+        vus: __ENV.CONCURRENT_USERS,
+        duration: __ENV.DURATION,
+        thresholds: {
+          http_req_duration: ['p(95)<500'], // 95% of requests under 500ms
+          http_req_failed: ['rate<0.1'],    // Error rate under 10%
+        },
+      };
+      
+      export default function() {
+        let response = http.get(__ENV.SERVICE_URL);
+        check(response, {
+          'status is 200': (r) => r.status === 200,
+          'response time < 500ms': (r) => r.timings.duration < 500,
+        });
+        sleep(1);
+      }
+      EOF
+      
+      # Run k6 test
+      CONCURRENT_USERS=$(params.CONCURRENT_USERS) \
+      DURATION=$(params.DURATION) \
+      SERVICE_URL=$(params.SERVICE_URL) \
+      k6 run --out json=/tmp/results.json /tmp/loadtest.js
+      
+      # Parse results
+      AVG_RESPONSE=$(cat /tmp/results.json | jq -r '.metrics.http_req_duration.values.avg' | tail -1)
+      ERROR_RATE=$(cat /tmp/results.json | jq -r '.metrics.http_req_failed.values.rate' | tail -1)
+      
+      echo "Average response time: ${AVG_RESPONSE}ms"
+      echo "Error rate: ${ERROR_RATE}"
+      
+      echo -n "${AVG_RESPONSE}" | tee $(results.RESPONSE_TIME.path)
+      
+      # Determine pass/fail based on architecture-specific thresholds
+      case "$(params.ARCHITECTURE)" in
+        "amd64")
+          THRESHOLD=200  # 200ms for high-performance nodes
+          ;;
+        "arm64")
+          THRESHOLD=400  # 400ms for ARM64 nodes
+          ;;
+        "arm")
+          THRESHOLD=800  # 800ms for ARM nodes
+          ;;
+        *)
+          THRESHOLD=500  # Default threshold
+          ;;
+      esac
+      
+      if (( $(echo "$AVG_RESPONSE < $THRESHOLD" | bc -l) )) && (( $(echo "$ERROR_RATE < 0.1" | bc -l) )); then
+        echo "Performance test PASSED"
+        echo "PASS" | tee $(results.TEST_RESULT.path)
+      else
+        echo "Performance test FAILED"
+        echo "FAIL" | tee $(results.TEST_RESULT.path)
+        exit 1
+      fi
+
+---
+# Architecture-aware deployment task
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: deploy-multiarch
+  namespace: tekton-pipelines
+spec:
+  description: Deploy to specific architecture nodes
+  params:
+  - name: IMAGE
+    description: Container image to deploy
+  - name: APP_NAME
+    description: Application name
+  - name: NAMESPACE
+    description: Target namespace
+  - name: ARCHITECTURE
+    description: Target architecture
+  - name: REPLICAS
+    description: Number of replicas
+    default: "1"
+  - name: DEPLOYMENT_STRATEGY
+    description: Deployment strategy (rolling/canary/blue-green)
+    default: "rolling"
+  workspaces:
+  - name: source
+  steps:
+  - name: deploy
+    image: bitnami/kubectl:latest
+    script: |
+      #!/bin/bash
+      set -e
+      
+      echo "Deploying $(params.APP_NAME) to $(params.ARCHITECTURE) nodes"
+      echo "Image: $(params.IMAGE)"
+      echo "Strategy: $(params.DEPLOYMENT_STRATEGY)"
+      
+      # Create deployment manifest
+      cat > /tmp/deployment.yaml << EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: $(params.APP_NAME)
+        namespace: $(params.NAMESPACE)
+        labels:
+          app: $(params.APP_NAME)
+          architecture: $(params.ARCHITECTURE)
+      spec:
+        replicas: $(params.REPLICAS)
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 25%
+            maxSurge: 25%
+        selector:
+          matchLabels:
+            app: $(params.APP_NAME)
+        template:
+          metadata:
+            labels:
+              app: $(params.APP_NAME)
+              architecture: $(params.ARCHITECTURE)
+            annotations:
+              linkerd.io/inject: enabled
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "8080"
+          spec:
+            nodeSelector:
+              kubernetes.io/arch: $(params.ARCHITECTURE)
+            affinity:
+              podAntiAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    labelSelector:
+                      matchExpressions:
+                      - key: app
+                        operator: In
+                        values: [$(params.APP_NAME)]
+                    topologyKey: kubernetes.io/hostname
+            containers:
+            - name: app
+              image: $(params.IMAGE)
+              ports:
+              - containerPort: 8080
+                name: http
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                initialDelaySeconds: 30
+                periodSeconds: 10
+              readinessProbe:
+                httpGet:
+                  path: /ready
+                  port: 8080
+                initialDelaySeconds: 5
+                periodSeconds: 5
+      EOF
+      
+      # Apply deployment
+      kubectl apply -f /tmp/deployment.yaml
+      
+      # Wait for rollout
+      kubectl rollout status deployment/$(params.APP_NAME) -n $(params.NAMESPACE) --timeout=300s
+      
+      # Create service if it doesn't exist
+      kubectl get service $(params.APP_NAME) -n $(params.NAMESPACE) || \
+      kubectl expose deployment $(params.APP_NAME) \
+        --port=80 \
+        --target-port=8080 \
+        --name=$(params.APP_NAME) \
+        -n $(params.NAMESPACE)
+      
+      echo "Deployment completed successfully"
+
+---
+# Complete CI/CD Pipeline
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: multiarch-cicd
+  namespace: tekton-pipelines
+spec:
+  description: Complete CI/CD pipeline for multi-architecture applications
+  params:
+  - name: git-url
+    description: Git repository URL
+  - name: git-revision
+    description: Git revision to build
+    default: main
+  - name: image-name
+    description: Name of the container image
+  - name: app-name
+    description: Application name
+  - name: target-namespace
+    description: Target namespace for deployment
+    default: default
+  workspaces:
+  - name: shared-data
+    description: Shared workspace for pipeline tasks
+  - name: git-credentials
+    description: Git credentials
+    optional: true
+  tasks:
+  
+  # 1. Clone source code
+  - name: fetch-source
+    taskRef:
+      name: git-clone
+      kind: ClusterTask
+    workspaces:
+    - name: output
+      workspace: shared-data
+    - name: basic-auth
+      workspace: git-credentials
+    params:
+    - name: url
+      value: $(params.git-url)
+    - name: revision
+      value: $(params.git-revision)
+  
+  # 2. Run tests
+  - name: test
+    runAfter: ["fetch-source"]
+    taskRef:
+      name: golang-test
+      kind: ClusterTask
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: package
+      value: "."
+    - name: flags
+      value: "-v -cover"
+  
+  # 3. Build multi-architecture images
+  - name: build-multiarch
+    runAfter: ["test"]
+    taskRef:
+      name: buildah-multiarch
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-name):$(params.git-revision)"
+    - name: PLATFORMS
+      value: "linux/amd64,linux/arm64,linux/arm/v7"
+  
+  # 4. Security scan
+  - name: security-scan
+    runAfter: ["build-multiarch"]
+    taskRef:
+      name: trivy-scan
+    params:
+    - name: IMAGE
+      value: "$(params.image-name):$(params.git-revision)"
+  
+  # 5. Deploy to ARM64 (staging)
+  - name: deploy-arm64-staging
+    runAfter: ["security-scan"]
+    taskRef:
+      name: deploy-multiarch
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-name):$(params.git-revision)"
+    - name: APP_NAME
+      value: "$(params.app-name)-staging"
+    - name: NAMESPACE
+      value: "$(params.target-namespace)"
+    - name: ARCHITECTURE
+      value: "arm64"
+    - name: REPLICAS
+      value: "1"
+  
+  # 6. Performance test on ARM64
+  - name: perf-test-arm64
+    runAfter: ["deploy-arm64-staging"]
+    taskRef:
+      name: performance-test
+    params:
+    - name: SERVICE_URL
+      value: "http://$(params.app-name)-staging.$(params.target-namespace):80"
+    - name: ARCHITECTURE
+      value: "arm64"
+    - name: DURATION
+      value: "60s"
+    - name: CONCURRENT_USERS
+      value: "5"
+  
+  # 7. Deploy to AMD64 (production)
+  - name: deploy-amd64-production
+    runAfter: ["perf-test-arm64"]
+    when:
+    - input: "$(tasks.perf-test-arm64.results.TEST_RESULT)"
+      operator: in
+      values: ["PASS"]
+    taskRef:
+      name: deploy-multiarch
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-name):$(params.git-revision)"
+    - name: APP_NAME
+      value: "$(params.app-name)"
+    - name: NAMESPACE
+      value: "$(params.target-namespace)"
+    - name: ARCHITECTURE
+      value: "amd64"
+    - name: REPLICAS
+      value: "3"
+  
+  # 8. Deploy to ARM64 (production)
+  - name: deploy-arm64-production
+    runAfter: ["deploy-amd64-production"]
+    taskRef:
+      name: deploy-multiarch
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-name):$(params.git-revision)"
+    - name: APP_NAME
+      value: "$(params.app-name)-arm64"
+    - name: NAMESPACE
+      value: "$(params.target-namespace)"
+    - name: ARCHITECTURE
+      value: "arm64"
+    - name: REPLICAS
+      value: "2"
+  
+  # 9. Final performance validation
+  - name: final-validation
+    runAfter: ["deploy-arm64-production"]
+    taskRef:
+      name: performance-test
+    params:
+    - name: SERVICE_URL
+      value: "http://$(params.app-name).$(params.target-namespace):80"
+    - name: ARCHITECTURE
+      value: "amd64"
+    - name: DURATION
+      value: "120s"
+    - name: CONCURRENT_USERS
+      value: "10"
+
+---
+# Tekton Dashboard enhanced for multi-arch
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tekton-dashboard
+  namespace: tekton-pipelines
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tekton-dashboard
+  template:
+    metadata:
+      labels:
+        app: tekton-dashboard
+    spec:
+      # Run on ARM64 for power efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      serviceAccountName: tekton-dashboard
+      containers:
+      - name: tekton-dashboard
+        image: gcr.io/tekton-releases/github.com/tektoncd/dashboard/cmd/dashboard:latest
+        ports:
+        - containerPort: 9097
+        env:
+        - name: PORT
+          value: "9097"
+        - name: READ_ONLY
+          value: "false"
+        - name: LOGOUT_URL
+          value: ""
+        - name: PIPELINES_NAMESPACE
+          value: "tekton-pipelines"
+        - name: TRIGGERS_NAMESPACE
+          value: "tekton-pipelines"
+        - name: INSTALLED_NAMESPACE
+          value: "tekton-pipelines"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9097
+        readinessProbe:
+          httpGet:
+            path: /readiness
+            port: 9097
+
+---
+# Pipeline triggers for GitOps
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: multiarch-build-trigger
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: git-repo-url
+    description: The git repository url
+  - name: git-revision
+    description: The git revision
+    default: main
+  - name: git-repo-name
+    description: The name of the deployment to be created / patched
+  resourcetemplates:
+  - apiVersion: tekton.dev/v1beta1
+    kind: PipelineRun
+    metadata:
+      generateName: multiarch-pipeline-run-
+    spec:
+      pipelineRef:
+        name: multiarch-cicd
+      workspaces:
+      - name: shared-data
+        volumeClaimTemplate:
+          spec:
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+      params:
+      - name: git-url
+        value: $(tt.params.git-repo-url)
+      - name: git-revision
+        value: $(tt.params.git-revision)
+      - name: image-name
+        value: "registry.homelab.local/$(tt.params.git-repo-name)"
+      - name: app-name
+        value: $(tt.params.git-repo-name)
+
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: multiarch-build-binding
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: git-repo-url
+    value: $(body.repository.clone_url)
+  - name: git-revision
+    value: $(body.head_commit.id)
+  - name: git-repo-name
+    value: $(body.repository.name)
+
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: multiarch-build-listener
+  namespace: tekton-pipelines
+spec:
+  serviceAccountName: tekton-triggers
+  triggers:
+  - name: github-push
+    bindings:
+    - ref: multiarch-build-binding
+    template:
+      ref: multiarch-build-trigger
+
+---
+# Container registry for homelab
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docker-registry
+  namespace: tekton-pipelines
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: docker-registry
+  template:
+    metadata:
+      labels:
+        app: docker-registry
+    spec:
+      # Prefer AMD64 for storage performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: registry
+        image: registry:2
+        ports:
+        - containerPort: 5000
+        env:
+        - name: REGISTRY_HTTP_ADDR
+          value: "0.0.0.0:5000"
+        - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+          value: "/var/lib/registry"
+        - name: REGISTRY_HTTP_TLS_CERTIFICATE
+          value: "/certs/tls.crt"
+        - name: REGISTRY_HTTP_TLS_KEY
+          value: "/certs/tls.key"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        volumeMounts:
+        - name: registry-storage
+          mountPath: /var/lib/registry
+        - name: registry-certs
+          mountPath: /certs
+      volumes:
+      - name: registry-storage
+        persistentVolumeClaim:
+          claimName: registry-storage
+      - name: registry-certs
+        secret:
+          secretName: registry-tls
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-storage
+  namespace: tekton-pipelines
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: longhorn-ssd
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: tekton-dashboard
+  namespace: tekton-pipelines
+spec:
+  selector:
+    app: tekton-dashboard
+  ports:
+  - port: 9097
+    targetPort: 9097
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: docker-registry
+  namespace: tekton-pipelines
+spec:
+  selector:
+    app: docker-registry
+  ports:
+  - port: 5000
+    targetPort: 5000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: el-multiarch-build-listener
+  namespace: tekton-pipelines
+spec:
+  selector:
+    eventlistener: multiarch-build-listener
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tekton-dashboard-ingress
+  namespace: tekton-pipelines
+  annotations:
+    cert-manager.io/cluster-issuer: homelab-ca-issuer
+spec:
+  tls:
+  - hosts:
+    - cicd.homelab.local
+    secretName: tekton-dashboard-tls
+  rules:
+  - host: cicd.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: tekton-dashboard
+            port:
+              number: 9097
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: docker-registry-ingress
+  namespace: tekton-pipelines
+  annotations:
+    cert-manager.io/cluster-issuer: homelab-ca-issuer
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  tls:
+  - hosts:
+    - registry.homelab.local
+    secretName: registry-tls
+  rules:
+  - host: registry.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: docker-registry
+            port:
+              number: 5000
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tekton-dashboard
+  namespace: tekton-pipelines
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tekton-triggers
+  namespace: tekton-pipelines
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tekton-dashboard
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+- apiGroups: ["tekton.dev"]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["triggers.tekton.dev"]
+  resources: ["*"]
+  verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tekton-dashboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tekton-dashboard
+subjects:
+- kind: ServiceAccount
+  name: tekton-dashboard
+  namespace: tekton-pipelines
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tekton-triggers
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tekton-dashboard
+subjects:
+- kind: ServiceAccount
+  name: tekton-triggers
+  namespace: tekton-pipelines
+
+---
+# Pipeline monitoring
+apiVersion: v1
+kind: ServiceMonitor
+metadata:
+  name: tekton-pipelines
+  namespace: tekton-pipelines
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: tekton-pipelines
+  endpoints:
+  - port: http-metrics
+    interval: 30s
+    path: /metrics
+
+---
+# Example application deployment via pipeline
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  generateName: example-multiarch-run-
+  namespace: tekton-pipelines
+spec:
+  pipelineRef:
+    name: multiarch-cicd
+  workspaces:
+  - name: shared-data
+    volumeClaimTemplate:
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+  params:
+  - name: git-url
+    value: "https://github.com/tektoncd/pipeline"
+  - name: git-revision
+    value: "main"
+  - name: image-name
+    value: "registry.homelab.local/example-app"
+  - name: app-name
+    value: "example-app"
+  - name: target-namespace
+    value: "default"

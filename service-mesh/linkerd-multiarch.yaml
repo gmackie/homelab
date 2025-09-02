@@ -1,0 +1,758 @@
+# Linkerd Service Mesh for Multi-Architecture Homelab
+# Linkerd is lighter weight than Istio, perfect for homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: linkerd
+  labels:
+    linkerd.io/control-plane-ns: linkerd
+    config.linkerd.io/admission-webhooks: disabled
+
+---
+# Linkerd installation script (multi-arch aware)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: linkerd-install-script
+  namespace: linkerd
+data:
+  install-linkerd.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Installing Linkerd for multi-architecture cluster..."
+    
+    # Detect system architecture
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64) LINKERD_ARCH="amd64" ;;
+        aarch64) LINKERD_ARCH="arm64" ;;
+        armv7l) LINKERD_ARCH="arm" ;;
+        *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+    esac
+    
+    # Download Linkerd CLI
+    LINKERD_VERSION="stable-2.14.1"
+    curl -sL https://github.com/linkerd/linkerd2/releases/download/${LINKERD_VERSION}/linkerd2-cli-${LINKERD_VERSION}-linux-${LINKERD_ARCH} \
+      -o /tmp/linkerd
+    chmod +x /tmp/linkerd
+    
+    # Check cluster
+    /tmp/linkerd check --pre
+    
+    # Generate multi-arch compatible manifest
+    /tmp/linkerd install \
+      --set proxyInit.runAsRoot=true \
+      --set controllerReplicas=1 \
+      --set proxy.resources.cpu.request=50m \
+      --set proxy.resources.memory.request=50Mi \
+      --set proxy.resources.cpu.limit=200m \
+      --set proxy.resources.memory.limit=128Mi \
+      > /tmp/linkerd-manifest.yaml
+    
+    # Apply manifest
+    kubectl apply -f /tmp/linkerd-manifest.yaml
+    
+    # Wait for control plane to be ready
+    /tmp/linkerd check
+    
+    echo "Linkerd installation complete!"
+
+---
+# Custom configuration for multi-arch proxies
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: linkerd-proxy-config
+  namespace: linkerd
+data:
+  proxy-config.yaml: |
+    # Proxy configuration optimized for different architectures
+    architectures:
+      amd64:
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "64Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        concurrency: 100
+        buffer_size: "8192"
+      arm64:
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "32Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+        concurrency: 50
+        buffer_size: "4096"
+      arm:
+        resources:
+          requests:
+            cpu: "25m"
+            memory: "16Mi"
+          limits:
+            cpu: "100m"
+            memory: "64Mi"
+        concurrency: 20
+        buffer_size: "2048"
+    
+    # Traffic policies
+    traffic_policies:
+      retry:
+        max_attempts: 3
+        timeout: "10s"
+      circuit_breaker:
+        consecutive_failures: 5
+        failure_percentage: 50
+        window_size: "30s"
+      load_balancing:
+        algorithm: "least_request"
+        
+    # Observability settings
+    observability:
+      prometheus:
+        enabled: true
+        scrape_interval: "30s"
+      tracing:
+        enabled: true
+        sample_rate: 0.1
+
+---
+# Linkerd control plane with architecture awareness
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linkerd-destination
+  namespace: linkerd
+  labels:
+    linkerd.io/control-plane-component: destination
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      linkerd.io/control-plane-component: destination
+  template:
+    metadata:
+      labels:
+        linkerd.io/control-plane-component: destination
+      annotations:
+        linkerd.io/inject: disabled
+    spec:
+      # Prefer AMD64 for control plane
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      serviceAccountName: linkerd-destination
+      containers:
+      - name: destination
+        image: cr.linkerd.io/linkerd/controller:stable-2.14.1
+        args:
+        - destination
+        - -addr=:8086
+        - -controller-namespace=linkerd
+        - -enable-h2-upgrade=true
+        - -log-level=info
+        ports:
+        - containerPort: 8086
+          name: grpc
+        - containerPort: 9996
+          name: admin
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "50Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: 9996
+          initialDelaySeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9996
+
+---
+# Traffic split for multi-arch deployments
+apiVersion: split.smi-spec.io/v1alpha1
+kind: TrafficSplit
+metadata:
+  name: multi-arch-split
+  namespace: default
+spec:
+  service: webapp
+  backends:
+  - service: webapp-amd64
+    weight: 100  # Start with AMD64
+  - service: webapp-arm64
+    weight: 0    # Gradually shift to ARM64
+
+---
+# Service mesh interface for traffic management
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mesh-traffic-policies
+  namespace: linkerd
+data:
+  canary-rollout.yaml: |
+    # Canary deployment strategy for multi-arch migrations
+    apiVersion: flagger.app/v1beta1
+    kind: Canary
+    metadata:
+      name: webapp
+      namespace: default
+    spec:
+      targetRef:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: webapp
+      service:
+        port: 80
+        targetPort: 8080
+      analysis:
+        interval: 30s
+        threshold: 10
+        maxWeight: 100
+        stepWeight: 10
+        metrics:
+        - name: request-success-rate
+          thresholdRange:
+            min: 99
+          interval: 1m
+        - name: request-duration
+          thresholdRange:
+            max: 500
+          interval: 1m
+      # Architecture-aware canary
+      canaryAnalysis:
+        architecturePreference:
+          - arm64  # Prefer ARM64 for power efficiency
+          - amd64  # Fallback to AMD64
+
+---
+# mTLS configuration for service mesh
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: linkerd-mtls-config
+  namespace: linkerd
+data:
+  issuer.crt: |
+    -----BEGIN CERTIFICATE-----
+    # Root CA certificate for mTLS
+    -----END CERTIFICATE-----
+  issuer.key: |
+    -----BEGIN RSA PRIVATE KEY-----
+    # Root CA private key
+    -----END RSA PRIVATE KEY-----
+
+---
+# Service profiles for optimized communication
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: webapp-profile
+  namespace: default
+spec:
+  routes:
+  - name: GET-api
+    condition:
+      method: GET
+      pathRegex: "/api/.*"
+    timeout: 30s
+    retryBudget:
+      retryRatio: 0.2
+      minRetriesPerSecond: 10
+      ttl: 10s
+  - name: POST-api
+    condition:
+      method: POST
+      pathRegex: "/api/.*"
+    timeout: 60s
+  retryBudget:
+    retryRatio: 0.2
+    minRetriesPerSecond: 10
+    ttl: 10s
+
+---
+# Linkerd proxy injector with architecture detection
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linkerd-proxy-injector
+  namespace: linkerd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: proxy-injector
+  template:
+    metadata:
+      labels:
+        app: proxy-injector
+    spec:
+      serviceAccountName: linkerd-proxy-injector
+      containers:
+      - name: injector
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes pyyaml
+          python3 /app/proxy_injector.py
+        volumeMounts:
+        - name: injector-app
+          mountPath: /app
+        - name: proxy-config
+          mountPath: /config
+        env:
+        - name: LINKERD_NAMESPACE
+          value: "linkerd"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+      volumes:
+      - name: injector-app
+        configMap:
+          name: proxy-injector-app
+      - name: proxy-config
+        configMap:
+          name: linkerd-proxy-config
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proxy-injector-app
+  namespace: linkerd
+data:
+  proxy_injector.py: |
+    #!/usr/bin/env python3
+    import json
+    import logging
+    import yaml
+    from kubernetes import client, config, watch
+    from typing import Dict, Optional
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class ProxyInjector:
+        def __init__(self):
+            try:
+                config.load_incluster_config()
+            except:
+                config.load_kube_config()
+            
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            
+            # Load proxy configuration
+            with open('/config/proxy-config.yaml', 'r') as f:
+                self.proxy_config = yaml.safe_load(f)
+        
+        def get_architecture_config(self, node_name: str) -> Dict:
+            """Get proxy configuration based on node architecture"""
+            try:
+                node = self.v1.read_node(node_name)
+                arch = node.metadata.labels.get('kubernetes.io/arch', 'amd64')
+                return self.proxy_config['architectures'].get(arch, self.proxy_config['architectures']['amd64'])
+            except:
+                return self.proxy_config['architectures']['amd64']
+        
+        def inject_proxy_annotation(self, deployment_name: str, namespace: str):
+            """Add Linkerd injection annotation to deployment"""
+            try:
+                deployment = self.apps_v1.read_namespaced_deployment(
+                    name=deployment_name,
+                    namespace=namespace
+                )
+                
+                # Check if already injected
+                annotations = deployment.metadata.annotations or {}
+                if annotations.get('linkerd.io/inject') == 'enabled':
+                    return
+                
+                # Add injection annotation
+                annotations['linkerd.io/inject'] = 'enabled'
+                
+                # Add architecture-specific proxy configuration
+                if deployment.spec.template.spec.node_selector:
+                    arch = deployment.spec.template.spec.node_selector.get('kubernetes.io/arch', 'amd64')
+                    arch_config = self.proxy_config['architectures'].get(arch)
+                    
+                    if arch_config:
+                        annotations['config.linkerd.io/proxy-cpu-request'] = arch_config['resources']['requests']['cpu']
+                        annotations['config.linkerd.io/proxy-memory-request'] = arch_config['resources']['requests']['memory']
+                        annotations['config.linkerd.io/proxy-cpu-limit'] = arch_config['resources']['limits']['cpu']
+                        annotations['config.linkerd.io/proxy-memory-limit'] = arch_config['resources']['limits']['memory']
+                
+                # Update deployment
+                deployment.metadata.annotations = annotations
+                self.apps_v1.patch_namespaced_deployment(
+                    name=deployment_name,
+                    namespace=namespace,
+                    body=deployment
+                )
+                
+                logger.info(f"Injected proxy configuration for {namespace}/{deployment_name}")
+                
+            except Exception as e:
+                logger.error(f"Failed to inject proxy for {namespace}/{deployment_name}: {e}")
+        
+        def watch_deployments(self):
+            """Watch for new deployments and inject proxy"""
+            w = watch.Watch()
+            
+            for event in w.stream(self.apps_v1.list_deployment_for_all_namespaces):
+                if event['type'] == 'ADDED':
+                    deployment = event['object']
+                    
+                    # Skip system namespaces
+                    if deployment.metadata.namespace in ['kube-system', 'linkerd', 'cert-manager']:
+                        continue
+                    
+                    # Check if opt-in annotation exists
+                    labels = deployment.metadata.labels or {}
+                    if labels.get('linkerd.io/auto-inject') == 'true':
+                        self.inject_proxy_annotation(
+                            deployment.metadata.name,
+                            deployment.metadata.namespace
+                        )
+        
+        def run(self):
+            """Main run loop"""
+            logger.info("Starting Linkerd proxy injector...")
+            
+            while True:
+                try:
+                    self.watch_deployments()
+                except Exception as e:
+                    logger.error(f"Watch error: {e}")
+                    time.sleep(10)
+    
+    if __name__ == "__main__":
+        injector = ProxyInjector()
+        injector.run()
+
+---
+# Traffic management policies
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traffic-policies
+  namespace: linkerd
+data:
+  policies.yaml: |
+    # Traffic management policies for multi-arch service mesh
+    policies:
+      # Retry policy for resilience
+      retry_policy:
+        http_methods: ["GET", "HEAD", "OPTIONS"]
+        status_codes: [502, 503, 504]
+        max_retries: 3
+        backoff:
+          base_interval: "25ms"
+          max_interval: "250ms"
+          
+      # Circuit breaker for fault tolerance
+      circuit_breaker:
+        failure_threshold: 5
+        success_threshold: 2
+        timeout: "30s"
+        half_open_max_requests: 3
+        
+      # Load balancing with architecture awareness
+      load_balancing:
+        strategy: "power_aware"
+        preferences:
+          - architecture: "arm64"
+            weight: 70  # Prefer ARM64 for power efficiency
+          - architecture: "arm"
+            weight: 20  # Use ARM for lightweight tasks
+          - architecture: "amd64"
+            weight: 10  # Use AMD64 only when needed
+            
+      # Rate limiting per architecture
+      rate_limiting:
+        amd64:
+          requests_per_second: 1000
+          burst: 2000
+        arm64:
+          requests_per_second: 500
+          burst: 1000
+        arm:
+          requests_per_second: 100
+          burst: 200
+
+---
+# Observability stack integration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: linkerd-observability
+  namespace: linkerd
+data:
+  prometheus-config.yaml: |
+    # Prometheus scrape configuration for Linkerd metrics
+    scrape_configs:
+    - job_name: 'linkerd-controller'
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ['linkerd']
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        action: keep
+        regex: admin-http
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        action: replace
+        target_label: component
+        
+    - job_name: 'linkerd-proxy'
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        action: keep
+        regex: linkerd-proxy
+      - source_labels: [__address__, __meta_kubernetes_pod_container_port_number]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        action: replace
+        target_label: node
+        
+  grafana-dashboard.json: |
+    {
+      "dashboard": {
+        "title": "Linkerd Multi-Arch Service Mesh",
+        "panels": [
+          {
+            "title": "Request Rate by Architecture",
+            "targets": [
+              {
+                "expr": "sum(rate(request_total[5m])) by (arch)"
+              }
+            ]
+          },
+          {
+            "title": "P99 Latency by Architecture",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.99, sum(rate(response_latency_ms_bucket[5m])) by (arch, le))"
+              }
+            ]
+          },
+          {
+            "title": "Success Rate by Service",
+            "targets": [
+              {
+                "expr": "sum(rate(response_total{classification=\"success\"}[5m])) by (service) / sum(rate(response_total[5m])) by (service)"
+              }
+            ]
+          },
+          {
+            "title": "Power Efficiency Score",
+            "targets": [
+              {
+                "expr": "(sum(rate(request_total[5m])) by (arch) / sum(node_power_consumption) by (arch))"
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+---
+# Service mesh gateway for external traffic
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: linkerd-gateway
+  namespace: linkerd
+  annotations:
+    nginx.ingress.kubernetes.io/upstream-vhost: $service_name.$namespace.svc.cluster.local:$service_port
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      grpc_set_header l5d-dst-override $service_name.$namespace.svc.cluster.local:$service_port;
+    nginx.ingress.kubernetes.io/server-snippet: |
+      grpc_read_timeout 300;
+      grpc_send_timeout 300;
+      client_body_timeout 60;
+      client_header_timeout 60;
+      client_max_body_size 1m;
+spec:
+  rules:
+  - host: mesh.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: linkerd-web
+            port:
+              number: 8084
+
+---
+# RBAC for Linkerd components
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: linkerd-destination
+  namespace: linkerd
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: linkerd-proxy-injector
+  namespace: linkerd
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: linkerd-destination
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "endpoints", "services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: linkerd-proxy-injector
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: linkerd-destination
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: linkerd-destination
+subjects:
+- kind: ServiceAccount
+  name: linkerd-destination
+  namespace: linkerd
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: linkerd-proxy-injector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: linkerd-proxy-injector
+subjects:
+- kind: ServiceAccount
+  name: linkerd-proxy-injector
+  namespace: linkerd
+
+---
+# Example application with service mesh
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp-meshed
+  namespace: default
+  labels:
+    app: webapp
+    linkerd.io/auto-inject: "true"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+      annotations:
+        linkerd.io/inject: enabled
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: [webapp]
+              topologyKey: kubernetes.io/arch  # Spread across architectures
+      containers:
+      - name: webapp
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+
+---
+# Service for meshed application
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp
+  namespace: default
+spec:
+  selector:
+    app: webapp
+  ports:
+  - port: 80
+    targetPort: 80
+    name: http

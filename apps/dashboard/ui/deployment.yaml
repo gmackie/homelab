@@ -1,0 +1,481 @@
+# Dashboard UI Deployment for Multi-Architecture Homelab
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard-ui
+  namespace: default
+  labels:
+    app: dashboard-ui
+    tier: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dashboard-ui
+  template:
+    metadata:
+      labels:
+        app: dashboard-ui
+        tier: frontend
+      annotations:
+        linkerd.io/inject: enabled
+    spec:
+      # Prefer ARM64 for UI (power efficient)
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: dashboard-ui
+        image: node:18-alpine
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          npm install -g http-server
+          cd /tmp
+          
+          # Create package.json
+          cat > package.json << 'EOF'
+          {
+            "name": "homelab-dashboard",
+            "version": "1.0.0",
+            "description": "Multi-Architecture Homelab Dashboard",
+            "scripts": {
+              "dev": "http-server . -p 3000 -c-1",
+              "start": "http-server . -p 3000"
+            }
+          }
+          EOF
+          
+          # Create index.html
+          cat > index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Homelab Multi-Architecture Dashboard</title>
+              <style>
+                  * { margin: 0; padding: 0; box-sizing: border-box; }
+                  
+                  body {
+                      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                      color: white;
+                      min-height: 100vh;
+                      overflow-x: hidden;
+                  }
+                  
+                  .container {
+                      max-width: 1200px;
+                      margin: 0 auto;
+                      padding: 20px;
+                  }
+                  
+                  .header {
+                      text-align: center;
+                      margin-bottom: 40px;
+                      animation: fadeInDown 1s ease-out;
+                  }
+                  
+                  .header h1 {
+                      font-size: 3rem;
+                      margin-bottom: 10px;
+                      text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+                  }
+                  
+                  .header p {
+                      font-size: 1.2rem;
+                      opacity: 0.9;
+                  }
+                  
+                  .stats-grid {
+                      display: grid;
+                      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                      gap: 20px;
+                      margin-bottom: 40px;
+                  }
+                  
+                  .stat-card {
+                      background: rgba(255, 255, 255, 0.1);
+                      backdrop-filter: blur(10px);
+                      border-radius: 15px;
+                      padding: 25px;
+                      border: 1px solid rgba(255, 255, 255, 0.2);
+                      animation: slideInUp 0.8s ease-out;
+                      transition: transform 0.3s ease;
+                  }
+                  
+                  .stat-card:hover {
+                      transform: translateY(-5px);
+                  }
+                  
+                  .stat-card h3 {
+                      font-size: 1.5rem;
+                      margin-bottom: 15px;
+                      color: #fff;
+                  }
+                  
+                  .stat-value {
+                      font-size: 2.5rem;
+                      font-weight: bold;
+                      margin-bottom: 10px;
+                      color: #00ff88;
+                      text-shadow: 0 0 10px rgba(0, 255, 136, 0.3);
+                  }
+                  
+                  .stat-label {
+                      font-size: 1rem;
+                      opacity: 0.8;
+                  }
+                  
+                  .architecture-badge {
+                      display: inline-block;
+                      padding: 5px 15px;
+                      border-radius: 20px;
+                      font-size: 0.9rem;
+                      font-weight: bold;
+                      margin: 5px;
+                      animation: pulse 2s infinite;
+                  }
+                  
+                  .arch-amd64 { background: #ff6b6b; }
+                  .arch-arm64 { background: #4ecdc4; }
+                  .arch-arm { background: #45b7d1; }
+                  
+                  .services-grid {
+                      display: grid;
+                      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                      gap: 15px;
+                      margin-top: 30px;
+                  }
+                  
+                  .service-item {
+                      background: rgba(255, 255, 255, 0.08);
+                      border-radius: 10px;
+                      padding: 20px;
+                      text-align: center;
+                      border: 1px solid rgba(255, 255, 255, 0.1);
+                      transition: all 0.3s ease;
+                  }
+                  
+                  .service-item:hover {
+                      background: rgba(255, 255, 255, 0.15);
+                      transform: scale(1.05);
+                  }
+                  
+                  .service-status {
+                      width: 12px;
+                      height: 12px;
+                      border-radius: 50%;
+                      display: inline-block;
+                      margin-right: 8px;
+                      animation: blink 2s infinite;
+                  }
+                  
+                  .status-healthy { background: #00ff88; }
+                  .status-warning { background: #ffaa00; }
+                  .status-error { background: #ff4444; }
+                  
+                  @keyframes fadeInDown {
+                      from { opacity: 0; transform: translateY(-30px); }
+                      to { opacity: 1; transform: translateY(0); }
+                  }
+                  
+                  @keyframes slideInUp {
+                      from { opacity: 0; transform: translateY(30px); }
+                      to { opacity: 1; transform: translateY(0); }
+                  }
+                  
+                  @keyframes pulse {
+                      0%, 100% { transform: scale(1); }
+                      50% { transform: scale(1.05); }
+                  }
+                  
+                  @keyframes blink {
+                      0%, 100% { opacity: 1; }
+                      50% { opacity: 0.3; }
+                  }
+                  
+                  .loading {
+                      text-align: center;
+                      margin: 40px 0;
+                      font-size: 1.2rem;
+                  }
+                  
+                  .error {
+                      background: rgba(255, 68, 68, 0.2);
+                      border: 1px solid #ff4444;
+                      border-radius: 10px;
+                      padding: 20px;
+                      margin: 20px 0;
+                      text-align: center;
+                  }
+                  
+                  @media (max-width: 768px) {
+                      .header h1 { font-size: 2rem; }
+                      .stat-value { font-size: 2rem; }
+                      .container { padding: 10px; }
+                  }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header">
+                      <h1>🏠 Homelab Dashboard</h1>
+                      <p>Multi-Architecture Kubernetes Cluster</p>
+                  </div>
+                  
+                  <div id="loading" class="loading">
+                      <div>Loading system information...</div>
+                  </div>
+                  
+                  <div id="error" class="error" style="display: none;">
+                      <div>❌ Failed to connect to API</div>
+                  </div>
+                  
+                  <div id="dashboard-content" style="display: none;">
+                      <div class="stats-grid">
+                          <div class="stat-card">
+                              <h3>🏗️ Architecture</h3>
+                              <div id="architecture-info">
+                                  <div id="current-arch" class="stat-value">-</div>
+                                  <div class="stat-label">Current Node</div>
+                              </div>
+                          </div>
+                          
+                          <div class="stat-card">
+                              <h3>⚡ System Status</h3>
+                              <div id="system-status" class="stat-value">-</div>
+                              <div class="stat-label">API Health</div>
+                          </div>
+                          
+                          <div class="stat-card">
+                              <h3>🕐 Uptime</h3>
+                              <div id="uptime" class="stat-value">-</div>
+                              <div class="stat-label">System Runtime</div>
+                          </div>
+                          
+                          <div class="stat-card">
+                              <h3>🔗 Services</h3>
+                              <div id="services-count" class="stat-value">-</div>
+                              <div class="stat-label">Connected Services</div>
+                          </div>
+                      </div>
+                      
+                      <div class="services-grid" id="services-grid">
+                          <!-- Services will be populated by JavaScript -->
+                      </div>
+                  </div>
+              </div>
+              
+              <script>
+                  const API_BASE = '/api';
+                  
+                  async function fetchHealthData() {
+                      try {
+                          const response = await fetch('http://dashboard-api:8080/health');
+                          return await response.json();
+                      } catch (error) {
+                          console.error('Failed to fetch health data:', error);
+                          return null;
+                      }
+                  }
+                  
+                  async function fetchMetricsData() {
+                      try {
+                          const response = await fetch('http://dashboard-api:8080/metrics');
+                          return await response.json();
+                      } catch (error) {
+                          console.error('Failed to fetch metrics data:', error);
+                          return null;
+                      }
+                  }
+                  
+                  function getArchitectureBadge(arch) {
+                      const badges = {
+                          'amd64': '<span class="architecture-badge arch-amd64">AMD64</span>',
+                          'arm64': '<span class="architecture-badge arch-arm64">ARM64</span>',
+                          'arm': '<span class="architecture-badge arch-arm">ARM</span>'
+                      };
+                      return badges[arch] || '<span class="architecture-badge">Unknown</span>';
+                  }
+                  
+                  function getServiceStatus(serviceName) {
+                      // Simulate service status (in real implementation, this would check actual services)
+                      const services = ['nats', 'minio', 'prometheus', 'elasticsearch'];
+                      return services.includes(serviceName) ? 'healthy' : 'warning';
+                  }
+                  
+                  function updateDashboard(healthData, metricsData) {
+                      document.getElementById('loading').style.display = 'none';
+                      document.getElementById('error').style.display = 'none';
+                      document.getElementById('dashboard-content').style.display = 'block';
+                      
+                      // Update architecture info
+                      const arch = healthData.architecture || 'unknown';
+                      document.getElementById('current-arch').innerHTML = getArchitectureBadge(arch);
+                      
+                      // Update system status
+                      document.getElementById('system-status').textContent = healthData.status || 'Unknown';
+                      
+                      // Update uptime
+                      document.getElementById('uptime').textContent = healthData.uptime || 'Unknown';
+                      
+                      // Update services count
+                      const servicesCount = Object.keys(healthData.services || {}).length;
+                      document.getElementById('services-count').textContent = servicesCount;
+                      
+                      // Update services grid
+                      const servicesGrid = document.getElementById('services-grid');
+                      servicesGrid.innerHTML = '';
+                      
+                      if (healthData.services) {
+                          Object.entries(healthData.services).forEach(([serviceName, serviceUrl]) => {
+                              const status = getServiceStatus(serviceName);
+                              const serviceItem = document.createElement('div');
+                              serviceItem.className = 'service-item';
+                              serviceItem.innerHTML = `
+                                  <div>
+                                      <span class="service-status status-${status}"></span>
+                                      <strong>${serviceName}</strong>
+                                  </div>
+                                  <div style="font-size: 0.8rem; margin-top: 10px; opacity: 0.7;">
+                                      ${serviceUrl}
+                                  </div>
+                              `;
+                              servicesGrid.appendChild(serviceItem);
+                          });
+                      }
+                  }
+                  
+                  function showError() {
+                      document.getElementById('loading').style.display = 'none';
+                      document.getElementById('error').style.display = 'block';
+                      document.getElementById('dashboard-content').style.display = 'none';
+                  }
+                  
+                  async function loadDashboard() {
+                      const healthData = await fetchHealthData();
+                      const metricsData = await fetchMetricsData();
+                      
+                      if (healthData) {
+                          updateDashboard(healthData, metricsData);
+                      } else {
+                          showError();
+                      }
+                  }
+                  
+                  // Load dashboard data
+                  loadDashboard();
+                  
+                  // Refresh every 30 seconds
+                  setInterval(loadDashboard, 30000);
+                  
+                  // Add some demo data if API is not available
+                  setTimeout(() => {
+                      if (document.getElementById('loading').style.display !== 'none') {
+                          // Show demo data
+                          const demoHealthData = {
+                              status: 'healthy',
+                              architecture: 'arm64',
+                              uptime: '2h 45m',
+                              services: {
+                                  'nats': 'http://nats.event-driven:8222',
+                                  'minio': 'http://minio.ml-serving:9000',
+                                  'prometheus': 'http://prometheus.flagger-system:9090',
+                                  'elasticsearch': 'http://elasticsearch.logging:9200'
+                              }
+                          };
+                          updateDashboard(demoHealthData, {});
+                      }
+                  }, 3000);
+              </script>
+          </body>
+          </html>
+          EOF
+          
+          npm start
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: API_URL
+          value: "http://dashboard-api:8080"
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard-ui
+  namespace: default
+  labels:
+    app: dashboard-ui
+spec:
+  selector:
+    app: dashboard-ui
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
+  type: ClusterIP
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dashboard-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: dashboard.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: dashboard-ui
+            port:
+              number: 3000
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: dashboard-api
+            port:
+              number: 8080

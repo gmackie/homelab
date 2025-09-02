@@ -1,0 +1,1236 @@
+# Disaster Recovery Automation for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: disaster-recovery
+  labels:
+    name: disaster-recovery
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: disaster-recovery-config
+  namespace: disaster-recovery
+data:
+  recovery-plan.yaml: |
+    # Disaster recovery scenarios and procedures
+    scenarios:
+      single_node_failure:
+        description: "Single node failure - hardware or software"
+        detection:
+          - "Node becomes NotReady for > 5 minutes"
+          - "Pods stuck in Pending state"
+          - "Node resource exhaustion"
+        recovery_steps:
+          - "Cordon and drain the failed node"
+          - "Reschedule workloads to healthy nodes"
+          - "Alert administrators"
+          - "Attempt node recovery"
+        automation_level: "full"
+        estimated_rto: "5 minutes"
+        
+      architecture_failure:
+        description: "Complete failure of one architecture (e.g., all AMD64 nodes)"
+        detection:
+          - "All nodes of same architecture become NotReady"
+          - "Architecture-specific workloads failing"
+        recovery_steps:
+          - "Identify affected workloads"
+          - "Migrate critical workloads to available architectures"
+          - "Scale up alternative architecture capacity"
+          - "Activate cross-architecture backup services"
+        automation_level: "partial"
+        estimated_rto: "15 minutes"
+        
+      storage_failure:
+        description: "Storage system failure or corruption"
+        detection:
+          - "PVC mounting failures"
+          - "Storage class unavailable"
+          - "Data corruption detected"
+        recovery_steps:
+          - "Activate backup storage systems"
+          - "Restore from latest snapshots"
+          - "Redirect workloads to backup storage"
+          - "Verify data integrity"
+        automation_level: "manual_approval"
+        estimated_rto: "30 minutes"
+        
+      network_partition:
+        description: "Network segmentation or connectivity loss"
+        detection:
+          - "Inter-node communication failures"
+          - "API server unreachable from some nodes"
+          - "Service discovery failures"
+        recovery_steps:
+          - "Identify network segments"
+          - "Activate local cluster operations"
+          - "Queue operations for synchronization"
+          - "Restore network connectivity"
+        automation_level: "partial"
+        estimated_rto: "10 minutes"
+        
+      complete_cluster_failure:
+        description: "Total cluster failure - all nodes down"
+        detection:
+          - "All nodes NotReady"
+          - "Control plane unreachable"
+          - "External monitoring alerts"
+        recovery_steps:
+          - "Activate backup cluster"
+          - "Restore cluster state from backups"
+          - "Redirect external traffic"
+          - "Restore applications from GitOps"
+        automation_level: "manual"
+        estimated_rto: "60 minutes"
+    
+    priority_services:
+      critical:
+        - "dns-system/pihole"
+        - "traefik-system/traefik"
+        - "monitoring/prometheus"
+        - "dashboard/homelab-dashboard"
+      important:
+        - "edge-computing/edge-orchestrator"
+        - "ai-ml-workloads/inference-service"
+        - "cert-manager/cert-manager"
+      optional:
+        - "benchmarking/benchmark-controller"
+        - "system-maintenance/cluster-maintenance"
+    
+    backup_strategy:
+      etcd_backup:
+        frequency: "every_30_minutes"
+        retention: "7_days"
+        storage: "local_and_remote"
+      application_backup:
+        frequency: "daily"
+        retention: "30_days"
+        storage: "remote_only"
+      configuration_backup:
+        frequency: "on_change"
+        retention: "unlimited"
+        storage: "git_and_remote"
+
+  recovery_scripts.sh: |
+    #!/bin/bash
+    
+    # Disaster Recovery Scripts for Multi-Architecture Homelab
+    
+    # Colors for output
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'
+    
+    log() {
+        echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
+    }
+    
+    warn() {
+        echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1${NC}"
+    }
+    
+    error() {
+        echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1${NC}"
+    }
+    
+    # Function: Check cluster health
+    check_cluster_health() {
+        log "Checking cluster health..."
+        
+        # Check API server
+        if ! kubectl cluster-info >/dev/null 2>&1; then
+            error "API server unreachable"
+            return 1
+        fi
+        
+        # Check node status
+        READY_NODES=$(kubectl get nodes --no-headers | grep " Ready " | wc -l)
+        TOTAL_NODES=$(kubectl get nodes --no-headers | wc -l)
+        
+        log "Cluster status: $READY_NODES/$TOTAL_NODES nodes ready"
+        
+        if [ $READY_NODES -eq 0 ]; then
+            error "No nodes are ready - cluster failure detected"
+            return 1
+        elif [ $READY_NODES -lt $((TOTAL_NODES / 2)) ]; then
+            warn "Less than half of nodes are ready - degraded state"
+            return 2
+        fi
+        
+        # Check by architecture
+        for arch in amd64 arm64 arm; do
+            arch_ready=$(kubectl get nodes -l kubernetes.io/arch=$arch --no-headers | grep " Ready " | wc -l)
+            arch_total=$(kubectl get nodes -l kubernetes.io/arch=$arch --no-headers | wc -l)
+            
+            if [ $arch_total -gt 0 ]; then
+                log "Architecture $arch: $arch_ready/$arch_total nodes ready"
+                
+                if [ $arch_ready -eq 0 ]; then
+                    warn "Complete $arch architecture failure detected"
+                fi
+            fi
+        done
+        
+        return 0
+    }
+    
+    # Function: Drain failed node
+    drain_failed_node() {
+        local node_name=$1
+        
+        log "Draining failed node: $node_name"
+        
+        # Cordon the node
+        kubectl cordon $node_name
+        
+        # Drain with grace period
+        kubectl drain $node_name \
+            --ignore-daemonsets \
+            --delete-emptydir-data \
+            --force \
+            --grace-period=30 \
+            --timeout=300s
+        
+        if [ $? -eq 0 ]; then
+            log "Successfully drained node: $node_name"
+        else
+            error "Failed to drain node: $node_name"
+            return 1
+        fi
+    }
+    
+    # Function: Recover workloads to alternative architecture
+    recover_to_alternative_arch() {
+        local failed_arch=$1
+        
+        log "Recovering workloads from failed architecture: $failed_arch"
+        
+        # Define architecture alternatives
+        case $failed_arch in
+            "amd64")
+                target_arch="arm64"
+                ;;
+            "arm64")
+                target_arch="amd64"
+                ;;
+            "arm")
+                target_arch="arm64"
+                ;;
+            *)
+                error "Unknown architecture: $failed_arch"
+                return 1
+                ;;
+        esac
+        
+        log "Target architecture for recovery: $target_arch"
+        
+        # Find deployments that can be moved
+        kubectl get deployments --all-namespaces -o json | \
+            jq -r '.items[] | select(.spec.template.spec.nodeSelector."kubernetes.io/arch" == "'$failed_arch'") | 
+                   "\(.metadata.namespace) \(.metadata.name)"' | \
+            while read namespace deployment; do
+                log "Migrating $namespace/$deployment to $target_arch"
+                
+                # Update node selector
+                kubectl patch deployment $deployment -n $namespace \
+                    -p '{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/arch":"'$target_arch'"}}}}}'
+                
+                # Scale down and up to force rescheduling
+                kubectl scale deployment $deployment -n $namespace --replicas=0
+                sleep 5
+                kubectl scale deployment $deployment -n $namespace --replicas=1
+            done
+    }
+    
+    # Function: Backup etcd
+    backup_etcd() {
+        local backup_dir="/tmp/etcd-backup-$(date +%Y%m%d-%H%M%S)"
+        
+        log "Creating etcd backup: $backup_dir"
+        
+        mkdir -p $backup_dir
+        
+        # Get etcd endpoints
+        ETCDCTL_API=3 etcdctl \
+            --endpoints=https://127.0.0.1:2379 \
+            --cacert=/var/lib/rancher/k3s/server/tls/etcd/server-ca.crt \
+            --cert=/var/lib/rancher/k3s/server/tls/etcd/server-client.crt \
+            --key=/var/lib/rancher/k3s/server/tls/etcd/server-client.key \
+            snapshot save $backup_dir/etcd-snapshot.db
+        
+        if [ $? -eq 0 ]; then
+            log "etcd backup created successfully: $backup_dir/etcd-snapshot.db"
+            
+            # Compress backup
+            tar -czf $backup_dir.tar.gz -C $backup_dir .
+            
+            # Upload to remote storage (implement as needed)
+            # aws s3 cp $backup_dir.tar.gz s3://homelab-backups/etcd/
+            
+            return 0
+        else
+            error "Failed to create etcd backup"
+            return 1
+        fi
+    }
+    
+    # Function: Restore from backup
+    restore_from_backup() {
+        local backup_file=$1
+        
+        warn "DESTRUCTIVE OPERATION: Restoring from backup: $backup_file"
+        read -p "Are you sure you want to proceed? (yes/no): " confirmation
+        
+        if [ "$confirmation" != "yes" ]; then
+            log "Backup restore cancelled"
+            return 1
+        fi
+        
+        log "Stopping k3s service..."
+        systemctl stop k3s
+        
+        # Extract backup
+        local restore_dir="/tmp/restore-$(date +%Y%m%d-%H%M%S)"
+        mkdir -p $restore_dir
+        tar -xzf $backup_file -C $restore_dir
+        
+        # Restore etcd
+        log "Restoring etcd from backup..."
+        rm -rf /var/lib/rancher/k3s/server/db/etcd
+        
+        ETCDCTL_API=3 etcdctl snapshot restore $restore_dir/etcd-snapshot.db \
+            --data-dir /var/lib/rancher/k3s/server/db/etcd
+        
+        log "Starting k3s service..."
+        systemctl start k3s
+        
+        # Wait for cluster to be ready
+        log "Waiting for cluster to become ready..."
+        sleep 30
+        
+        while ! kubectl cluster-info >/dev/null 2>&1; do
+            log "Waiting for API server..."
+            sleep 10
+        done
+        
+        log "Cluster restored successfully"
+    }
+    
+    # Function: Failover to backup cluster
+    failover_to_backup() {
+        warn "Initiating failover to backup cluster"
+        
+        # This would involve:
+        # 1. Updating DNS to point to backup cluster
+        # 2. Activating backup cluster services
+        # 3. Syncing latest data
+        
+        log "Backup cluster failover would be implemented here"
+        # Implementation depends on backup cluster setup
+    }
+    
+    # Function: Send alert
+    send_alert() {
+        local severity=$1
+        local message=$2
+        
+        log "ALERT [$severity]: $message"
+        
+        # Send to monitoring system
+        curl -X POST http://prometheus.monitoring:9093/api/v1/alerts \
+            -H "Content-Type: application/json" \
+            -d '{
+                "alerts": [
+                    {
+                        "labels": {
+                            "alertname": "DisasterRecovery",
+                            "severity": "'$severity'",
+                            "cluster": "homelab"
+                        },
+                        "annotations": {
+                            "message": "'$message'"
+                        }
+                    }
+                ]
+            }' 2>/dev/null || true
+        
+        # Send email (if configured)
+        # echo "$message" | mail -s "Homelab Alert [$severity]" admin@homelab.local
+    }
+    
+    # Main recovery function
+    execute_recovery() {
+        local scenario=$1
+        
+        log "Executing disaster recovery for scenario: $scenario"
+        
+        case $scenario in
+            "single_node_failure")
+                local failed_node=$2
+                drain_failed_node $failed_node
+                send_alert "warning" "Node $failed_node has been drained due to failure"
+                ;;
+            "architecture_failure")
+                local failed_arch=$2
+                recover_to_alternative_arch $failed_arch
+                send_alert "critical" "Architecture $failed_arch failure - workloads migrated"
+                ;;
+            "storage_failure")
+                log "Storage failure recovery requires manual intervention"
+                send_alert "critical" "Storage failure detected - manual recovery required"
+                ;;
+            "network_partition")
+                log "Network partition recovery - implementing local operations"
+                send_alert "warning" "Network partition detected - switching to local operations"
+                ;;
+            "complete_cluster_failure")
+                failover_to_backup
+                send_alert "critical" "Complete cluster failure - backup cluster activated"
+                ;;
+            *)
+                error "Unknown recovery scenario: $scenario"
+                return 1
+                ;;
+        esac
+    }
+
+---
+# Disaster Recovery Controller
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: disaster-recovery-controller
+  namespace: disaster-recovery
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: disaster-recovery-controller
+  template:
+    metadata:
+      labels:
+        app: disaster-recovery-controller
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64  # Run on stable architecture
+      serviceAccountName: disaster-recovery-controller
+      containers:
+      - name: controller
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes pyyaml requests redis asyncio aiohttp
+          python3 /app/disaster_recovery_controller.py
+        volumeMounts:
+        - name: recovery-app
+          mountPath: /app
+        - name: recovery-config
+          mountPath: /config
+        - name: recovery-scripts
+          mountPath: /scripts
+        env:
+        - name: REDIS_URL
+          value: "redis://disaster-recovery-redis:6379"
+        - name: ALERT_WEBHOOK
+          value: "http://alertmanager.monitoring:9093/api/v1/alerts"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        ports:
+        - containerPort: 8080
+          name: api
+      volumes:
+      - name: recovery-app
+        configMap:
+          name: disaster-recovery-app
+      - name: recovery-config
+        configMap:
+          name: disaster-recovery-config
+      - name: recovery-scripts
+        configMap:
+          name: disaster-recovery-config
+          items:
+          - key: recovery_scripts.sh
+            path: recovery_scripts.sh
+            mode: 0755
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: disaster-recovery-app
+  namespace: disaster-recovery
+data:
+  disaster_recovery_controller.py: |
+    #!/usr/bin/env python3
+    import asyncio
+    import json
+    import logging
+    import os
+    import subprocess
+    import time
+    import yaml
+    from datetime import datetime, timedelta
+    from typing import Dict, List, Optional
+    from kubernetes import client, config, watch
+    from aiohttp import web
+    import redis
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class DisasterRecoveryController:
+        def __init__(self):
+            try:
+                config.load_incluster_config()
+            except:
+                config.load_kube_config()
+            
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            
+            # Connect to Redis for state management
+            redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+            self.redis_client = redis.from_url(redis_url)
+            
+            # Load recovery configuration
+            with open('/config/recovery-plan.yaml', 'r') as f:
+                self.recovery_config = yaml.safe_load(f)
+            
+            self.active_incidents = {}
+            self.recovery_history = []
+            
+        async def monitor_cluster_health(self):
+            """Continuously monitor cluster health for disaster scenarios"""
+            logger.info("Starting cluster health monitoring...")
+            
+            while True:
+                try:
+                    await self.check_node_health()
+                    await self.check_architecture_health()
+                    await self.check_storage_health()
+                    await self.check_network_health()
+                    await self.check_critical_services()
+                    
+                except Exception as e:
+                    logger.error(f"Error in health monitoring: {e}")
+                
+                await asyncio.sleep(30)  # Check every 30 seconds
+        
+        async def check_node_health(self):
+            """Check individual node health"""
+            nodes = self.v1.list_node()
+            
+            for node in nodes.items:
+                node_name = node.metadata.name
+                
+                # Check node conditions
+                ready_condition = None
+                for condition in node.status.conditions:
+                    if condition.type == 'Ready':
+                        ready_condition = condition
+                        break
+                
+                if ready_condition and ready_condition.status != 'True':
+                    # Node is not ready
+                    if node_name not in self.active_incidents:
+                        await self.handle_node_failure(node_name, ready_condition.reason)
+                else:
+                    # Node is healthy, clear any existing incidents
+                    if node_name in self.active_incidents:
+                        await self.resolve_incident(node_name)
+        
+        async def check_architecture_health(self):
+            """Check health by architecture"""
+            architectures = ['amd64', 'arm64', 'arm']
+            
+            for arch in architectures:
+                nodes = self.v1.list_node(label_selector=f'kubernetes.io/arch={arch}')
+                
+                if not nodes.items:
+                    continue  # No nodes of this architecture
+                
+                ready_nodes = 0
+                total_nodes = len(nodes.items)
+                
+                for node in nodes.items:
+                    for condition in node.status.conditions:
+                        if condition.type == 'Ready' and condition.status == 'True':
+                            ready_nodes += 1
+                            break
+                
+                # Check for complete architecture failure
+                if ready_nodes == 0 and total_nodes > 0:
+                    incident_key = f"arch_failure_{arch}"
+                    if incident_key not in self.active_incidents:
+                        await self.handle_architecture_failure(arch)
+                elif ready_nodes == total_nodes:
+                    # Architecture is healthy
+                    incident_key = f"arch_failure_{arch}"
+                    if incident_key in self.active_incidents:
+                        await self.resolve_incident(incident_key)
+        
+        async def check_storage_health(self):
+            """Check storage system health"""
+            try:
+                # Check PVCs for mounting issues
+                pvcs = self.v1.list_persistent_volume_claim_for_all_namespaces()
+                
+                failed_pvcs = []
+                for pvc in pvcs.items:
+                    if pvc.status.phase != 'Bound':
+                        failed_pvcs.append(f"{pvc.metadata.namespace}/{pvc.metadata.name}")
+                
+                if failed_pvcs:
+                    incident_key = "storage_failure"
+                    if incident_key not in self.active_incidents:
+                        await self.handle_storage_failure(failed_pvcs)
+                
+            except Exception as e:
+                logger.error(f"Error checking storage health: {e}")
+        
+        async def check_network_health(self):
+            """Check network connectivity between nodes"""
+            # This is a simplified check - in reality you'd use more sophisticated methods
+            try:
+                # Check if we can reach all nodes from API server perspective
+                nodes = self.v1.list_node()
+                
+                unreachable_nodes = []
+                for node in nodes.items:
+                    # Check last heartbeat time
+                    for condition in node.status.conditions:
+                        if condition.type == 'Ready':
+                            last_heartbeat = condition.last_heartbeat_time
+                            if last_heartbeat:
+                                time_diff = datetime.now(last_heartbeat.tzinfo) - last_heartbeat
+                                if time_diff.total_seconds() > 300:  # 5 minutes
+                                    unreachable_nodes.append(node.metadata.name)
+                
+                if unreachable_nodes:
+                    incident_key = "network_partition"
+                    if incident_key not in self.active_incidents:
+                        await self.handle_network_partition(unreachable_nodes)
+                
+            except Exception as e:
+                logger.error(f"Error checking network health: {e}")
+        
+        async def check_critical_services(self):
+            """Check health of critical services"""
+            critical_services = self.recovery_config['priority_services']['critical']
+            
+            for service_spec in critical_services:
+                namespace, service_name = service_spec.split('/')
+                
+                try:
+                    # Check if deployment exists and is ready
+                    deployment = self.apps_v1.read_namespaced_deployment(
+                        name=service_name, namespace=namespace
+                    )
+                    
+                    ready_replicas = deployment.status.ready_replicas or 0
+                    desired_replicas = deployment.status.replicas or 0
+                    
+                    if ready_replicas < desired_replicas:
+                        incident_key = f"service_failure_{namespace}_{service_name}"
+                        if incident_key not in self.active_incidents:
+                            await self.handle_service_failure(namespace, service_name)
+                    else:
+                        # Service is healthy
+                        incident_key = f"service_failure_{namespace}_{service_name}"
+                        if incident_key in self.active_incidents:
+                            await self.resolve_incident(incident_key)
+                
+                except client.exceptions.ApiException as e:
+                    if e.status == 404:
+                        # Service not found
+                        incident_key = f"service_missing_{namespace}_{service_name}"
+                        if incident_key not in self.active_incidents:
+                            await self.handle_service_missing(namespace, service_name)
+        
+        async def handle_node_failure(self, node_name: str, reason: str):
+            """Handle single node failure"""
+            logger.warning(f"Node failure detected: {node_name} - {reason}")
+            
+            incident = {
+                'type': 'single_node_failure',
+                'node': node_name,
+                'reason': reason,
+                'timestamp': datetime.now().isoformat(),
+                'status': 'active'
+            }
+            
+            self.active_incidents[node_name] = incident
+            
+            # Execute recovery script
+            recovery_result = await self.execute_recovery_script(
+                'single_node_failure', node_name
+            )
+            
+            incident['recovery_result'] = recovery_result
+            
+            # Store in Redis
+            self.redis_client.hset(
+                'dr:incidents',
+                node_name,
+                json.dumps(incident)
+            )
+            
+            await self.send_alert('warning', f"Node {node_name} failure - automated recovery initiated")
+        
+        async def handle_architecture_failure(self, architecture: str):
+            """Handle complete architecture failure"""
+            logger.error(f"Complete architecture failure: {architecture}")
+            
+            incident_key = f"arch_failure_{architecture}"
+            incident = {
+                'type': 'architecture_failure',
+                'architecture': architecture,
+                'timestamp': datetime.now().isoformat(),
+                'status': 'active'
+            }
+            
+            self.active_incidents[incident_key] = incident
+            
+            # Execute recovery script
+            recovery_result = await self.execute_recovery_script(
+                'architecture_failure', architecture
+            )
+            
+            incident['recovery_result'] = recovery_result
+            
+            await self.send_alert('critical', f"Complete {architecture} architecture failure - workloads being migrated")
+        
+        async def handle_storage_failure(self, failed_pvcs: List[str]):
+            """Handle storage system failure"""
+            logger.error(f"Storage failure detected: {failed_pvcs}")
+            
+            incident_key = "storage_failure"
+            incident = {
+                'type': 'storage_failure',
+                'failed_pvcs': failed_pvcs,
+                'timestamp': datetime.now().isoformat(),
+                'status': 'active'
+            }
+            
+            self.active_incidents[incident_key] = incident
+            
+            await self.send_alert('critical', f"Storage failure detected - {len(failed_pvcs)} PVCs affected")
+        
+        async def handle_network_partition(self, unreachable_nodes: List[str]):
+            """Handle network partition"""
+            logger.error(f"Network partition detected: {unreachable_nodes}")
+            
+            incident_key = "network_partition"
+            incident = {
+                'type': 'network_partition',
+                'unreachable_nodes': unreachable_nodes,
+                'timestamp': datetime.now().isoformat(),
+                'status': 'active'
+            }
+            
+            self.active_incidents[incident_key] = incident
+            
+            await self.send_alert('warning', f"Network partition detected - {len(unreachable_nodes)} nodes unreachable")
+        
+        async def handle_service_failure(self, namespace: str, service_name: str):
+            """Handle critical service failure"""
+            logger.warning(f"Critical service failure: {namespace}/{service_name}")
+            
+            incident_key = f"service_failure_{namespace}_{service_name}"
+            incident = {
+                'type': 'service_failure',
+                'namespace': namespace,
+                'service': service_name,
+                'timestamp': datetime.now().isoformat(),
+                'status': 'active'
+            }
+            
+            self.active_incidents[incident_key] = incident
+            
+            # Try to restart the deployment
+            try:
+                self.apps_v1.patch_namespaced_deployment(
+                    name=service_name,
+                    namespace=namespace,
+                    body={
+                        'spec': {
+                            'template': {
+                                'metadata': {
+                                    'annotations': {
+                                        'kubectl.kubernetes.io/restartedAt': datetime.now().isoformat()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                )
+                
+                incident['recovery_action'] = 'deployment_restarted'
+                
+            except Exception as e:
+                incident['recovery_error'] = str(e)
+            
+            await self.send_alert('warning', f"Critical service {namespace}/{service_name} failure - restart attempted")
+        
+        async def handle_service_missing(self, namespace: str, service_name: str):
+            """Handle missing critical service"""
+            logger.error(f"Critical service missing: {namespace}/{service_name}")
+            
+            incident_key = f"service_missing_{namespace}_{service_name}"
+            incident = {
+                'type': 'service_missing',
+                'namespace': namespace,
+                'service': service_name,
+                'timestamp': datetime.now().isoformat(),
+                'status': 'active'
+            }
+            
+            self.active_incidents[incident_key] = incident
+            
+            await self.send_alert('critical', f"Critical service {namespace}/{service_name} is missing")
+        
+        async def execute_recovery_script(self, scenario: str, *args) -> Dict:
+            """Execute recovery script for a given scenario"""
+            try:
+                cmd = ['/bin/bash', '/scripts/recovery_scripts.sh', 'execute_recovery', scenario] + list(args)
+                
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5 minute timeout
+                )
+                
+                return {
+                    'exit_code': result.returncode,
+                    'stdout': result.stdout,
+                    'stderr': result.stderr,
+                    'success': result.returncode == 0
+                }
+                
+            except subprocess.TimeoutExpired:
+                return {
+                    'exit_code': -1,
+                    'error': 'Script execution timed out',
+                    'success': False
+                }
+            except Exception as e:
+                return {
+                    'exit_code': -1,
+                    'error': str(e),
+                    'success': False
+                }
+        
+        async def resolve_incident(self, incident_key: str):
+            """Resolve an active incident"""
+            if incident_key in self.active_incidents:
+                incident = self.active_incidents[incident_key]
+                incident['status'] = 'resolved'
+                incident['resolved_at'] = datetime.now().isoformat()
+                
+                # Move to history
+                self.recovery_history.append(incident)
+                del self.active_incidents[incident_key]
+                
+                # Remove from Redis
+                self.redis_client.hdel('dr:incidents', incident_key)
+                
+                logger.info(f"Incident resolved: {incident_key}")
+                await self.send_alert('info', f"Incident {incident_key} has been resolved")
+        
+        async def send_alert(self, severity: str, message: str):
+            """Send alert to monitoring system"""
+            logger.info(f"ALERT [{severity}]: {message}")
+            
+            alert_data = {
+                'alerts': [
+                    {
+                        'labels': {
+                            'alertname': 'DisasterRecovery',
+                            'severity': severity,
+                            'cluster': 'homelab'
+                        },
+                        'annotations': {
+                            'message': message,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                    }
+                ]
+            }
+            
+            # Store alert in Redis
+            self.redis_client.lpush(
+                'dr:alerts',
+                json.dumps(alert_data)
+            )
+            
+            # Keep only last 100 alerts
+            self.redis_client.ltrim('dr:alerts', 0, 99)
+        
+        async def api_handler(self, request):
+            """Handle API requests"""
+            path = request.path
+            
+            if path == '/health':
+                return web.json_response({'status': 'healthy'})
+            elif path == '/incidents':
+                return web.json_response(self.active_incidents)
+            elif path == '/history':
+                return web.json_response(self.recovery_history[-50:])  # Last 50
+            elif path == '/status':
+                # Run health check and return status
+                health_result = await self.run_health_check()
+                return web.json_response(health_result)
+            else:
+                return web.json_response({'error': 'Not found'}, status=404)
+        
+        async def run_health_check(self) -> Dict:
+            """Run comprehensive health check"""
+            health_status = {
+                'cluster_healthy': True,
+                'issues': [],
+                'architecture_status': {},
+                'service_status': {},
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Check architectures
+            for arch in ['amd64', 'arm64', 'arm']:
+                nodes = self.v1.list_node(label_selector=f'kubernetes.io/arch={arch}')
+                if nodes.items:
+                    ready_count = sum(1 for node in nodes.items 
+                                    if any(c.type == 'Ready' and c.status == 'True' 
+                                          for c in node.status.conditions))
+                    total_count = len(nodes.items)
+                    
+                    health_status['architecture_status'][arch] = {
+                        'ready': ready_count,
+                        'total': total_count,
+                        'healthy': ready_count == total_count
+                    }
+                    
+                    if ready_count < total_count:
+                        health_status['cluster_healthy'] = False
+                        health_status['issues'].append(f"{arch}: {ready_count}/{total_count} nodes ready")
+            
+            # Check critical services
+            for service_spec in self.recovery_config['priority_services']['critical']:
+                namespace, service_name = service_spec.split('/')
+                try:
+                    deployment = self.apps_v1.read_namespaced_deployment(
+                        name=service_name, namespace=namespace
+                    )
+                    
+                    ready = deployment.status.ready_replicas or 0
+                    desired = deployment.status.replicas or 0
+                    
+                    health_status['service_status'][service_spec] = {
+                        'ready': ready,
+                        'desired': desired,
+                        'healthy': ready == desired
+                    }
+                    
+                    if ready < desired:
+                        health_status['cluster_healthy'] = False
+                        health_status['issues'].append(f"Service {service_spec}: {ready}/{desired} replicas ready")
+                
+                except:
+                    health_status['service_status'][service_spec] = {
+                        'healthy': False,
+                        'error': 'Not found'
+                    }
+                    health_status['cluster_healthy'] = False
+                    health_status['issues'].append(f"Service {service_spec}: Not found")
+            
+            return health_status
+        
+        async def run(self):
+            """Main run loop"""
+            logger.info("Starting Disaster Recovery Controller...")
+            
+            # Set up web server
+            app = web.Application()
+            app.router.add_get('/{path:.*}', self.api_handler)
+            
+            # Start background tasks
+            tasks = [
+                asyncio.create_task(self.monitor_cluster_health()),
+                asyncio.create_task(self.start_web_server(app))
+            ]
+            
+            # Run forever
+            await asyncio.gather(*tasks)
+        
+        async def start_web_server(self, app):
+            """Start the web server"""
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, '0.0.0.0', 8080)
+            await site.start()
+            logger.info("Disaster Recovery API server started on port 8080")
+            
+            # Keep running
+            while True:
+                await asyncio.sleep(3600)
+    
+    if __name__ == "__main__":
+        controller = DisasterRecoveryController()
+        asyncio.run(controller.run())
+
+---
+# Redis for disaster recovery state
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: disaster-recovery-redis
+  namespace: disaster-recovery
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: disaster-recovery-redis
+  template:
+    metadata:
+      labels:
+        app: disaster-recovery-redis
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]  # Prefer ARM64 for power efficiency
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: disaster-recovery-redis
+  namespace: disaster-recovery
+spec:
+  selector:
+    app: disaster-recovery-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+# Backup automation
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-backup
+  namespace: disaster-recovery
+spec:
+  schedule: "*/30 * * * *"  # Every 30 minutes
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: amd64
+            node-role.kubernetes.io/master: "true"
+          hostNetwork: true
+          containers:
+          - name: etcd-backup
+            image: bitnami/kubectl:latest
+            command: ["/bin/bash"]
+            args:
+            - -c
+            - |
+              echo "Creating etcd backup..."
+              
+              BACKUP_DIR="/tmp/etcd-backup-$(date +%Y%m%d-%H%M%S)"
+              mkdir -p $BACKUP_DIR
+              
+              # Create etcd snapshot
+              /scripts/recovery_scripts.sh backup_etcd
+              
+              echo "etcd backup completed"
+            volumeMounts:
+            - name: etcd-certs
+              mountPath: /var/lib/rancher/k3s/server/tls/etcd
+              readOnly: true
+            - name: recovery-scripts
+              mountPath: /scripts
+            - name: backup-storage
+              mountPath: /backups
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "128Mi"
+              limits:
+                cpu: "500m"
+                memory: "256Mi"
+          volumes:
+          - name: etcd-certs
+            hostPath:
+              path: /var/lib/rancher/k3s/server/tls/etcd
+          - name: recovery-scripts
+            configMap:
+              name: disaster-recovery-config
+              items:
+              - key: recovery_scripts.sh
+                path: recovery_scripts.sh
+                mode: 0755
+          - name: backup-storage
+            hostPath:
+              path: /var/backups/etcd
+          restartPolicy: OnFailure
+
+---
+# Application backup
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: application-backup
+  namespace: disaster-recovery
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: amd64
+          containers:
+          - name: app-backup
+            image: bitnami/kubectl:latest
+            command: ["/bin/bash"]
+            args:
+            - -c
+            - |
+              echo "Creating application backup..."
+              
+              BACKUP_DIR="/backups/apps/$(date +%Y%m%d)"
+              mkdir -p $BACKUP_DIR
+              
+              # Backup all ConfigMaps and Secrets
+              kubectl get configmaps --all-namespaces -o yaml > $BACKUP_DIR/configmaps.yaml
+              kubectl get secrets --all-namespaces -o yaml > $BACKUP_DIR/secrets.yaml
+              
+              # Backup deployments
+              kubectl get deployments --all-namespaces -o yaml > $BACKUP_DIR/deployments.yaml
+              
+              # Backup services
+              kubectl get services --all-namespaces -o yaml > $BACKUP_DIR/services.yaml
+              
+              # Backup ingresses
+              kubectl get ingresses --all-namespaces -o yaml > $BACKUP_DIR/ingresses.yaml
+              
+              # Backup PVCs
+              kubectl get pvc --all-namespaces -o yaml > $BACKUP_DIR/pvcs.yaml
+              
+              # Create tar archive
+              cd /backups/apps
+              tar -czf $BACKUP_DIR.tar.gz $(basename $BACKUP_DIR)
+              rm -rf $BACKUP_DIR
+              
+              # Cleanup old backups (keep 30 days)
+              find /backups/apps -name "*.tar.gz" -mtime +30 -delete
+              
+              echo "Application backup completed: $BACKUP_DIR.tar.gz"
+            volumeMounts:
+            - name: backup-storage
+              mountPath: /backups
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "128Mi"
+              limits:
+                cpu: "500m"
+                memory: "256Mi"
+          volumes:
+          - name: backup-storage
+            hostPath:
+              path: /var/backups
+          restartPolicy: OnFailure
+
+---
+# RBAC for disaster recovery controller
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: disaster-recovery-controller
+  namespace: disaster-recovery
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: disaster-recovery-controller
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "services", "configmaps", "secrets", "persistentvolumeclaims"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "replicasets"]
+  verbs: ["get", "list", "watch", "patch", "update", "create", "delete"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: disaster-recovery-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: disaster-recovery-controller
+subjects:
+- kind: ServiceAccount
+  name: disaster-recovery-controller
+  namespace: disaster-recovery
+
+---
+# Service for disaster recovery API
+apiVersion: v1
+kind: Service
+metadata:
+  name: disaster-recovery-controller
+  namespace: disaster-recovery
+spec:
+  selector:
+    app: disaster-recovery-controller
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: api

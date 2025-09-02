@@ -1,0 +1,1048 @@
+# Advanced Security Hardening for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security
+  labels:
+    name: security
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+---
+# OPA (Open Policy Agent) for Policy Enforcement
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa-policies
+  namespace: security
+data:
+  architecture-placement.rego: |
+    package kubernetes.admission
+    
+    import future.keywords.contains
+    import future.keywords.if
+    import future.keywords.in
+    
+    # Deny heavy workloads on ARM nodes
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      input.request.object.metadata.labels.workload_type == "heavy"
+      input.request.object.spec.nodeSelector["kubernetes.io/arch"] == "arm"
+      msg := "Heavy workloads cannot run on ARM nodes"
+    }
+    
+    # Enforce architecture requirements
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      required_arch := input.request.object.metadata.annotations["required-architecture"]
+      node_arch := input.request.object.spec.nodeSelector["kubernetes.io/arch"]
+      required_arch != node_arch
+      msg := sprintf("Pod requires %s architecture but targets %s", [required_arch, node_arch])
+    }
+    
+    # Deny pods without resource limits
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      not container.resources.limits
+      msg := sprintf("Container %s must have resource limits", [container.name])
+    }
+    
+    # Enforce security contexts
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      not input.request.object.spec.securityContext.runAsNonRoot
+      msg := "Pods must run as non-root user"
+    }
+    
+    # Deny privileged containers
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      container.securityContext.privileged
+      msg := sprintf("Container %s cannot run in privileged mode", [container.name])
+    }
+    
+    # Enforce image pull policy
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      container.imagePullPolicy == "Never"
+      msg := "ImagePullPolicy 'Never' is not allowed in production"
+    }
+    
+    # Require specific labels
+    deny[msg] {
+      input.request.kind.kind in ["Deployment", "StatefulSet", "DaemonSet"]
+      not input.request.object.metadata.labels.environment
+      msg := "Resource must have 'environment' label"
+    }
+    
+    deny[msg] {
+      input.request.kind.kind in ["Deployment", "StatefulSet", "DaemonSet"]
+      not input.request.object.metadata.labels.team
+      msg := "Resource must have 'team' label"
+    }
+
+  network-policies.rego: |
+    package kubernetes.admission
+    
+    # Enforce network segmentation
+    deny[msg] {
+      input.request.kind.kind == "Service"
+      input.request.object.metadata.namespace == "production"
+      input.request.object.spec.type == "NodePort"
+      msg := "NodePort services not allowed in production namespace"
+    }
+    
+    # Restrict cross-namespace communication
+    deny[msg] {
+      input.request.kind.kind == "NetworkPolicy"
+      ingress := input.request.object.spec.ingress[_]
+      from := ingress.from[_]
+      from.namespaceSelector.matchLabels.name == "default"
+      input.request.object.metadata.namespace != "default"
+      msg := "Cross-namespace traffic from default namespace is restricted"
+    }
+
+  rbac-policies.rego: |
+    package kubernetes.admission
+    
+    # Prevent wildcard permissions
+    deny[msg] {
+      input.request.kind.kind in ["Role", "ClusterRole"]
+      rule := input.request.object.rules[_]
+      "*" in rule.verbs
+      msg := "Wildcard verbs are not allowed in RBAC rules"
+    }
+    
+    deny[msg] {
+      input.request.kind.kind in ["Role", "ClusterRole"]
+      rule := input.request.object.rules[_]
+      "*" in rule.resources
+      msg := "Wildcard resources are not allowed in RBAC rules"
+    }
+    
+    # Restrict secret access
+    deny[msg] {
+      input.request.kind.kind == "Role"
+      rule := input.request.object.rules[_]
+      "secrets" in rule.resources
+      "get" in rule.verbs
+      not input.request.object.metadata.namespace in ["kube-system", "security"]
+      msg := "Secret access must be explicitly approved"
+    }
+
+---
+# OPA Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opa
+  namespace: security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opa
+  template:
+    metadata:
+      labels:
+        app: opa
+    spec:
+      serviceAccountName: opa
+      # Run on AMD64 for performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: opa
+        image: openpolicyagent/opa:0.55.0-envoy-rootless
+        ports:
+        - containerPort: 8181
+          name: http
+        - containerPort: 8282
+          name: diagnostics
+        args:
+          - "run"
+          - "--server"
+          - "--addr=0.0.0.0:8181"
+          - "--diagnostic-addr=0.0.0.0:8282"
+          - "--set=plugins.envoy_ext_authz_grpc.addr=:9191"
+          - "--set=plugins.envoy_ext_authz_grpc.query=data.envoy.authz.allow"
+          - "--set=decision_logs.console=true"
+          - "/policies"
+        volumeMounts:
+        - name: policies
+          mountPath: /policies
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /health?plugins
+            port: 8282
+        readinessProbe:
+          httpGet:
+            path: /health?plugins
+            port: 8282
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: policies
+        configMap:
+          name: opa-policies
+
+---
+# Falco for Runtime Security
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: security
+spec:
+  selector:
+    matchLabels:
+      app: falco
+  template:
+    metadata:
+      labels:
+        app: falco
+    spec:
+      serviceAccountName: falco
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/master
+      containers:
+      - name: falco
+        image: falcosecurity/falco:0.35.0
+        securityContext:
+          privileged: true
+        args:
+          - /usr/bin/falco
+          - --cri
+          - /run/containerd/containerd.sock
+          - -K
+          - /var/run/secrets/kubernetes.io/serviceaccount/token
+          - -k
+          - https://$(KUBERNETES_SERVICE_HOST)
+          - -pk
+        env:
+        - name: FALCO_BPF_PROBE
+          value: ""
+        volumeMounts:
+        - name: config
+          mountPath: /etc/falco
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: boot
+          mountPath: /host/boot
+          readOnly: true
+        - name: lib-modules
+          mountPath: /host/lib/modules
+          readOnly: true
+        - name: usr
+          mountPath: /host/usr
+          readOnly: true
+        - name: etc
+          mountPath: /host/etc
+          readOnly: true
+        - name: dev
+          mountPath: /host/dev
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+      volumes:
+      - name: config
+        configMap:
+          name: falco-config
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: boot
+        hostPath:
+          path: /boot
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
+      - name: usr
+        hostPath:
+          path: /usr
+      - name: etc
+        hostPath:
+          path: /etc
+      - name: dev
+        hostPath:
+          path: /dev
+
+---
+# Falco Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-config
+  namespace: security
+data:
+  falco.yaml: |
+    rules_file:
+      - /etc/falco/falco_rules.yaml
+      - /etc/falco/falco_rules.local.yaml
+      - /etc/falco/k8s_audit_rules.yaml
+      - /etc/falco/custom_rules.yaml
+    
+    json_output: true
+    json_include_output_property: true
+    log_stderr: true
+    log_syslog: false
+    log_level: info
+    
+    priority: warning
+    
+    stdout_output:
+      enabled: true
+    
+    syslog_output:
+      enabled: false
+    
+    file_output:
+      enabled: false
+      keep_alive: false
+      filename: /var/log/falco/events.txt
+    
+    http_output:
+      enabled: true
+      url: http://falco-exporter.security:8080/events
+    
+    program_output:
+      enabled: false
+    
+    webserver:
+      enabled: true
+      listen_port: 8765
+      k8s_audit_endpoint: /k8s-audit
+      ssl_enabled: false
+    
+    # Architecture-specific rules
+    custom_rules:
+      - rule: Heavy workload on wrong architecture
+        desc: Detect heavy workloads running on ARM nodes
+        condition: >
+          container and
+          container.image contains "tensorflow" and
+          k8s.node.name contains "arm"
+        output: Heavy workload running on ARM node (user=%user.name command=%proc.cmdline node=%k8s.node.name)
+        priority: WARNING
+      
+      - rule: Unauthorized cross-architecture communication
+        desc: Detect unexpected network connections between architectures
+        condition: >
+          inbound and
+          fd.sport >= 30000 and
+          k8s.pod.label.architecture != k8s.pod.label.target_architecture
+        output: Cross-architecture communication detected (connection=%fd.name pod=%k8s.pod.name)
+        priority: NOTICE
+
+  custom_rules.yaml: |
+    - rule: Suspicious Process in Container
+      desc: Detect suspicious processes running in containers
+      condition: >
+        container and
+        proc.name in (nc, ncat, netcat, nmap, tcpdump, tshark)
+      output: Suspicious process in container (user=%user.name command=%proc.cmdline container=%container.name)
+      priority: WARNING
+    
+    - rule: Container Privilege Escalation
+      desc: Detect privilege escalation in containers
+      condition: >
+        container and
+        proc.name in (sudo, su) and
+        proc.pname != in (bash, sh)
+      output: Privilege escalation detected (user=%user.name command=%proc.cmdline container=%container.name)
+      priority: CRITICAL
+    
+    - rule: Cryptocurrency Mining
+      desc: Detect cryptocurrency mining activity
+      condition: >
+        container and
+        (proc.name in (xmrig, minerd, minergate) or
+         proc.cmdline contains "stratum+tcp")
+      output: Cryptocurrency mining detected (command=%proc.cmdline container=%container.name)
+      priority: CRITICAL
+    
+    - rule: Sensitive File Access
+      desc: Detect access to sensitive files
+      condition: >
+        container and
+        (fd.name contains "/etc/shadow" or
+         fd.name contains "/etc/passwd" or
+         fd.name contains ".kube/config") and
+        evt.type in (open, openat)
+      output: Sensitive file accessed (file=%fd.name user=%user.name container=%container.name)
+      priority: WARNING
+
+---
+# Vault for Secrets Management
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vault
+  namespace: security
+spec:
+  serviceName: vault
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vault
+  template:
+    metadata:
+      labels:
+        app: vault
+    spec:
+      serviceAccountName: vault
+      # Run on AMD64 for security processing
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: vault
+        image: hashicorp/vault:1.14.0
+        command: ["vault", "server", "-config=/vault/config/vault.hcl"]
+        ports:
+        - containerPort: 8200
+          name: vault
+        - containerPort: 8201
+          name: cluster
+        env:
+        - name: VAULT_ADDR
+          value: "http://127.0.0.1:8200"
+        - name: VAULT_API_ADDR
+          value: "http://vault:8200"
+        - name: VAULT_CLUSTER_ADDR
+          value: "http://vault:8201"
+        - name: SKIP_CHOWN
+          value: "true"
+        volumeMounts:
+        - name: vault-config
+          mountPath: /vault/config
+        - name: vault-data
+          mountPath: /vault/data
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+        livenessProbe:
+          httpGet:
+            path: /v1/sys/health?standbyok=true
+            port: 8200
+          initialDelaySeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /v1/sys/health?standbyok=true
+            port: 8200
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+      volumes:
+      - name: vault-config
+        configMap:
+          name: vault-config
+  volumeClaimTemplates:
+  - metadata:
+      name: vault-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ssd
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+# Vault Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-config
+  namespace: security
+data:
+  vault.hcl: |
+    ui = true
+    
+    listener "tcp" {
+      tls_disable = 1
+      address = "[::]:8200"
+      cluster_address = "[::]:8201"
+    }
+    
+    storage "file" {
+      path = "/vault/data"
+    }
+    
+    seal "transit" {
+      address = "http://vault:8200"
+      disable_renewal = "false"
+      key_name = "autounseal"
+      mount_path = "transit/"
+    }
+    
+    telemetry {
+      prometheus_retention_time = "30s"
+      disable_hostname = true
+    }
+
+---
+# Kyverno for Policy Management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kyverno
+  namespace: security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kyverno
+  template:
+    metadata:
+      labels:
+        app: kyverno
+    spec:
+      serviceAccountName: kyverno
+      containers:
+      - name: kyverno
+        image: ghcr.io/kyverno/kyverno:v1.10.0
+        args:
+          - --filterK8sResources=[Event,*,*][JobController,*,*][PodController,*,*]
+          - --excludeGroupRole=system:serviceaccounts:kube-system,*,*
+          - --loggingFormat=text
+          - --v=2
+        ports:
+        - containerPort: 9443
+          name: webhook
+        - containerPort: 8080
+          name: metrics
+        env:
+        - name: INIT_CONFIG
+          value: kyverno
+        - name: KYVERNO_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: KYVERNO_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: KYVERNO_SERVICE_ACCOUNT
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.serviceAccountName
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+
+---
+# Kyverno Policies
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-architecture-labels
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: check-architecture-label
+    match:
+      any:
+      - resources:
+          kinds:
+          - Deployment
+          - StatefulSet
+          - DaemonSet
+    validate:
+      message: "Workloads must specify target architecture"
+      pattern:
+        spec:
+          template:
+            spec:
+              =(nodeSelector):
+                "kubernetes.io/arch": "?*"
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: check-image-tag
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          - Deployment
+          - StatefulSet
+          - DaemonSet
+    validate:
+      message: "Using 'latest' tag is not allowed"
+      pattern:
+        spec:
+          =(template):
+            =(spec):
+              containers:
+              - name: "*"
+                image: "!*:latest"
+
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-pod-security-context
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: check-security-context
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          - Deployment
+          - StatefulSet
+          - DaemonSet
+    validate:
+      message: "Security context is required"
+      pattern:
+        spec:
+          =(template):
+            =(spec):
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: ">0"
+                fsGroup: ">0"
+
+---
+# CertManager for TLS Management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-manager
+  namespace: security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-manager
+  template:
+    metadata:
+      labels:
+        app: cert-manager
+    spec:
+      serviceAccountName: cert-manager
+      containers:
+      - name: cert-manager
+        image: quay.io/jetstack/cert-manager-controller:v1.12.0
+        args:
+          - --v=2
+          - --cluster-resource-namespace=$(POD_NAMESPACE)
+          - --leader-election-namespace=$(POD_NAMESPACE)
+        ports:
+        - containerPort: 9402
+          name: metrics
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+
+---
+# Certificate Issuer
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: homelab-ca-issuer
+spec:
+  ca:
+    secretName: homelab-ca-secret
+
+---
+# Network Policies for Security Segmentation
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-ingress
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector: {}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+
+---
+# Security Scanner
+apiVersion: apps/v1
+kind: CronJob
+metadata:
+  name: security-scanner
+  namespace: security
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: security-scanner
+          containers:
+          - name: scanner
+            image: aquasec/trivy:0.44.0
+            command:
+            - sh
+            - -c
+            - |
+              # Scan all images in the cluster
+              kubectl get pods --all-namespaces -o jsonpath="{.items[*].spec.containers[*].image}" | \
+              tr -s '[[:space:]]' '\n' | \
+              sort | uniq | \
+              while read image; do
+                echo "Scanning $image"
+                trivy image --severity HIGH,CRITICAL --no-progress "$image"
+              done
+              
+              # Generate report
+              trivy k8s --report summary cluster
+          restartPolicy: OnFailure
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: opa
+  namespace: security
+spec:
+  selector:
+    app: opa
+  ports:
+  - name: http
+    port: 8181
+    targetPort: 8181
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+  namespace: security
+spec:
+  selector:
+    app: vault
+  ports:
+  - name: vault
+    port: 8200
+    targetPort: 8200
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: falco-exporter
+  namespace: security
+spec:
+  selector:
+    app: falco-exporter
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opa
+  namespace: security
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: falco
+  namespace: security
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault
+  namespace: security
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kyverno
+  namespace: security
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-manager
+  namespace: security
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: security-scanner
+  namespace: security
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: opa
+rules:
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: falco
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "namespaces", "pods", "replicationcontrollers", "services", "events", "configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vault
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "update", "get", "list", "watch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno
+rules:
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-manager
+rules:
+- apiGroups: ["cert-manager.io"]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: security-scanner
+rules:
+- apiGroups: [""]
+  resources: ["pods", "namespaces"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: opa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: opa
+subjects:
+- kind: ServiceAccount
+  name: opa
+  namespace: security
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: falco
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: falco
+subjects:
+- kind: ServiceAccount
+  name: falco
+  namespace: security
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vault
+subjects:
+- kind: ServiceAccount
+  name: vault
+  namespace: security
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kyverno
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kyverno
+subjects:
+- kind: ServiceAccount
+  name: kyverno
+  namespace: security
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cert-manager
+subjects:
+- kind: ServiceAccount
+  name: cert-manager
+  namespace: security
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: security-scanner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: security-scanner
+subjects:
+- kind: ServiceAccount
+  name: security-scanner
+  namespace: security

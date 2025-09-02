@@ -1,0 +1,314 @@
+# SABnzbd Usenet Downloader for Media Stack
+---
+# SABnzbd Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sabnzbd
+  namespace: media
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sabnzbd
+  template:
+    metadata:
+      labels:
+        app: sabnzbd
+    spec:
+      # Run on AMD64 for download performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: sabnzbd
+        image: linuxserver/sabnzbd:latest
+        ports:
+        - containerPort: 8080
+          name: web
+        - containerPort: 9090
+          name: https
+        env:
+        - name: PUID
+          value: "1000"
+        - name: PGID
+          value: "1000"
+        - name: TZ
+          value: "America/New_York"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: downloads
+          mountPath: /downloads
+        - name: incomplete
+          mountPath: /incomplete-downloads
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: sabnzbd-config
+      - name: downloads
+        persistentVolumeClaim:
+          claimName: downloads-storage
+      - name: incomplete
+        persistentVolumeClaim:
+          claimName: sabnzbd-incomplete
+
+---
+# NZBHydra2 for Usenet Indexer Aggregation
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nzbhydra2
+  namespace: media
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nzbhydra2
+  template:
+    metadata:
+      labels:
+        app: nzbhydra2
+    spec:
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: nzbhydra2
+        image: linuxserver/nzbhydra2:latest
+        ports:
+        - containerPort: 5076
+          name: web
+        env:
+        - name: PUID
+          value: "1000"
+        - name: PGID
+          value: "1000"
+        - name: TZ
+          value: "America/New_York"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: downloads
+          mountPath: /downloads
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: nzbhydra2-config
+      - name: downloads
+        persistentVolumeClaim:
+          claimName: downloads-storage
+
+---
+# SABnzbd Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sabnzbd-config-template
+  namespace: media
+data:
+  sabnzbd.ini: |
+    [misc]
+    auto_browser = 0
+    host = 0.0.0.0
+    port = 8080
+    download_dir = /downloads/complete
+    complete_dir = /downloads/complete
+    dirscan_dir = /downloads/watch
+    script_dir = /config/scripts
+    email_dir = ""
+    password_file = ""
+    permissions = ""
+    auto_disconnect = 1
+    auto_sort = ""
+    check_new_rel = 1
+    replace_spaces = 0
+    replace_dots = 0
+    safe_postproc = 1
+    pause_on_post_processing = 0
+    enable_recursive = 1
+    flat_unpack = 0
+    par_option = ""
+    pre_check = 0
+    nice = ""
+    ionice = ""
+    win_process_prio = 3
+    par2_multicore = 1
+    num_decoders = 3
+    
+    [servers]
+    # Add your Usenet providers here
+    # [[provider1]]
+    # name = provider1
+    # displayname = Provider 1
+    # host = news.provider1.com
+    # port = 563
+    # username = your_username
+    # password = your_password
+    # connections = 20
+    # ssl = 1
+    # enable = 1
+    # optional = 0
+    # retention = 0
+    # timeout = 120
+    # priority = 0
+    
+    [categories]
+    [[*]]
+    name = *
+    order = 0
+    pp = 3
+    script = None
+    dir = ""
+    
+    [[movies]]
+    name = movies
+    order = 1
+    pp = 3
+    script = None
+    dir = Movies
+    
+    [[tv]]
+    name = tv
+    order = 2
+    pp = 3
+    script = None  
+    dir = TV
+    
+    [[music]]
+    name = music
+    order = 3
+    pp = 3
+    script = None
+    dir = Music
+
+---
+# Persistent Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sabnzbd-config
+  namespace: media
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sabnzbd-incomplete
+  namespace: media
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: longhorn
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nzbhydra2-config
+  namespace: media
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: longhorn-ssd
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: sabnzbd
+  namespace: media
+spec:
+  selector:
+    app: sabnzbd
+  ports:
+  - name: web
+    port: 8080
+    targetPort: 8080
+  - name: https
+    port: 9090
+    targetPort: 9090
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nzbhydra2
+  namespace: media
+spec:
+  selector:
+    app: nzbhydra2
+  ports:
+  - port: 5076
+    targetPort: 5076
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: usenet-ingress
+  namespace: media
+spec:
+  rules:
+  - host: sabnzbd.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: sabnzbd
+            port:
+              number: 8080
+  - host: nzbhydra.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nzbhydra2
+            port:
+              number: 5076

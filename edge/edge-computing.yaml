@@ -1,0 +1,1470 @@
+# Edge Computing Platform for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge
+  labels:
+    name: edge
+    tier: edge
+
+---
+# KubeEdge Cloud Core
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeedge-cloudcore
+  namespace: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubeedge-cloudcore
+  template:
+    metadata:
+      labels:
+        app: kubeedge-cloudcore
+    spec:
+      serviceAccountName: kubeedge-cloudcore
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: cloudcore
+        image: kubeedge/cloudcore:v1.15.0
+        args:
+        - --config=/etc/kubeedge/config/cloudcore.yaml
+        - --v=2
+        ports:
+        - containerPort: 10000
+          name: cloudhub
+        - containerPort: 10002
+          name: edgecontroller
+        volumeMounts:
+        - name: config
+          mountPath: /etc/kubeedge/config
+        - name: certs
+          mountPath: /etc/kubeedge/certs
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        env:
+        - name: KUBECONFIG
+          value: "/etc/kubernetes/admin.conf"
+      volumes:
+      - name: config
+        configMap:
+          name: kubeedge-cloudcore-config
+      - name: certs
+        secret:
+          secretName: kubeedge-certs
+
+---
+# KubeEdge CloudCore Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubeedge-cloudcore-config
+  namespace: edge
+data:
+  cloudcore.yaml: |
+    apiVersion: cloudcore.config.kubeedge.io/v1alpha1
+    kind: CloudCore
+    modules:
+      cloudHub:
+        advertiseAddress:
+        - 192.168.1.100  # Replace with actual cluster IP
+        nodeLimit: 100
+        tlsCAFile: /etc/kubeedge/certs/ca.crt
+        tlsCertFile: /etc/kubeedge/certs/cloudcore.crt
+        tlsPrivateKeyFile: /etc/kubeedge/certs/cloudcore.key
+        unixsocket:
+          address: unix:///var/lib/kubeedge/kubeedge.sock
+          enable: true
+        websocket:
+          address: 0.0.0.0
+          enable: true
+          port: 10000
+        quic:
+          address: 0.0.0.0
+          enable: false
+          port: 10001
+        https:
+          address: 0.0.0.0
+          enable: true
+          port: 10002
+      
+      edgeController:
+        enable: true
+        buffer:
+          podEvent: 1
+          configMapEvent: 1
+          secretEvent: 1
+        load:
+          enabled: true
+        
+      deviceController:
+        enable: true
+        
+      syncController:
+        enable: true
+
+---
+# Edge Node Configuration Template
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubeedge-edgecore-config
+  namespace: edge
+data:
+  edgecore.yaml: |
+    apiVersion: edgecore.config.kubeedge.io/v1alpha1
+    kind: EdgeCore
+    modules:
+      edged:
+        enable: true
+        cniBinDir: /opt/cni/bin
+        cniCacheDir: /var/lib/cni/cache
+        cniConfDir: /etc/cni/net.d
+        networkPluginMTU: 1500
+        dockerAddress: unix:///var/run/docker.sock
+        gpuPluginEnabled: false
+        imageGCHighThreshold: 80
+        imageGCLowThreshold: 40
+        maximumDeadContainersPerPod: 1
+        podSandboxImage: kubeedge/pause:3.1
+        
+      edgeHub:
+        enable: true
+        heartbeat: 15
+        projectID: e632aba927ea4ac2b575ec1603d56f10
+        quic:
+          enable: false
+          handshakeTimeout: 30
+          readDeadline: 15
+          server: 192.168.1.100:10001  # CloudCore QUIC address
+          writeDeadline: 15
+        rotateCertificates: true
+        server: 192.168.1.100:10000    # CloudCore WebSocket address
+        tlsCaFile: /etc/kubeedge/certs/ca.crt
+        tlsCertFile: /etc/kubeedge/certs/edge.crt
+        tlsPrivateKeyFile: /etc/kubeedge/certs/edge.key
+        websocket:
+          enable: true
+          handshakeTimeout: 30
+          readDeadline: 15
+          writeDeadline: 15
+        
+      eventBus:
+        enable: true
+        mqttMode: 2  # 0: internal, 1: both, 2: external
+        mqttServerExternal: tcp://edge-mqtt:1883
+        mqttServerInternal: tcp://127.0.0.1:1884
+        mqttSessionQueueSize: 100
+        
+      serviceBus:
+        enable: false
+        
+      deviceTwin:
+        enable: true
+        
+      dbTest:
+        enable: false
+
+---
+# Edge MQTT Broker for IoT Communication
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-mqtt
+  namespace: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-mqtt
+  template:
+    metadata:
+      labels:
+        app: edge-mqtt
+    spec:
+      # Run on ARM for ultra-low power
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: mosquitto
+        image: eclipse-mosquitto:2.0.15
+        ports:
+        - containerPort: 1883
+          name: mqtt
+        - containerPort: 9001
+          name: websocket
+        volumeMounts:
+        - name: config
+          mountPath: /mosquitto/config
+        - name: data
+          mountPath: /mosquitto/data
+        - name: logs
+          mountPath: /mosquitto/log
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: config
+        configMap:
+          name: edge-mqtt-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: edge-mqtt-data
+      - name: logs
+        emptyDir: {}
+
+---
+# MQTT Broker Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-mqtt-config
+  namespace: edge
+data:
+  mosquitto.conf: |
+    # Mosquitto configuration for edge computing
+    
+    # Network settings
+    listener 1883
+    protocol mqtt
+    
+    listener 9001
+    protocol websockets
+    
+    # Security settings
+    allow_anonymous false
+    password_file /mosquitto/config/passwd
+    
+    # Persistence
+    persistence true
+    persistence_location /mosquitto/data/
+    
+    # Logging
+    log_dest file /mosquitto/log/mosquitto.log
+    log_type error
+    log_type warning
+    log_type notice
+    log_type information
+    log_timestamp true
+    
+    # Performance tuning
+    max_connections 1000
+    max_inflight_messages 20
+    max_queued_messages 100
+    message_size_limit 10240
+    
+    # Keep alive
+    keepalive_interval 60
+    
+    # Bridge configuration for cloud connectivity
+    connection cloudbridge
+    address nats.event-driven:4222
+    topic devices/+/data out 0 "" homelab/edge/
+    topic devices/+/commands in 0 "" homelab/edge/
+    bridge_protocol_version mqttv311
+    
+  passwd: |
+    # Generated password file
+    edge:$6$salt$hashedpassword
+    devices:$6$salt$hashedpassword
+
+---
+# Edge Device Manager
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-device-manager
+  namespace: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-device-manager
+  template:
+    metadata:
+      labels:
+        app: edge-device-manager
+    spec:
+      serviceAccountName: edge-device-manager
+      containers:
+      - name: manager
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes paho-mqtt prometheus-client pyyaml
+          python3 /app/device_manager.py
+        volumeMounts:
+        - name: manager-app
+          mountPath: /app
+        env:
+        - name: MQTT_BROKER
+          value: "edge-mqtt:1883"
+        - name: MQTT_USERNAME
+          value: "edge"
+        - name: MQTT_PASSWORD
+          value: "edgepassword"
+        - name: CLOUD_NATS_URL
+          value: "nats://nats.event-driven:4222"
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: manager-app
+        configMap:
+          name: edge-device-manager-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-device-manager-app
+  namespace: edge
+data:
+  device_manager.py: |
+    #!/usr/bin/env python3
+    import os
+    import json
+    import time
+    import logging
+    import threading
+    from datetime import datetime, timedelta
+    import paho.mqtt.client as mqtt
+    from kubernetes import client, config
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Metrics
+    EDGE_DEVICES_CONNECTED = Gauge('edge_devices_connected_total', 'Connected edge devices', ['device_type', 'location'])
+    EDGE_MESSAGES_RECEIVED = Counter('edge_messages_received_total', 'Messages received from edge devices', ['device_id', 'message_type'])
+    EDGE_DEVICE_LAST_SEEN = Gauge('edge_device_last_seen_timestamp', 'Last seen timestamp for edge devices', ['device_id'])
+    EDGE_PROCESSING_TIME = Histogram('edge_message_processing_seconds', 'Time to process edge messages')
+    
+    class EdgeDeviceManager:
+        def __init__(self):
+            config.load_incluster_config()
+            self.k8s_client = client.CoreV1Api()
+            self.custom_api = client.CustomObjectsApi()
+            
+            # MQTT configuration
+            self.mqtt_broker = os.getenv("MQTT_BROKER", "localhost")
+            self.mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
+            self.mqtt_username = os.getenv("MQTT_USERNAME", "edge")
+            self.mqtt_password = os.getenv("MQTT_PASSWORD", "password")
+            
+            # Device registry
+            self.devices = {}
+            self.device_types = {
+                "sensor": {"power": 0.5, "arch": "arm"},
+                "camera": {"power": 2.0, "arch": "arm64"},
+                "gateway": {"power": 1.0, "arch": "arm64"},
+                "actuator": {"power": 1.5, "arch": "arm"},
+                "display": {"power": 3.0, "arch": "arm64"}
+            }
+            
+            # Initialize MQTT client
+            self.mqtt_client = mqtt.Client()
+            self.mqtt_client.username_pw_set(self.mqtt_username, self.mqtt_password)
+            self.mqtt_client.on_connect = self.on_mqtt_connect
+            self.mqtt_client.on_message = self.on_mqtt_message
+            self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+            
+        def on_mqtt_connect(self, client, userdata, flags, rc):
+            """Handle MQTT connection"""
+            if rc == 0:
+                logger.info("Connected to MQTT broker")
+                # Subscribe to device topics
+                topics = [
+                    ("devices/+/data", 0),
+                    ("devices/+/status", 0),
+                    ("devices/+/telemetry", 0),
+                    ("edge/+/heartbeat", 0),
+                    ("sensors/+/readings", 0)
+                ]
+                
+                for topic, qos in topics:
+                    client.subscribe(topic, qos)
+                    logger.info(f"Subscribed to topic: {topic}")
+            else:
+                logger.error(f"Failed to connect to MQTT broker: {rc}")
+        
+        def on_mqtt_disconnect(self, client, userdata, rc):
+            """Handle MQTT disconnection"""
+            logger.warning(f"Disconnected from MQTT broker: {rc}")
+        
+        def on_mqtt_message(self, client, userdata, msg):
+            """Process incoming MQTT messages"""
+            try:
+                with EDGE_PROCESSING_TIME.time():
+                    topic = msg.topic
+                    payload = msg.payload.decode('utf-8')
+                    
+                    logger.debug(f"Received message on topic {topic}: {payload}")
+                    
+                    # Parse topic to extract device information
+                    topic_parts = topic.split('/')
+                    
+                    if len(topic_parts) >= 3:
+                        category = topic_parts[0]  # devices, edge, sensors
+                        device_id = topic_parts[1]
+                        message_type = topic_parts[2]
+                        
+                        # Update metrics
+                        EDGE_MESSAGES_RECEIVED.labels(device_id=device_id, message_type=message_type).inc()
+                        EDGE_DEVICE_LAST_SEEN.labels(device_id=device_id).set(time.time())
+                        
+                        # Process message based on type
+                        if message_type == "data":
+                            self.process_device_data(device_id, payload)
+                        elif message_type == "status":
+                            self.process_device_status(device_id, payload)
+                        elif message_type == "telemetry":
+                            self.process_device_telemetry(device_id, payload)
+                        elif message_type == "heartbeat":
+                            self.process_device_heartbeat(device_id, payload)
+                        elif message_type == "readings":
+                            self.process_sensor_readings(device_id, payload)
+                        
+                        # Update device registry
+                        self.update_device_registry(device_id, category, message_type, payload)
+                
+            except Exception as e:
+                logger.error(f"Failed to process MQTT message: {e}")
+        
+        def process_device_data(self, device_id, payload):
+            """Process data messages from devices"""
+            try:
+                data = json.loads(payload)
+                
+                # Extract relevant information
+                timestamp = data.get('timestamp', datetime.utcnow().isoformat())
+                values = data.get('values', {})
+                device_type = data.get('type', 'unknown')
+                location = data.get('location', 'unknown')
+                
+                # Update device metrics
+                EDGE_DEVICES_CONNECTED.labels(device_type=device_type, location=location).set(1)
+                
+                # Process different data types
+                if device_type == "sensor":
+                    self.process_sensor_data(device_id, values)
+                elif device_type == "camera":
+                    self.process_camera_data(device_id, values)
+                elif device_type == "gateway":
+                    self.process_gateway_data(device_id, values)
+                
+                # Forward to cloud if needed
+                self.forward_to_cloud(device_id, data)
+                
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON in device data from {device_id}")
+            except Exception as e:
+                logger.error(f"Failed to process device data from {device_id}: {e}")
+        
+        def process_sensor_data(self, device_id, values):
+            """Process sensor-specific data"""
+            # Common sensor values
+            temperature = values.get('temperature')
+            humidity = values.get('humidity')
+            pressure = values.get('pressure')
+            
+            logger.info(f"Sensor {device_id}: temp={temperature}, humidity={humidity}, pressure={pressure}")
+            
+            # Trigger alerts if values are out of range
+            if temperature and (temperature > 35 or temperature < 5):
+                self.trigger_alert(device_id, "temperature", temperature, "out_of_range")
+            
+            if humidity and (humidity > 90 or humidity < 10):
+                self.trigger_alert(device_id, "humidity", humidity, "out_of_range")
+        
+        def process_camera_data(self, device_id, values):
+            """Process camera-specific data"""
+            frame_rate = values.get('frame_rate')
+            resolution = values.get('resolution')
+            motion_detected = values.get('motion_detected', False)
+            
+            logger.info(f"Camera {device_id}: fps={frame_rate}, resolution={resolution}, motion={motion_detected}")
+            
+            if motion_detected:
+                self.trigger_alert(device_id, "motion", True, "motion_detected")
+        
+        def process_gateway_data(self, device_id, values):
+            """Process gateway-specific data"""
+            connected_devices = values.get('connected_devices', 0)
+            signal_strength = values.get('signal_strength')
+            data_throughput = values.get('data_throughput')
+            
+            logger.info(f"Gateway {device_id}: devices={connected_devices}, signal={signal_strength}, throughput={data_throughput}")
+        
+        def process_device_status(self, device_id, payload):
+            """Process device status messages"""
+            try:
+                status = json.loads(payload)
+                
+                device_status = status.get('status', 'unknown')
+                battery_level = status.get('battery_level')
+                signal_strength = status.get('signal_strength')
+                uptime = status.get('uptime')
+                
+                logger.info(f"Device {device_id} status: {device_status}, battery: {battery_level}%")
+                
+                # Check for low battery
+                if battery_level and battery_level < 20:
+                    self.trigger_alert(device_id, "battery", battery_level, "low_battery")
+                
+                # Check for offline status
+                if device_status == "offline":
+                    self.trigger_alert(device_id, "status", device_status, "device_offline")
+                
+            except Exception as e:
+                logger.error(f"Failed to process device status from {device_id}: {e}")
+        
+        def process_device_telemetry(self, device_id, payload):
+            """Process device telemetry data"""
+            try:
+                telemetry = json.loads(payload)
+                
+                cpu_usage = telemetry.get('cpu_usage')
+                memory_usage = telemetry.get('memory_usage')
+                disk_usage = telemetry.get('disk_usage')
+                temperature = telemetry.get('temperature')
+                
+                logger.debug(f"Device {device_id} telemetry: CPU={cpu_usage}%, Memory={memory_usage}%, Disk={disk_usage}%")
+                
+                # Check for high resource usage
+                if cpu_usage and cpu_usage > 90:
+                    self.trigger_alert(device_id, "cpu", cpu_usage, "high_usage")
+                
+                if memory_usage and memory_usage > 90:
+                    self.trigger_alert(device_id, "memory", memory_usage, "high_usage")
+                
+            except Exception as e:
+                logger.error(f"Failed to process device telemetry from {device_id}: {e}")
+        
+        def process_device_heartbeat(self, device_id, payload):
+            """Process device heartbeat messages"""
+            try:
+                heartbeat = json.loads(payload)
+                timestamp = heartbeat.get('timestamp', datetime.utcnow().isoformat())
+                
+                # Update device last seen
+                self.devices[device_id] = {
+                    'last_seen': timestamp,
+                    'status': 'online'
+                }
+                
+                logger.debug(f"Heartbeat from device {device_id}")
+                
+            except Exception as e:
+                logger.error(f"Failed to process heartbeat from {device_id}: {e}")
+        
+        def process_sensor_readings(self, device_id, payload):
+            """Process sensor readings"""
+            try:
+                readings = json.loads(payload)
+                
+                for sensor_name, value in readings.items():
+                    logger.debug(f"Sensor {device_id}.{sensor_name}: {value}")
+                    
+                    # Store in time series (simplified)
+                    # In a real implementation, this would go to a time series database
+                
+            except Exception as e:
+                logger.error(f"Failed to process sensor readings from {device_id}: {e}")
+        
+        def update_device_registry(self, device_id, category, message_type, payload):
+            """Update the device registry with latest information"""
+            if device_id not in self.devices:
+                self.devices[device_id] = {
+                    'id': device_id,
+                    'category': category,
+                    'first_seen': datetime.utcnow().isoformat(),
+                    'status': 'online'
+                }
+            
+            self.devices[device_id].update({
+                'last_seen': datetime.utcnow().isoformat(),
+                'last_message_type': message_type
+            })
+        
+        def trigger_alert(self, device_id, metric, value, alert_type):
+            """Trigger an alert for device issues"""
+            alert = {
+                "device_id": device_id,
+                "metric": metric,
+                "value": value,
+                "alert_type": alert_type,
+                "timestamp": datetime.utcnow().isoformat(),
+                "severity": self.get_alert_severity(alert_type)
+            }
+            
+            logger.warning(f"ALERT: {alert}")
+            
+            # Forward alert to cloud monitoring
+            self.forward_alert_to_cloud(alert)
+        
+        def get_alert_severity(self, alert_type):
+            """Get alert severity based on type"""
+            severity_map = {
+                "out_of_range": "warning",
+                "motion_detected": "info",
+                "low_battery": "warning",
+                "device_offline": "critical",
+                "high_usage": "warning"
+            }
+            return severity_map.get(alert_type, "info")
+        
+        def forward_to_cloud(self, device_id, data):
+            """Forward device data to cloud systems"""
+            try:
+                # Create cloud event
+                cloud_event = {
+                    "specversion": "1.0",
+                    "type": "io.homelab.edge.device.data",
+                    "source": f"edge-device/{device_id}",
+                    "id": f"{device_id}-{int(time.time())}",
+                    "time": datetime.utcnow().isoformat(),
+                    "data": data
+                }
+                
+                # Publish to cloud topic (simplified - would use NATS in reality)
+                logger.debug(f"Forwarding data from {device_id} to cloud")
+                
+            except Exception as e:
+                logger.error(f"Failed to forward data to cloud: {e}")
+        
+        def forward_alert_to_cloud(self, alert):
+            """Forward alert to cloud monitoring"""
+            try:
+                # Create alert event
+                alert_event = {
+                    "specversion": "1.0",
+                    "type": "io.homelab.edge.alert",
+                    "source": "edge-device-manager",
+                    "id": f"alert-{int(time.time())}",
+                    "time": datetime.utcnow().isoformat(),
+                    "data": alert
+                }
+                
+                logger.info(f"Forwarding alert to cloud: {alert}")
+                
+            except Exception as e:
+                logger.error(f"Failed to forward alert to cloud: {e}")
+        
+        def monitor_device_health(self):
+            """Monitor device health and cleanup stale devices"""
+            while True:
+                try:
+                    current_time = datetime.utcnow()
+                    stale_threshold = current_time - timedelta(minutes=5)
+                    
+                    stale_devices = []
+                    for device_id, device_info in self.devices.items():
+                        last_seen_str = device_info.get('last_seen')
+                        if last_seen_str:
+                            last_seen = datetime.fromisoformat(last_seen_str.replace('Z', '+00:00'))
+                            if last_seen < stale_threshold:
+                                stale_devices.append(device_id)
+                    
+                    # Mark stale devices as offline
+                    for device_id in stale_devices:
+                        if self.devices[device_id]['status'] != 'offline':
+                            self.devices[device_id]['status'] = 'offline'
+                            self.trigger_alert(device_id, "status", "offline", "device_offline")
+                    
+                    logger.info(f"Monitoring {len(self.devices)} devices, {len(stale_devices)} stale")
+                    
+                except Exception as e:
+                    logger.error(f"Error in device health monitoring: {e}")
+                
+                time.sleep(60)  # Check every minute
+        
+        def run(self):
+            """Main device manager loop"""
+            logger.info("Starting Edge Device Manager")
+            
+            # Start metrics server
+            start_http_server(8080)
+            
+            # Start device health monitoring in background
+            health_thread = threading.Thread(target=self.monitor_device_health)
+            health_thread.daemon = True
+            health_thread.start()
+            
+            # Connect to MQTT broker
+            try:
+                self.mqtt_client.connect(self.mqtt_broker, self.mqtt_port, 60)
+                self.mqtt_client.loop_forever()
+            except Exception as e:
+                logger.error(f"Failed to connect to MQTT broker: {e}")
+                
+            logger.info("Edge Device Manager stopped")
+    
+    if __name__ == "__main__":
+        manager = EdgeDeviceManager()
+        manager.run()
+
+---
+# Edge AI Inference Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-ai-inference
+  namespace: edge
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: edge-ai-inference
+  template:
+    metadata:
+      labels:
+        app: edge-ai-inference
+    spec:
+      # Run on ARM64 for balanced performance/efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: inference
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install tensorflow-lite opencv-python numpy pillow flask
+          python3 /app/edge_inference.py
+        volumeMounts:
+        - name: inference-app
+          mountPath: /app
+        - name: models
+          mountPath: /models
+        ports:
+        - containerPort: 5000
+          name: http
+        env:
+        - name: MODEL_PATH
+          value: "/models"
+        - name: INFERENCE_BACKEND
+          value: "tflite"  # TensorFlow Lite for edge
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+      volumes:
+      - name: inference-app
+        configMap:
+          name: edge-inference-app
+      - name: models
+        persistentVolumeClaim:
+          claimName: edge-models
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-inference-app
+  namespace: edge
+data:
+  edge_inference.py: |
+    #!/usr/bin/env python3
+    import os
+    import json
+    import numpy as np
+    from flask import Flask, request, jsonify
+    import tensorflow.lite as tflite
+    from PIL import Image
+    import logging
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    app = Flask(__name__)
+    
+    class EdgeInference:
+        def __init__(self):
+            self.model_path = os.getenv("MODEL_PATH", "/models")
+            self.models = {}
+            self.load_models()
+        
+        def load_models(self):
+            """Load TensorFlow Lite models"""
+            try:
+                model_files = [f for f in os.listdir(self.model_path) if f.endswith('.tflite')]
+                
+                for model_file in model_files:
+                    model_name = model_file.replace('.tflite', '')
+                    model_path = os.path.join(self.model_path, model_file)
+                    
+                    # Load TFLite model
+                    interpreter = tflite.Interpreter(model_path=model_path)
+                    interpreter.allocate_tensors()
+                    
+                    self.models[model_name] = {
+                        'interpreter': interpreter,
+                        'input_details': interpreter.get_input_details(),
+                        'output_details': interpreter.get_output_details()
+                    }
+                    
+                    logger.info(f"Loaded model: {model_name}")
+                
+                if not self.models:
+                    logger.warning("No TFLite models found, creating demo model")
+                    self.create_demo_model()
+                    
+            except Exception as e:
+                logger.error(f"Failed to load models: {e}")
+                self.create_demo_model()
+        
+        def create_demo_model(self):
+            """Create a demo model for testing"""
+            # This would create a simple demo model
+            logger.info("Created demo inference model")
+        
+        def preprocess_image(self, image_data, input_shape):
+            """Preprocess image for inference"""
+            try:
+                # Load image
+                image = Image.open(image_data)
+                
+                # Resize to model input size
+                target_size = (input_shape[1], input_shape[2])
+                image = image.resize(target_size)
+                
+                # Convert to array and normalize
+                image_array = np.array(image, dtype=np.float32)
+                if len(image_array.shape) == 3:
+                    image_array = np.expand_dims(image_array, axis=0)
+                
+                # Normalize to [0, 1]
+                image_array = image_array / 255.0
+                
+                return image_array
+                
+            except Exception as e:
+                logger.error(f"Failed to preprocess image: {e}")
+                return None
+        
+        def run_inference(self, model_name, input_data):
+            """Run inference on input data"""
+            try:
+                if model_name not in self.models:
+                    return {"error": f"Model {model_name} not found"}
+                
+                model = self.models[model_name]
+                interpreter = model['interpreter']
+                input_details = model['input_details']
+                output_details = model['output_details']
+                
+                # Set input tensor
+                interpreter.set_tensor(input_details[0]['index'], input_data)
+                
+                # Run inference
+                interpreter.invoke()
+                
+                # Get output
+                output_data = interpreter.get_tensor(output_details[0]['index'])
+                
+                return {
+                    "model": model_name,
+                    "predictions": output_data.tolist(),
+                    "shape": output_data.shape
+                }
+                
+            except Exception as e:
+                logger.error(f"Inference failed for model {model_name}: {e}")
+                return {"error": str(e)}
+    
+    # Initialize inference engine
+    inference_engine = EdgeInference()
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        return jsonify({"status": "healthy", "models": list(inference_engine.models.keys())})
+    
+    @app.route('/models', methods=['GET'])
+    def list_models():
+        models_info = {}
+        for name, model in inference_engine.models.items():
+            models_info[name] = {
+                "input_shape": model['input_details'][0]['shape'].tolist(),
+                "output_shape": model['output_details'][0]['shape'].tolist()
+            }
+        return jsonify(models_info)
+    
+    @app.route('/predict/<model_name>', methods=['POST'])
+    def predict(model_name):
+        try:
+            if 'image' in request.files:
+                # Image inference
+                image_file = request.files['image']
+                if model_name in inference_engine.models:
+                    input_shape = inference_engine.models[model_name]['input_details'][0]['shape']
+                    processed_image = inference_engine.preprocess_image(image_file, input_shape)
+                    
+                    if processed_image is not None:
+                        result = inference_engine.run_inference(model_name, processed_image)
+                        return jsonify(result)
+                    else:
+                        return jsonify({"error": "Failed to preprocess image"}), 400
+                else:
+                    return jsonify({"error": f"Model {model_name} not found"}), 404
+            
+            elif request.is_json:
+                # JSON data inference
+                data = request.get_json()
+                input_array = np.array(data['input'], dtype=np.float32)
+                result = inference_engine.run_inference(model_name, input_array)
+                return jsonify(result)
+            
+            else:
+                return jsonify({"error": "Invalid input format"}), 400
+                
+        except Exception as e:
+            logger.error(f"Prediction failed: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=5000)
+
+---
+# Edge Data Processing Pipeline
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-data-processor
+  namespace: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-data-processor
+  template:
+    metadata:
+      labels:
+        app: edge-data-processor
+    spec:
+      containers:
+      - name: processor
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install pandas numpy redis prometheus-client
+          python3 /app/edge_processor.py
+        volumeMounts:
+        - name: processor-app
+          mountPath: /app
+        env:
+        - name: REDIS_URL
+          value: "redis://edge-redis:6379"
+        - name: PROCESSING_INTERVAL
+          value: "10"
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: processor-app
+        configMap:
+          name: edge-processor-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-processor-app
+  namespace: edge
+data:
+  edge_processor.py: |
+    #!/usr/bin/env python3
+    import os
+    import time
+    import json
+    import redis
+    import pandas as pd
+    import numpy as np
+    from datetime import datetime, timedelta
+    from prometheus_client import Gauge, Counter, start_http_server
+    import logging
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Metrics
+    EDGE_DATA_PROCESSED = Counter('edge_data_processed_total', 'Total data points processed', ['data_type'])
+    EDGE_PROCESSING_TIME = Gauge('edge_processing_time_seconds', 'Time spent processing data')
+    EDGE_QUEUE_SIZE = Gauge('edge_queue_size', 'Size of processing queue')
+    
+    class EdgeDataProcessor:
+        def __init__(self):
+            self.redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+            self.processing_interval = int(os.getenv("PROCESSING_INTERVAL", "10"))
+            
+        def process_sensor_data(self, data_points):
+            """Process sensor data with edge analytics"""
+            try:
+                if not data_points:
+                    return
+                
+                # Convert to DataFrame for analysis
+                df = pd.DataFrame(data_points)
+                
+                # Basic statistics
+                stats = {
+                    'count': len(df),
+                    'mean_temperature': df['temperature'].mean() if 'temperature' in df else None,
+                    'mean_humidity': df['humidity'].mean() if 'humidity' in df else None,
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                
+                # Anomaly detection (simple threshold-based)
+                anomalies = []
+                for _, row in df.iterrows():
+                    if 'temperature' in row and (row['temperature'] > 35 or row['temperature'] < -10):
+                        anomalies.append({
+                            'device_id': row.get('device_id'),
+                            'metric': 'temperature',
+                            'value': row['temperature'],
+                            'type': 'threshold_exceeded'
+                        })
+                
+                # Store processed results
+                result = {
+                    'statistics': stats,
+                    'anomalies': anomalies,
+                    'processed_at': datetime.utcnow().isoformat()
+                }
+                
+                # Cache results
+                self.redis_client.setex(
+                    f"processed:sensor:{int(time.time())}", 
+                    3600,  # 1 hour TTL
+                    json.dumps(result)
+                )
+                
+                EDGE_DATA_PROCESSED.labels(data_type='sensor').inc(len(data_points))
+                logger.info(f"Processed {len(data_points)} sensor data points, found {len(anomalies)} anomalies")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"Failed to process sensor data: {e}")
+                return None
+        
+        def process_camera_data(self, data_points):
+            """Process camera data with edge analytics"""
+            try:
+                # Simplified camera data processing
+                motion_events = []
+                for data_point in data_points:
+                    if data_point.get('motion_detected'):
+                        motion_events.append({
+                            'device_id': data_point.get('device_id'),
+                            'timestamp': data_point.get('timestamp'),
+                            'confidence': data_point.get('confidence', 0.5)
+                        })
+                
+                result = {
+                    'motion_events': motion_events,
+                    'total_frames': len(data_points),
+                    'motion_ratio': len(motion_events) / len(data_points) if data_points else 0
+                }
+                
+                EDGE_DATA_PROCESSED.labels(data_type='camera').inc(len(data_points))
+                logger.info(f"Processed {len(data_points)} camera frames, detected {len(motion_events)} motion events")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"Failed to process camera data: {e}")
+                return None
+        
+        def aggregate_device_data(self):
+            """Aggregate data from multiple devices"""
+            try:
+                # Get data from Redis queues
+                sensor_data = []
+                camera_data = []
+                
+                # Process sensor queue
+                while True:
+                    data = self.redis_client.rpop("queue:sensor_data")
+                    if not data:
+                        break
+                    sensor_data.append(json.loads(data))
+                
+                # Process camera queue
+                while True:
+                    data = self.redis_client.rpop("queue:camera_data")
+                    if not data:
+                        break
+                    camera_data.append(json.loads(data))
+                
+                # Update queue size metrics
+                EDGE_QUEUE_SIZE.set(len(sensor_data) + len(camera_data))
+                
+                # Process data types
+                results = {}
+                
+                if sensor_data:
+                    start_time = time.time()
+                    results['sensor'] = self.process_sensor_data(sensor_data)
+                    EDGE_PROCESSING_TIME.set(time.time() - start_time)
+                
+                if camera_data:
+                    start_time = time.time()
+                    results['camera'] = self.process_camera_data(camera_data)
+                    EDGE_PROCESSING_TIME.set(time.time() - start_time)
+                
+                return results
+                
+            except Exception as e:
+                logger.error(f"Failed to aggregate device data: {e}")
+                return {}
+        
+        def run(self):
+            """Main processing loop"""
+            logger.info("Starting Edge Data Processor")
+            
+            # Start metrics server
+            start_http_server(8080)
+            
+            while True:
+                try:
+                    results = self.aggregate_device_data()
+                    
+                    if results:
+                        logger.info(f"Processing cycle completed: {len(results)} data types processed")
+                    
+                except Exception as e:
+                    logger.error(f"Error in processing cycle: {e}")
+                
+                time.sleep(self.processing_interval)
+    
+    if __name__ == "__main__":
+        processor = EdgeDataProcessor()
+        processor.run()
+
+---
+# Redis for Edge Data Caching
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-redis
+  namespace: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-redis
+  template:
+    metadata:
+      labels:
+        app: edge-redis
+    spec:
+      # Run on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: redis
+        image: redis:7.0-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        args:
+        - redis-server
+        - --appendonly
+        - "yes"
+        - --maxmemory
+        - "256mb"
+        - --maxmemory-policy
+        - "allkeys-lru"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: edge-redis-data
+
+---
+# Persistent Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: edge-mqtt-data
+  namespace: edge
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: edge-models
+  namespace: edge
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: edge-redis-data
+  namespace: edge
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: longhorn-ssd
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeedge-cloudcore
+  namespace: edge
+spec:
+  selector:
+    app: kubeedge-cloudcore
+  ports:
+  - name: cloudhub
+    port: 10000
+    targetPort: 10000
+  - name: edgecontroller
+    port: 10002
+    targetPort: 10002
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-mqtt
+  namespace: edge
+spec:
+  selector:
+    app: edge-mqtt
+  ports:
+  - name: mqtt
+    port: 1883
+    targetPort: 1883
+  - name: websocket
+    port: 9001
+    targetPort: 9001
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-device-manager
+  namespace: edge
+spec:
+  selector:
+    app: edge-device-manager
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-ai-inference
+  namespace: edge
+spec:
+  selector:
+    app: edge-ai-inference
+  ports:
+  - port: 5000
+    targetPort: 5000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-data-processor
+  namespace: edge
+spec:
+  selector:
+    app: edge-data-processor
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-redis
+  namespace: edge
+spec:
+  selector:
+    app: edge-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeedge-cloudcore
+  namespace: edge
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edge-device-manager
+  namespace: edge
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeedge-cloudcore
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "services", "endpoints", "namespaces", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edge-device-manager
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeedge-cloudcore
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeedge-cloudcore
+subjects:
+- kind: ServiceAccount
+  name: kubeedge-cloudcore
+  namespace: edge
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: edge-device-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edge-device-manager
+subjects:
+- kind: ServiceAccount
+  name: edge-device-manager
+  namespace: edge
+
+---
+# Secrets Template
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubeedge-certs
+  namespace: edge
+type: Opaque
+data:
+  # Base64 encoded certificates (to be replaced with actual certs)
+  ca.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t
+  cloudcore.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t
+  cloudcore.key: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t

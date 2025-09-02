@@ -1,0 +1,924 @@
+# Flagger Progressive Delivery for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flagger-system
+  labels:
+    name: flagger-system
+
+---
+# Flagger configuration for multi-arch deployments
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flagger-config
+  namespace: flagger-system
+data:
+  config.yaml: |
+    # Flagger configuration for multi-architecture homelab
+    metrics:
+      interval: "30s"
+      threshold: 5
+      query: |
+        histogram_quantile(0.99,
+          sum(rate(http_request_duration_seconds_bucket{job="linkerd-proxy"}[30s]))
+          by (le, dst_deployment, dst_namespace)
+        )
+      
+    architectures:
+      amd64:
+        canary:
+          # More aggressive canary on AMD64 (higher capacity)
+          maxWeight: 50
+          stepWeight: 10
+          threshold: 5
+          iterations: 5
+        
+      arm64:
+        canary:
+          # Conservative canary on ARM64 (balanced)
+          maxWeight: 30
+          stepWeight: 5
+          threshold: 3
+          iterations: 6
+        
+      arm:
+        canary:
+          # Very conservative on ARM (limited resources)
+          maxWeight: 20
+          stepWeight: 5
+          threshold: 2
+          iterations: 4
+    
+    notifications:
+      slack:
+        webhook_url: ""
+        channel: "#deployments"
+        username: "Flagger"
+      
+    analysis:
+      # Architecture-aware success rate thresholds
+      amd64_success_rate: 99.0
+      arm64_success_rate: 97.0  # Slightly more tolerant
+      arm_success_rate: 95.0    # Most tolerant for edge devices
+      
+      # Latency thresholds by architecture
+      amd64_latency_p99: 100   # 100ms
+      arm64_latency_p99: 300   # 300ms
+      arm_latency_p99: 1000    # 1000ms
+
+---
+# Flagger deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flagger
+  namespace: flagger-system
+  labels:
+    app.kubernetes.io/name: flagger
+    app.kubernetes.io/version: "1.32.0"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flagger
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flagger
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      # Prefer AMD64 for Flagger controller
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      serviceAccountName: flagger
+      containers:
+      - name: flagger
+        image: ghcr.io/fluxcd/flagger:1.32.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: http-metrics
+          containerPort: 8080
+        command:
+        - ./flagger
+        - -log-level=info
+        - -metrics-addr=:8080
+        - -mesh-provider=linkerd
+        - -metrics-server=http://prometheus:9090
+        - -slack-url=$(SLACK_URL)
+        env:
+        - name: SLACK_URL
+          valueFrom:
+            secretKeyRef:
+              name: slack
+              key: url
+              optional: true
+        livenessProbe:
+          exec:
+            command:
+            - wget
+            - --quiet
+            - --tries=1
+            - --timeout=4
+            - --spider
+            - http://localhost:8080/healthz
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - wget
+            - --quiet
+            - --tries=1
+            - --timeout=4
+            - --spider
+            - http://localhost:8080/healthz
+          timeoutSeconds: 5
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "32Mi"
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+        securityContext:
+          readOnlyRootFilesystem: true
+          runAsUser: 10001
+        volumeMounts:
+        - name: config
+          mountPath: /etc/flagger
+      volumes:
+      - name: config
+        configMap:
+          name: flagger-config
+
+---
+# Prometheus for Flagger metrics
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: flagger-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      # Run on ARM64 for power efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      serviceAccountName: prometheus
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.47.0
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.path=/prometheus/
+        - --web.console.libraries=/etc/prometheus/console_libraries
+        - --web.console.templates=/etc/prometheus/consoles
+        - --web.enable-lifecycle
+        - --web.route-prefix=/
+        ports:
+        - containerPort: 9090
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: storage
+          mountPath: /prometheus
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+      - name: storage
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: flagger-system
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files: []
+
+    scrape_configs:
+    - job_name: 'kubernetes-pods'
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: kubernetes_namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: kubernetes_pod_name
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        action: replace
+        target_label: kubernetes_node
+      - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+        action: replace
+        target_label: node_architecture
+
+    - job_name: 'linkerd-proxy'
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        action: keep
+        regex: linkerd-proxy
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        action: keep
+        regex: linkerd-admin
+      - source_labels: [__meta_kubernetes_pod_annotation_linkerd_io_proxy_job_name]
+        action: replace
+        target_label: __job_name
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - action: labeldrop
+        regex: __meta_kubernetes_pod_label_linkerd_io_control_plane_ns
+      - action: labeldrop
+        regex: __meta_kubernetes_pod_label_linkerd_io_proxy_uid
+
+---
+# Load tester deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-tester
+  namespace: flagger-system
+  labels:
+    app: load-tester
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: load-tester
+  template:
+    metadata:
+      labels:
+        app: load-tester
+      annotations:
+        linkerd.io/inject: enabled
+    spec:
+      containers:
+      - name: load-tester
+        image: ghcr.io/fluxcd/flagger-loadtester:0.27.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+        command:
+        - ./loadtester
+        - -port=8080
+        - -log-level=info
+        - -timeout=1h
+        livenessProbe:
+          exec:
+            command:
+            - wget
+            - --quiet
+            - --tries=1
+            - --timeout=4
+            - --spider
+            - http://localhost:8080/healthz
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - wget
+            - --quiet
+            - --tries=1
+            - --timeout=4
+            - --spider
+            - http://localhost:8080/healthz
+          timeoutSeconds: 5
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "64Mi"
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+
+---
+# Example canary deployment for dashboard
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: dashboard-ui
+  namespace: default
+spec:
+  # Target deployment
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: dashboard-ui
+  
+  # Progressive traffic shifting
+  progressDeadlineSeconds: 60
+  service:
+    port: 3000
+    targetPort: 3000
+    gateways:
+    - public-gateway.istio-system.svc.cluster.local
+    hosts:
+    - dashboard.homelab.local
+  
+  # Canary analysis with architecture awareness
+  analysis:
+    # Schedule interval
+    interval: 30s
+    # Max number of failed metric checks before rollback
+    threshold: 5
+    # Max traffic percentage routed to canary
+    maxWeight: 50
+    # Canary increment step
+    stepWeight: 10
+    # Promotion criteria
+    metrics:
+    - name: request-success-rate
+      # Linkerd success rate
+      thresholdRange:
+        min: 99
+      interval: 30s
+    - name: request-duration
+      # Linkerd request duration P99
+      thresholdRange:
+        max: 500
+      interval: 30s
+    # Load testing
+    webhooks:
+    - name: acceptance-test
+      type: pre-rollout
+      url: http://load-tester.flagger-system/
+      timeout: 30s
+      metadata:
+        type: bash
+        cmd: "curl -sd 'test' http://dashboard-ui-canary.default:3000/ | grep OK"
+    - name: load-test
+      type: rollout
+      url: http://load-tester.flagger-system/
+      metadata:
+        cmd: "hey -z 1m -q 10 -c 2 http://dashboard-ui-canary.default:3000/"
+
+---
+# Architecture-specific canary for ML serving
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: sklearn-serving-arm64
+  namespace: ml-serving
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sklearn-serving-arm64
+  
+  progressDeadlineSeconds: 60
+  service:
+    port: 8000
+    targetPort: 8000
+  
+  # ARM64-specific analysis (more conservative)
+  analysis:
+    interval: 60s  # Longer interval for ARM64
+    threshold: 3   # Lower threshold (more tolerant)
+    maxWeight: 30  # Lower max weight
+    stepWeight: 5  # Smaller steps
+    metrics:
+    - name: request-success-rate
+      thresholdRange:
+        min: 97  # More tolerant for ARM64
+      interval: 60s
+    - name: request-duration
+      thresholdRange:
+        max: 800  # Higher latency tolerance for ARM64
+      interval: 60s
+    webhooks:
+    - name: ml-acceptance-test
+      type: pre-rollout
+      url: http://load-tester.flagger-system/
+      timeout: 30s
+      metadata:
+        type: bash
+        cmd: |
+          curl -X POST -H "Content-Type: application/json" \
+            -d '{"instances": [[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]], "model_name": "default"}' \
+            http://sklearn-serving-arm64-canary.ml-serving:8000/predict | jq .predictions
+    - name: ml-load-test
+      type: rollout
+      url: http://load-tester.flagger-system/
+      metadata:
+        cmd: |
+          # Simulated ML inference load test
+          for i in {1..60}; do
+            curl -X POST -H "Content-Type: application/json" \
+              -d '{"instances": [[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]], "model_name": "default"}' \
+              http://sklearn-serving-arm64-canary.ml-serving:8000/predict > /dev/null
+            sleep 1
+          done
+
+---
+# Event-driven canary automation
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-automation
+  namespace: flagger-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: canary-automation
+  template:
+    metadata:
+      labels:
+        app: canary-automation
+    spec:
+      serviceAccountName: canary-automation
+      containers:
+      - name: automation
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes asyncio-nats-client
+          python3 /app/canary_automation.py
+        volumeMounts:
+        - name: automation-app
+          mountPath: /app
+        env:
+        - name: NATS_URL
+          value: "nats://apps:apps123@nats.event-driven:4222"
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: automation-app
+        configMap:
+          name: canary-automation-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: canary-automation-app
+  namespace: flagger-system
+data:
+  canary_automation.py: |
+    #!/usr/bin/env python3
+    import asyncio
+    import json
+    import logging
+    import os
+    from datetime import datetime
+    from kubernetes import client, config
+    import nats
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    class CanaryAutomation:
+        def __init__(self):
+            # Initialize Kubernetes client
+            config.load_incluster_config()
+            self.k8s_apps = client.AppsV1Api()
+            self.k8s_custom = client.CustomObjectsApi()
+            
+            self.nats_client = None
+            
+        async def connect_nats(self):
+            """Connect to NATS for event-driven automation"""
+            nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
+            
+            try:
+                self.nats_client = await nats.connect(nats_url)
+                logger.info(f"Connected to NATS at {nats_url}")
+            except Exception as e:
+                logger.error(f"Failed to connect to NATS: {e}")
+                raise
+        
+        async def handle_deployment_event(self, msg):
+            """Handle deployment events and trigger canary if needed"""
+            try:
+                event_data = json.loads(msg.data.decode())
+                
+                if "deployment.scaled" in event_data.get("type", ""):
+                    deployment_name = event_data.get("data", {}).get("deployment")
+                    namespace = event_data.get("data", {}).get("namespace")
+                    architecture = event_data.get("architecture", "unknown")
+                    
+                    logger.info(f"Deployment scaled: {deployment_name} in {namespace} on {architecture}")
+                    
+                    # Check if this deployment has a canary
+                    canary = await self.get_canary(deployment_name, namespace)
+                    
+                    if canary:
+                        # Trigger canary analysis if conditions are met
+                        await self.trigger_canary_analysis(canary, architecture)
+                
+                await msg.ack()
+                
+            except Exception as e:
+                logger.error(f"Failed to handle deployment event: {e}")
+                await msg.nak()
+        
+        async def get_canary(self, deployment_name: str, namespace: str):
+            """Get canary resource for deployment"""
+            try:
+                canaries = self.k8s_custom.list_namespaced_custom_object(
+                    group="flagger.app",
+                    version="v1beta1", 
+                    namespace=namespace,
+                    plural="canaries"
+                )
+                
+                for canary in canaries.get("items", []):
+                    target_ref = canary.get("spec", {}).get("targetRef", {})
+                    if target_ref.get("name") == deployment_name:
+                        return canary
+                
+                return None
+                
+            except Exception as e:
+                logger.error(f"Failed to get canary for {deployment_name}: {e}")
+                return None
+        
+        async def trigger_canary_analysis(self, canary, architecture: str):
+            """Trigger canary analysis with architecture-specific parameters"""
+            try:
+                canary_name = canary["metadata"]["name"]
+                namespace = canary["metadata"]["namespace"]
+                
+                logger.info(f"Triggering canary analysis for {canary_name} on {architecture}")
+                
+                # Get architecture-specific configuration
+                arch_config = self.get_architecture_config(architecture)
+                
+                # Update canary analysis parameters based on architecture
+                patch_body = {
+                    "spec": {
+                        "analysis": {
+                            "maxWeight": arch_config["maxWeight"],
+                            "stepWeight": arch_config["stepWeight"],
+                            "threshold": arch_config["threshold"]
+                        }
+                    }
+                }
+                
+                # Apply the patch
+                self.k8s_custom.patch_namespaced_custom_object(
+                    group="flagger.app",
+                    version="v1beta1",
+                    namespace=namespace,
+                    plural="canaries",
+                    name=canary_name,
+                    body=patch_body
+                )
+                
+                logger.info(f"Updated canary {canary_name} with {architecture}-specific config")
+                
+                # Send notification event
+                await self.send_canary_notification(canary_name, namespace, architecture, "triggered")
+                
+            except Exception as e:
+                logger.error(f"Failed to trigger canary analysis: {e}")
+        
+        def get_architecture_config(self, architecture: str):
+            """Get architecture-specific canary configuration"""
+            configs = {
+                "amd64": {"maxWeight": 50, "stepWeight": 10, "threshold": 5},
+                "arm64": {"maxWeight": 30, "stepWeight": 5, "threshold": 3},
+                "arm": {"maxWeight": 20, "stepWeight": 5, "threshold": 2}
+            }
+            
+            return configs.get(architecture, configs["amd64"])
+        
+        async def send_canary_notification(self, canary_name: str, namespace: str, architecture: str, status: str):
+            """Send canary status notification"""
+            if not self.nats_client:
+                return
+                
+            notification = {
+                "type": "homelab.canary.status",
+                "source": "flagger/automation",
+                "data": {
+                    "canary": canary_name,
+                    "namespace": namespace,
+                    "architecture": architecture,
+                    "status": status,
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+            
+            await self.nats_client.publish(
+                "events.canary",
+                json.dumps(notification).encode()
+            )
+            
+            logger.info(f"Sent canary notification: {canary_name} {status}")
+        
+        async def monitor_canary_status(self):
+            """Monitor canary status and send notifications"""
+            while True:
+                try:
+                    # Get all canaries across all namespaces
+                    canaries = self.k8s_custom.list_cluster_custom_object(
+                        group="flagger.app",
+                        version="v1beta1",
+                        plural="canaries"
+                    )
+                    
+                    for canary in canaries.get("items", []):
+                        name = canary["metadata"]["name"]
+                        namespace = canary["metadata"]["namespace"]
+                        status = canary.get("status", {})
+                        phase = status.get("phase", "Initializing")
+                        
+                        # Send status updates for active canaries
+                        if phase in ["Progressing", "Promoting", "Finalising"]:
+                            # Get node architecture from deployment
+                            architecture = await self.get_deployment_architecture(name, namespace)
+                            await self.send_canary_notification(name, namespace, architecture, phase.lower())
+                    
+                    await asyncio.sleep(60)  # Check every minute
+                    
+                except Exception as e:
+                    logger.error(f"Error monitoring canary status: {e}")
+                    await asyncio.sleep(30)
+        
+        async def get_deployment_architecture(self, deployment_name: str, namespace: str):
+            """Get the architecture where deployment is running"""
+            try:
+                deployment = self.k8s_apps.read_namespaced_deployment(deployment_name, namespace)
+                node_selector = deployment.spec.template.spec.node_selector or {}
+                
+                arch = node_selector.get("kubernetes.io/arch", "unknown")
+                return arch
+                
+            except Exception as e:
+                logger.error(f"Failed to get deployment architecture: {e}")
+                return "unknown"
+        
+        async def run(self):
+            """Run the canary automation"""
+            await self.connect_nats()
+            
+            # Subscribe to deployment events
+            await self.nats_client.subscribe(
+                "events.system",
+                cb=self.handle_deployment_event
+            )
+            
+            # Start monitoring canary status
+            await asyncio.gather(
+                self.monitor_canary_status()
+            )
+
+    async def main():
+        automation = CanaryAutomation()
+        await automation.run()
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: flagger
+  namespace: flagger-system
+  labels:
+    app.kubernetes.io/name: flagger
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8080
+    protocol: TCP
+    targetPort: http
+  selector:
+    app.kubernetes.io/name: flagger
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: flagger-system
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - port: 9090
+    targetPort: 9090
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: load-tester
+  namespace: flagger-system
+spec:
+  type: ClusterIP
+  selector:
+    app: load-tester
+  ports:
+  - name: http
+    port: 80
+    protocol: TCP
+    targetPort: http
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flagger
+  namespace: flagger-system
+  labels:
+    app.kubernetes.io/name: flagger
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: flagger-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: canary-automation
+  namespace: flagger-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: flagger
+  labels:
+    app.kubernetes.io/name: flagger
+rules:
+- apiGroups: [""]
+  resources: ["events", "configmaps", "secrets", "services", "endpoints"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "replicasets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["extensions", "networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["flagger.app"]
+  resources: ["canaries", "metrictemplates", "alertproviders"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["networking.istio.io"]
+  resources: ["virtualservices", "destinationrules"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["split.smi-spec.io"]
+  resources: ["trafficsplits"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: canary-automation
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["flagger.app"]
+  resources: ["canaries"]
+  verbs: ["get", "list", "watch", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: flagger
+  labels:
+    app.kubernetes.io/name: flagger
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: flagger
+subjects:
+- kind: ServiceAccount
+  name: flagger
+  namespace: flagger-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: flagger-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: canary-automation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: canary-automation
+subjects:
+- kind: ServiceAccount
+  name: canary-automation
+  namespace: flagger-system

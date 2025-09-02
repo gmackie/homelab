@@ -1,0 +1,1236 @@
+# Litmus Chaos Engineering for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: litmus
+  labels:
+    name: litmus
+
+---
+# Litmus configuration for multi-arch chaos testing
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litmus-config
+  namespace: litmus
+data:
+  config.yaml: |
+    # Litmus configuration for multi-architecture chaos testing
+    chaos:
+      # Architecture-specific chaos experiments
+      architectures:
+        amd64:
+          experiments:
+            - pod-delete
+            - node-cpu-hog
+            - node-memory-hog
+            - disk-fill
+            - network-latency
+          severity: medium  # Can handle more aggressive chaos
+          
+        arm64:
+          experiments:
+            - pod-delete
+            - node-cpu-hog
+            - network-latency
+            - container-kill
+          severity: low     # More conservative for ARM64
+          
+        arm:
+          experiments:
+            - pod-delete
+            - container-kill
+          severity: minimal # Very conservative for edge devices
+      
+      # Experiment parameters by architecture
+      parameters:
+        amd64:
+          cpu_hog_percentage: 80
+          memory_percentage: 70
+          network_latency_ms: 100
+          
+        arm64:
+          cpu_hog_percentage: 60
+          memory_percentage: 50
+          network_latency_ms: 200
+          
+        arm:
+          cpu_hog_percentage: 40
+          memory_percentage: 30
+          network_latency_ms: 300
+      
+      # Service-specific chaos rules
+      service_chaos:
+        critical_services:
+          - name: "dashboard-api"
+            experiments: ["pod-delete"]
+            frequency: "weekly"
+            
+        resilient_services:
+          - name: "nats"
+            experiments: ["pod-delete", "network-partition"]
+            frequency: "daily"
+            
+        ml_services:
+          - name: "sklearn-serving-arm64"
+            experiments: ["pod-delete", "cpu-hog"]
+            frequency: "weekly"
+
+---
+# Litmus ChaosCenter (Control Plane)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-center-frontend
+  namespace: litmus
+  labels:
+    component: chaos-center-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: chaos-center-frontend
+  template:
+    metadata:
+      labels:
+        component: chaos-center-frontend
+    spec:
+      # Run on AMD64 for web UI
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      serviceAccountName: litmus-frontend
+      containers:
+      - name: chaos-center-frontend
+        image: litmuschaos/litmusportal-frontend:3.3.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8185
+        env:
+        - name: AGENT_SCOPE
+          value: cluster
+        - name: AGENT_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: IS_AGENT
+          value: "true"
+        - name: COMPONENT_NAME
+          value: "chaos-center-frontend"
+        - name: CHAOS_CENTER_SCOPE
+          value: cluster
+        resources:
+          requests:
+            memory: "250Mi"
+            cpu: "125m"
+          limits:
+            memory: "512Mi"
+            cpu: "550m"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-center-backend
+  namespace: litmus
+  labels:
+    component: chaos-center-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: chaos-center-backend
+  template:
+    metadata:
+      labels:
+        component: chaos-center-backend
+    spec:
+      # Run on AMD64 for backend processing
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      serviceAccountName: litmus-backend
+      containers:
+      - name: chaos-center-backend
+        image: litmuschaos/litmusportal-server:3.3.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        - containerPort: 8000
+        env:
+        - name: DB_SERVER
+          value: "mongo-service:27017"
+        - name: JWT_SECRET
+          value: "litmus-portal@123"
+        - name: EXTERNAL_AGENT
+          value: "false"
+        - name: AGENT_SCOPE
+          value: cluster
+        - name: AGENT_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: LITMUS_PORTAL_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: CHAOS_CENTER_SCOPE
+          value: cluster
+        - name: SUBSCRIBER_IMAGE
+          value: "litmuschaos/litmusportal-subscriber:3.3.0"
+        - name: EVENT_TRACKER_IMAGE
+          value: "litmuschaos/litmusportal-event-tracker:3.3.0"
+        - name: ARGO_WORKFLOW_CONTROLLER_IMAGE
+          value: "litmuschaos/workflow-controller:v3.4.4"
+        - name: ARGO_WORKFLOW_EXECUTOR_IMAGE
+          value: "litmuschaos/argoexec:v3.4.4"
+        - name: LITMUS_CHAOS_OPERATOR_IMAGE
+          value: "litmuschaos/chaos-operator:3.3.0"
+        - name: LITMUS_CHAOS_RUNNER_IMAGE
+          value: "litmuschaos/chaos-runner:3.3.0"
+        - name: LITMUS_CHAOS_EXPORTER_IMAGE
+          value: "litmuschaos/chaos-exporter:3.3.0"
+        - name: CONTAINER_RUNTIME_EXECUTOR
+          value: "k8sapi"
+        - name: DEFAULT_HUB_BRANCH_NAME
+          value: "v3.3.x"
+        - name: LITMUS_AUTH_GRPC_ENDPOINT
+          value: "chaos-center-auth-server-service"
+        - name: LITMUS_AUTH_GRPC_PORT
+          value: ":3030"
+        - name: WORKFLOW_HELPER_IMAGE_VERSION
+          value: "3.3.0"
+        - name: REMOTE_HUB_MAX_SIZE
+          value: "5000000"
+        - name: INFRA_DEPLOYMENTS
+          value: '["app=chaos-exporter", "name=chaos-operator", "app=event-tracker", "app=workflow-controller"]'
+        resources:
+          requests:
+            memory: "250Mi"
+            cpu: "125m"
+          limits:
+            memory: "712Mi"
+            cpu: "550m"
+        volumeMounts:
+        - name: gitops-storage
+          mountPath: /tmp/
+        - name: hub-storage
+          mountPath: /tmp/version/
+      volumes:
+      - name: gitops-storage
+        emptyDir: {}
+      - name: hub-storage
+        emptyDir: {}
+
+---
+# MongoDB for Litmus (lightweight deployment)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongo
+  namespace: litmus
+  labels:
+    app: mongo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      # Prefer ARM64 for database (good performance, low power)
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: mongo
+        image: mongo:4.2.20
+        ports:
+        - containerPort: 27017
+        imagePullPolicy: Always
+        volumeMounts:
+        - name: mongo-persistent-storage
+          mountPath: /data/db
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          value: "admin"
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          value: "1234"
+        resources:
+          requests:
+            memory: "150Mi"
+            cpu: "125m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: mongo-persistent-storage
+        persistentVolumeClaim:
+          claimName: mongo-pv-claim
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongo-pv-claim
+  namespace: litmus
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: longhorn-ssd
+
+---
+# Architecture-specific Chaos Experiments
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: amd64-node-chaos
+  namespace: litmus
+  labels:
+    name: amd64-node-chaos
+    app.kubernetes.io/part-of: litmus
+    app.kubernetes.io/component: chaosexperiment
+    app.kubernetes.io/version: 3.3.0
+spec:
+  definition:
+    scope: Cluster
+    permissions:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["create","delete","get","list","patch","update", "deletecollection"]
+    - apiGroups: [""]
+      resources: ["events"]
+      verbs: ["create","get","list","patch","update"]
+    - apiGroups: [""]
+      resources: ["configmaps"]
+      verbs: ["create","delete","get","list","patch","update"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get","list","watch"]
+    - apiGroups: [""]
+      resources: ["pods/exec"]
+      verbs: ["get","list","create"]
+    - apiGroups: [""]
+      resources: ["secrets"]
+      verbs: ["get","list"]
+    - apiGroups: [""]
+      resources: ["nodes"]
+      verbs: ["patch","get","list"]
+    image: "litmuschaos/go-runner:3.3.0"
+    imagePullPolicy: Always
+    args:
+    - -c
+    - ./experiments -name node-cpu-hog
+    command:
+    - /bin/bash
+    env:
+    - name: TOTAL_CHAOS_DURATION
+      value: '60'
+    - name: NODE_CPU_CORE
+      value: ''
+    - name: CPU_LOAD
+      value: '80'  # Higher load for AMD64
+    - name: LIB_IMAGE
+      value: 'litmuschaos/go-runner:3.3.0'
+    - name: TARGET_NODE
+      value: ''
+    - name: NODE_LABEL
+      value: 'kubernetes.io/arch=amd64'
+    - name: RAMP_TIME
+      value: ''
+    - name: SEQUENCE
+      value: parallel
+    labels:
+      name: amd64-node-chaos
+      app.kubernetes.io/part-of: litmus
+      app.kubernetes.io/component: experiment-job
+      app.kubernetes.io/version: 3.3.0
+
+---
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: arm64-pod-chaos
+  namespace: litmus
+  labels:
+    name: arm64-pod-chaos
+    app.kubernetes.io/part-of: litmus
+    app.kubernetes.io/component: chaosexperiment
+    app.kubernetes.io/version: 3.3.0
+spec:
+  definition:
+    scope: Namespaced
+    permissions:
+    - apiGroups: [""]
+      resources: ["pods","events"]
+      verbs: ["create","list","get","patch","update","delete","deletecollection"]
+    - apiGroups: [""]
+      resources: ["pods/exec","pods/log","replicationcontrollers"]
+      verbs: ["create","list","get"]
+    - apiGroups: ["apps"]
+      resources: ["daemonsets","deployments","deployments/scale","replicasets","statefulsets"]
+      verbs: ["list","get","patch","update","create"]
+    - apiGroups: ["batch"]
+      resources: ["jobs"]
+      verbs: ["create","list","get","delete","deletecollection"]
+    - apiGroups: ["litmuschaos.io"]
+      resources: ["chaosengines","chaosexperiments","chaosresults"]
+      verbs: ["create","list","get","patch","update"]
+    image: "litmuschaos/go-runner:3.3.0"
+    imagePullPolicy: Always
+    args:
+    - -c
+    - ./experiments -name pod-delete
+    command:
+    - /bin/bash
+    env:
+    - name: TOTAL_CHAOS_DURATION
+      value: "15"
+    - name: CHAOS_INTERVAL
+      value: "5"
+    - name: FORCE
+      value: "false"
+    - name: PODS_AFFECTED_PERC
+      value: "25"  # Conservative for ARM64
+    - name: TARGET_PODS
+      value: ""
+    - name: NODE_LABEL
+      value: "kubernetes.io/arch=arm64"
+    - name: SEQUENCE
+      value: "parallel"
+    labels:
+      name: arm64-pod-chaos
+      app.kubernetes.io/part-of: litmus
+      app.kubernetes.io/component: experiment-job
+      app.kubernetes.io/version: 3.3.0
+
+---
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: arm-minimal-chaos
+  namespace: litmus
+  labels:
+    name: arm-minimal-chaos
+    app.kubernetes.io/part-of: litmus
+    app.kubernetes.io/component: chaosexperiment
+    app.kubernetes.io/version: 3.3.0
+spec:
+  definition:
+    scope: Namespaced
+    permissions:
+    - apiGroups: [""]
+      resources: ["pods","events"]
+      verbs: ["create","list","get","patch","update","delete"]
+    - apiGroups: ["apps"]
+      resources: ["deployments","daemonsets"]
+      verbs: ["list","get"]
+    image: "litmuschaos/go-runner:3.3.0"
+    imagePullPolicy: Always
+    args:
+    - -c
+    - ./experiments -name container-kill
+    command:
+    - /bin/bash
+    env:
+    - name: TOTAL_CHAOS_DURATION
+      value: "10"  # Very short for ARM
+    - name: CHAOS_INTERVAL
+      value: "10"
+    - name: CONTAINER_RUNTIME
+      value: "containerd"
+    - name: SOCKET_PATH
+      value: "/run/containerd/containerd.sock"
+    - name: TARGET_CONTAINER
+      value: ""
+    - name: NODE_LABEL
+      value: "kubernetes.io/arch=arm"
+    - name: PODS_AFFECTED_PERC
+      value: "10"  # Very conservative
+    labels:
+      name: arm-minimal-chaos
+      app.kubernetes.io/part-of: litmus
+      app.kubernetes.io/component: experiment-job
+      app.kubernetes.io/version: 3.3.0
+
+---
+# Multi-Architecture Chaos Engine
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: homelab-multiarch-chaos
+  namespace: litmus
+spec:
+  appinfo:
+    appns: default
+    applabel: "tier=frontend"
+    appkind: "deployment"
+  # Chaos experiment list
+  experiments:
+  - name: amd64-node-chaos
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: '30'
+        - name: CPU_LOAD
+          value: '60'  # Moderate load for testing
+      probe:
+      - name: "dashboard-availability-check"
+        type: "httpProbe"
+        mode: "Continuous"
+        runProperties:
+          probeTimeout: 10
+          retry: 1
+          interval: 2
+          probePollingInterval: 2
+        httpProbe/inputs:
+          url: "http://dashboard-api.default:8080/health"
+          insecureSkipTLSVerify: false
+          method:
+            get:
+              criteria: ==
+              responseCode: "200"
+  
+  - name: arm64-pod-chaos
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: '20'
+        - name: TARGET_PODS
+          value: "sklearn-serving-arm64"
+      probe:
+      - name: "ml-service-check"
+        type: "httpProbe"
+        mode: "SOT"  # Start of Test
+        httpProbe/inputs:
+          url: "http://sklearn-serving.ml-serving:8000/health"
+          method:
+            get:
+              criteria: ==
+              responseCode: "200"
+
+---
+# Chaos Workflow for scheduled experiments
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: multiarch-chaos-workflow
+  namespace: litmus
+spec:
+  entrypoint: chaos-experiment
+  serviceAccountName: argo-chaos
+  templates:
+  - name: chaos-experiment
+    steps:
+    - - name: install-chaos-experiments
+        template: install-chaos-experiments
+    - - name: run-amd64-chaos
+        template: run-amd64-chaos
+        when: "{{workflow.parameters.target-arch}} == amd64 || {{workflow.parameters.target-arch}} == all"
+      - name: run-arm64-chaos
+        template: run-arm64-chaos
+        when: "{{workflow.parameters.target-arch}} == arm64 || {{workflow.parameters.target-arch}} == all"
+      - name: run-arm-chaos
+        template: run-arm-chaos
+        when: "{{workflow.parameters.target-arch}} == arm || {{workflow.parameters.target-arch}} == all"
+    - - name: cleanup
+        template: cleanup
+
+  - name: install-chaos-experiments
+    container:
+      image: litmuschaos/k8s:3.3.0
+      command: [sh, -c]
+      args: ["kubectl apply -f https://hub.litmuschaos.io/api/chaos/3.3.0?file=charts/generic/experiments.yaml"]
+
+  - name: run-amd64-chaos
+    inputs:
+      artifacts:
+      - name: run-amd64-chaos
+        path: /tmp/chaosengine-amd64.yaml
+        raw:
+          data: |
+            apiVersion: litmuschaos.io/v1alpha1
+            kind: ChaosEngine
+            metadata:
+              name: amd64-chaos-engine
+              namespace: litmus
+            spec:
+              appinfo:
+                appns: default
+                applabel: "app=dashboard-api"
+                appkind: "deployment"
+              experiments:
+              - name: node-cpu-hog
+                spec:
+                  components:
+                    env:
+                    - name: TOTAL_CHAOS_DURATION
+                      value: "60"
+                    - name: CPU_LOAD
+                      value: "50"
+                    - name: NODE_LABEL
+                      value: "kubernetes.io/arch=amd64"
+    container:
+      image: litmuschaos/litmus-checker:3.3.0
+      args: ["-file=/tmp/chaosengine-amd64.yaml","-saveName=/tmp/engine-name"]
+
+  - name: run-arm64-chaos
+    inputs:
+      artifacts:
+      - name: run-arm64-chaos
+        path: /tmp/chaosengine-arm64.yaml
+        raw:
+          data: |
+            apiVersion: litmuschaos.io/v1alpha1
+            kind: ChaosEngine
+            metadata:
+              name: arm64-chaos-engine
+              namespace: litmus
+            spec:
+              appinfo:
+                appns: ml-serving
+                applabel: "app=sklearn-serving"
+                appkind: "deployment"
+              experiments:
+              - name: pod-delete
+                spec:
+                  components:
+                    env:
+                    - name: TOTAL_CHAOS_DURATION
+                      value: "30"
+                    - name: PODS_AFFECTED_PERC
+                      value: "50"
+    container:
+      image: litmuschaos/litmus-checker:3.3.0
+      args: ["-file=/tmp/chaosengine-arm64.yaml","-saveName=/tmp/engine-name"]
+
+  - name: run-arm-chaos
+    inputs:
+      artifacts:
+      - name: run-arm-chaos
+        path: /tmp/chaosengine-arm.yaml
+        raw:
+          data: |
+            apiVersion: litmuschaos.io/v1alpha1
+            kind: ChaosEngine
+            metadata:
+              name: arm-chaos-engine
+              namespace: litmus
+            spec:
+              appinfo:
+                appns: event-driven
+                applabel: "app=event-consumer"
+                appkind: "deployment"
+              experiments:
+              - name: container-kill
+                spec:
+                  components:
+                    env:
+                    - name: TOTAL_CHAOS_DURATION
+                      value: "15"
+                    - name: CHAOS_INTERVAL
+                      value: "15"
+    container:
+      image: litmuschaos/litmus-checker:3.3.0
+      args: ["-file=/tmp/chaosengine-arm.yaml","-saveName=/tmp/engine-name"]
+
+  - name: cleanup
+    container:
+      image: litmuschaos/k8s:3.3.0
+      command: [sh, -c]
+      args: ["kubectl delete chaosengine --all -n litmus"]
+
+---
+# Chaos scheduler for automated testing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-scheduler
+  namespace: litmus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chaos-scheduler
+  template:
+    metadata:
+      labels:
+        app: chaos-scheduler
+    spec:
+      serviceAccountName: chaos-scheduler
+      containers:
+      - name: scheduler
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes schedule asyncio-nats-client
+          python3 /app/chaos_scheduler.py
+        volumeMounts:
+        - name: scheduler-app
+          mountPath: /app
+        env:
+        - name: CHAOS_NAMESPACE
+          value: "litmus"
+        - name: NATS_URL
+          value: "nats://apps:apps123@nats.event-driven:4222"
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: scheduler-app
+        configMap:
+          name: chaos-scheduler-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chaos-scheduler-app
+  namespace: litmus
+data:
+  chaos_scheduler.py: |
+    #!/usr/bin/env python3
+    import asyncio
+    import json
+    import logging
+    import os
+    import random
+    import schedule
+    import time
+    from datetime import datetime
+    from kubernetes import client, config
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    class ChaosScheduler:
+        def __init__(self):
+            config.load_incluster_config()
+            self.k8s_client = client.CustomObjectsApi()
+            self.apps_client = client.AppsV1Api()
+            self.namespace = os.getenv("CHAOS_NAMESPACE", "litmus")
+            
+        def get_cluster_architecture_status(self):
+            """Get current status of different architectures"""
+            try:
+                # Get node counts by architecture
+                core_client = client.CoreV1Api()
+                nodes = core_client.list_node()
+                
+                arch_stats = {"amd64": 0, "arm64": 0, "arm": 0}
+                
+                for node in nodes.items:
+                    arch = node.metadata.labels.get("kubernetes.io/arch", "unknown")
+                    if arch in arch_stats:
+                        arch_stats[arch] += 1
+                
+                logger.info(f"Cluster architecture status: {arch_stats}")
+                return arch_stats
+                
+            except Exception as e:
+                logger.error(f"Failed to get cluster status: {e}")
+                return {"amd64": 1, "arm64": 1, "arm": 1}  # Fallback
+        
+        def should_run_chaos_for_arch(self, architecture):
+            """Determine if chaos should run for specific architecture"""
+            
+            # Time-based rules
+            current_hour = datetime.now().hour
+            
+            # AMD64: Can handle chaos anytime except peak hours
+            if architecture == "amd64":
+                return current_hour not in [9, 10, 11, 14, 15, 16]  # Avoid business hours
+            
+            # ARM64: Conservative timing
+            elif architecture == "arm64":
+                return current_hour in [2, 3, 4, 22, 23]  # Off-peak hours only
+            
+            # ARM: Very limited chaos
+            elif architecture == "arm":
+                return current_hour in [3, 4] and random.random() < 0.3  # 30% chance in early morning
+            
+            return False
+        
+        def create_chaos_engine(self, target_arch, experiment_name, target_namespace, target_app):
+            """Create a chaos engine for specific architecture"""
+            
+            # Architecture-specific parameters
+            arch_params = {
+                "amd64": {
+                    "duration": "60",
+                    "intensity": "medium",
+                    "affected_percentage": "50"
+                },
+                "arm64": {
+                    "duration": "30", 
+                    "intensity": "low",
+                    "affected_percentage": "25"
+                },
+                "arm": {
+                    "duration": "15",
+                    "intensity": "minimal", 
+                    "affected_percentage": "10"
+                }
+            }
+            
+            params = arch_params.get(target_arch, arch_params["arm64"])
+            
+            chaos_engine = {
+                "apiVersion": "litmuschaos.io/v1alpha1",
+                "kind": "ChaosEngine",
+                "metadata": {
+                    "name": f"scheduled-{target_arch}-{experiment_name}-{int(time.time())}",
+                    "namespace": self.namespace,
+                    "labels": {
+                        "scheduled": "true",
+                        "architecture": target_arch,
+                        "experiment": experiment_name
+                    }
+                },
+                "spec": {
+                    "appinfo": {
+                        "appns": target_namespace,
+                        "applabel": f"app={target_app}",
+                        "appkind": "deployment"
+                    },
+                    "chaosServiceAccount": "litmus-admin",
+                    "experiments": [{
+                        "name": experiment_name,
+                        "spec": {
+                            "components": {
+                                "env": [
+                                    {"name": "TOTAL_CHAOS_DURATION", "value": params["duration"]},
+                                    {"name": "PODS_AFFECTED_PERC", "value": params["affected_percentage"]},
+                                    {"name": "NODE_LABEL", "value": f"kubernetes.io/arch={target_arch}"}
+                                ]
+                            }
+                        }
+                    }],
+                    "engineState": "active"
+                }
+            }
+            
+            return chaos_engine
+        
+        def run_scheduled_chaos(self):
+            """Run scheduled chaos experiments"""
+            
+            arch_status = self.get_cluster_architecture_status()
+            
+            # Define chaos scenarios by architecture and service
+            chaos_scenarios = [
+                # AMD64 scenarios (heavy workloads)
+                {
+                    "arch": "amd64",
+                    "experiment": "pod-delete", 
+                    "namespace": "default",
+                    "app": "dashboard-api",
+                    "probability": 0.7
+                },
+                {
+                    "arch": "amd64",
+                    "experiment": "node-cpu-hog",
+                    "namespace": "tracing", 
+                    "app": "jaeger-collector",
+                    "probability": 0.5
+                },
+                
+                # ARM64 scenarios (balanced workloads)
+                {
+                    "arch": "arm64",
+                    "experiment": "pod-delete",
+                    "namespace": "ml-serving",
+                    "app": "sklearn-serving-arm64", 
+                    "probability": 0.4
+                },
+                {
+                    "arch": "arm64",
+                    "experiment": "container-kill",
+                    "namespace": "logging",
+                    "app": "kibana",
+                    "probability": 0.3
+                },
+                
+                # ARM scenarios (edge workloads)
+                {
+                    "arch": "arm",
+                    "experiment": "container-kill",
+                    "namespace": "event-driven",
+                    "app": "event-consumer-arm",
+                    "probability": 0.2
+                }
+            ]
+            
+            experiments_run = 0
+            
+            for scenario in chaos_scenarios:
+                arch = scenario["arch"]
+                
+                # Check if we have nodes of this architecture
+                if arch_status.get(arch, 0) == 0:
+                    logger.info(f"No {arch} nodes available, skipping")
+                    continue
+                
+                # Check if chaos should run for this architecture
+                if not self.should_run_chaos_for_arch(arch):
+                    logger.info(f"Chaos not scheduled for {arch} at this time")
+                    continue
+                
+                # Probability check
+                if random.random() > scenario["probability"]:
+                    logger.info(f"Skipping {arch} chaos due to probability")
+                    continue
+                
+                try:
+                    # Create and apply chaos engine
+                    chaos_engine = self.create_chaos_engine(
+                        arch,
+                        scenario["experiment"],
+                        scenario["namespace"], 
+                        scenario["app"]
+                    )
+                    
+                    # Apply the chaos engine
+                    self.k8s_client.create_namespaced_custom_object(
+                        group="litmuschaos.io",
+                        version="v1alpha1",
+                        namespace=self.namespace,
+                        plural="chaosengines",
+                        body=chaos_engine
+                    )
+                    
+                    experiments_run += 1
+                    logger.info(f"Started chaos experiment: {scenario['experiment']} on {arch}")
+                    
+                    # Send notification
+                    await self.send_chaos_notification(scenario, "started")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to create chaos engine for {arch}: {e}")
+            
+            logger.info(f"Chaos scheduler run completed. {experiments_run} experiments started.")
+        
+        async def send_chaos_notification(self, scenario, status):
+            """Send chaos experiment notification"""
+            try:
+                import nats
+                
+                nats_client = await nats.connect(os.getenv("NATS_URL", "nats://localhost:4222"))
+                
+                notification = {
+                    "type": "homelab.chaos.experiment",
+                    "source": "chaos-scheduler",
+                    "data": {
+                        "architecture": scenario["arch"],
+                        "experiment": scenario["experiment"],
+                        "target_app": scenario["app"],
+                        "target_namespace": scenario["namespace"],
+                        "status": status,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                }
+                
+                await nats_client.publish(
+                    "events.chaos",
+                    json.dumps(notification).encode()
+                )
+                
+                await nats_client.close()
+                
+            except Exception as e:
+                logger.error(f"Failed to send chaos notification: {e}")
+        
+        def cleanup_old_experiments(self):
+            """Clean up completed chaos engines"""
+            try:
+                # Get all chaos engines
+                chaos_engines = self.k8s_client.list_namespaced_custom_object(
+                    group="litmuschaos.io",
+                    version="v1alpha1",
+                    namespace=self.namespace,
+                    plural="chaosengines"
+                )
+                
+                cleaned = 0
+                for engine in chaos_engines.get("items", []):
+                    # Check if experiment is completed
+                    status = engine.get("status", {})
+                    engine_status = status.get("engineStatus", "")
+                    
+                    if engine_status in ["Stopped", "Completed"]:
+                        # Delete completed engines
+                        self.k8s_client.delete_namespaced_custom_object(
+                            group="litmuschaos.io",
+                            version="v1alpha1",
+                            namespace=self.namespace,
+                            plural="chaosengines",
+                            name=engine["metadata"]["name"]
+                        )
+                        cleaned += 1
+                
+                logger.info(f"Cleaned up {cleaned} completed chaos engines")
+                
+            except Exception as e:
+                logger.error(f"Failed to cleanup experiments: {e}")
+        
+        def run(self):
+            """Run the chaos scheduler"""
+            logger.info("Starting Chaos Scheduler for Multi-Architecture Homelab")
+            
+            # Schedule chaos experiments
+            schedule.every(6).hours.do(self.run_scheduled_chaos)  # Every 6 hours
+            schedule.every().day.at("02:00").do(self.cleanup_old_experiments)  # Daily cleanup
+            
+            # Manual test run on startup (after 5 minutes)
+            schedule.every(5).minutes.do(self.run_scheduled_chaos).tag('startup')
+            
+            while True:
+                schedule.run_pending()
+                time.sleep(60)  # Check every minute
+
+    if __name__ == "__main__":
+        scheduler = ChaosScheduler()
+        scheduler.run()
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: chaos-center-frontend-service
+  namespace: litmus
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 9091
+    targetPort: 8185
+  selector:
+    component: chaos-center-frontend
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chaos-center-backend-service
+  namespace: litmus
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 9002
+    targetPort: 8080
+  - name: rpc
+    port: 8000
+    targetPort: 8000
+  selector:
+    component: chaos-center-backend
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-service
+  namespace: litmus
+spec:
+  clusterIP: None
+  selector:
+    app: mongo
+  ports:
+  - name: mongo
+    port: 27017
+    targetPort: 27017
+
+---
+# Ingress for Chaos Center
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chaos-center-ingress
+  namespace: litmus
+spec:
+  rules:
+  - host: chaos.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: chaos-center-frontend-service
+            port:
+              number: 9091
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: chaos-center-backend-service
+            port:
+              number: 9002
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litmus-frontend
+  namespace: litmus
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litmus-backend
+  namespace: litmus
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chaos-scheduler
+  namespace: litmus
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argo-chaos
+  namespace: litmus
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litmus-admin
+  namespace: litmus
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: litmus-admin
+rules:
+- apiGroups: [""]
+  resources: ["pods", "events", "configmaps", "secrets", "services", "nodes"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+- apiGroups: ["litmuschaos.io"]
+  resources: ["chaosengines", "chaosexperiments", "chaosresults"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+- apiGroups: ["argoproj.io"]
+  resources: ["workflows", "workflowtemplates", "cronworkflows"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: litmus-frontend
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: litmus-admin
+subjects:
+- kind: ServiceAccount
+  name: litmus-frontend
+  namespace: litmus
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: litmus-backend
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: litmus-admin
+subjects:
+- kind: ServiceAccount
+  name: litmus-backend
+  namespace: litmus
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: chaos-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: litmus-admin
+subjects:
+- kind: ServiceAccount
+  name: chaos-scheduler
+  namespace: litmus
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argo-chaos
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: litmus-admin
+subjects:
+- kind: ServiceAccount
+  name: argo-chaos
+  namespace: litmus
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: litmus-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: litmus-admin
+subjects:
+- kind: ServiceAccount
+  name: litmus-admin
+  namespace: litmus

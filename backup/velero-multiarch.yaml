@@ -1,0 +1,1068 @@
+# Velero Backup and Disaster Recovery for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: velero
+  labels:
+    name: velero
+
+---
+# Velero configuration for multi-arch backup
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-config
+  namespace: velero
+data:
+  config.yaml: |
+    # Velero configuration for multi-architecture homelab
+    backup:
+      # Architecture-aware backup strategies
+      strategies:
+        critical_data:
+          # Critical databases and persistent data
+          namespaces: ["ml-serving", "logging", "tracing", "event-driven"]
+          schedule: "0 2 * * *"  # Daily at 2 AM
+          retention: "720h"      # 30 days
+          
+        application_configs:
+          # Application configurations and secrets
+          resources: ["configmaps", "secrets", "persistentvolumes", "persistentvolumeclaims"]
+          schedule: "0 */6 * * *"  # Every 6 hours
+          retention: "168h"        # 7 days
+          
+        cluster_state:
+          # Full cluster state backup
+          include_all: true
+          schedule: "0 1 * * 0"   # Weekly on Sunday
+          retention: "2160h"      # 90 days
+          
+        architecture_specific:
+          # Architecture-specific workload backups
+          amd64_workloads:
+            namespaces: ["default", "tracing"]
+            schedule: "0 3 * * *"
+            
+          arm64_workloads:
+            namespaces: ["ml-serving", "logging"]
+            schedule: "0 4 * * *"
+            
+          arm_workloads:
+            namespaces: ["event-driven"]
+            schedule: "0 5 * * *"
+    
+    storage:
+      # MinIO as backup storage backend
+      provider: "aws"
+      bucket: "homelab-backups"
+      region: "homelab"
+      s3_compatible: true
+      endpoint: "http://backup-minio:9000"
+      
+    features:
+      # Velero feature flags
+      enable_csi_snapshots: true
+      enable_fs_backup: true
+      enable_api_group_versions: true
+      
+    monitoring:
+      # Backup monitoring and alerting
+      success_webhook: "http://webhook-receiver:8080/backup-success"
+      failure_webhook: "http://webhook-receiver:8080/backup-failure"
+      metrics_enabled: true
+
+---
+# MinIO for backup storage
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backup-minio
+  namespace: velero
+  labels:
+    app: backup-minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backup-minio
+  template:
+    metadata:
+      labels:
+        app: backup-minio
+    spec:
+      # Prefer AMD64 for storage performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: minio
+        image: minio/minio:latest
+        args:
+        - server
+        - /data
+        - --console-address
+        - ":9001"
+        env:
+        - name: MINIO_ROOT_USER
+          value: "velero"
+        - name: MINIO_ROOT_PASSWORD
+          value: "velero-backup-secret-key"
+        - name: MINIO_DEFAULT_BUCKETS
+          value: "homelab-backups"
+        ports:
+        - containerPort: 9000
+          name: api
+        - containerPort: 9001
+          name: console
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+        volumeMounts:
+        - name: backup-storage
+          mountPath: /data
+        livenessProbe:
+          httpGet:
+            path: /minio/health/live
+            port: 9000
+        readinessProbe:
+          httpGet:
+            path: /minio/health/ready
+            port: 9000
+      volumes:
+      - name: backup-storage
+        persistentVolumeClaim:
+          claimName: backup-storage
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-storage
+  namespace: velero
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: longhorn-ssd
+
+---
+# Velero server deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: velero
+  namespace: velero
+  labels:
+    component: velero
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: velero
+  template:
+    metadata:
+      labels:
+        component: velero
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8085"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Run on AMD64 for Velero server
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      restartPolicy: Always
+      serviceAccountName: velero
+      containers:
+      - name: velero
+        image: velero/velero:v1.12.0
+        ports:
+        - name: metrics
+          containerPort: 8085
+        - name: monitoring
+          containerPort: 8080
+        command:
+        - /velero
+        args:
+        - server
+        - --log-level=info
+        - --log-format=text
+        - --metrics-addr=0.0.0.0:8085
+        - --features=EnableCSI
+        - --default-volume-snapshot-locations=default:longhorn
+        - --uploader-type=restic
+        env:
+        - name: VELERO_SCRATCH_DIR
+          value: /scratch
+        - name: VELERO_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: LD_LIBRARY_PATH
+          value: /plugins
+        - name: AWS_SHARED_CREDENTIALS_FILE
+          value: /credentials/cloud
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "128Mi"
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: plugins
+          mountPath: /plugins
+        - name: scratch
+          mountPath: /scratch
+        - name: credentials
+          mountPath: /credentials
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 8085
+          initialDelaySeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 8085
+          initialDelaySeconds: 10
+      volumes:
+      - name: plugins
+        emptyDir: {}
+      - name: scratch
+        emptyDir: {}
+      - name: credentials
+        secret:
+          secretName: cloud-credentials
+      initContainers:
+      - image: velero/velero-plugin-for-aws:v1.8.0
+        imagePullPolicy: IfNotPresent
+        name: velero-plugin-for-aws
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /target
+          name: plugins
+
+---
+# Restic DaemonSet for file system backups
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: restic
+  namespace: velero
+spec:
+  selector:
+    matchLabels:
+      name: restic
+  template:
+    metadata:
+      labels:
+        name: restic
+    spec:
+      serviceAccountName: velero
+      securityContext:
+        runAsUser: 0
+      containers:
+      - name: restic
+        image: velero/velero:v1.12.0
+        command:
+        - /velero
+        args:
+        - restic
+        - server
+        - --log-level=info
+        - --log-format=text
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: VELERO_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: VELERO_SCRATCH_DIR
+          value: /scratch
+        - name: AWS_SHARED_CREDENTIALS_FILE
+          value: /credentials/cloud
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: host-pods
+          mountPath: /host_pods
+          mountPropagation: HostToContainer
+        - name: scratch
+          mountPath: /scratch
+        - name: credentials
+          mountPath: /credentials
+      volumes:
+      - name: host-pods
+        hostPath:
+          path: /var/lib/kubelet/pods
+      - name: scratch
+        emptyDir: {}
+      - name: credentials
+        secret:
+          secretName: cloud-credentials
+
+---
+# Backup automation and monitoring
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backup-manager
+  namespace: velero
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backup-manager
+  template:
+    metadata:
+      labels:
+        app: backup-manager
+    spec:
+      serviceAccountName: backup-manager
+      containers:
+      - name: manager
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes schedule requests prometheus-client
+          python3 /app/backup_manager.py
+        volumeMounts:
+        - name: manager-app
+          mountPath: /app
+        env:
+        - name: VELERO_NAMESPACE
+          value: "velero"
+        - name: BACKUP_BUCKET
+          value: "homelab-backups"
+        - name: MINIO_ENDPOINT
+          value: "http://backup-minio:9000"
+        - name: MINIO_ACCESS_KEY
+          value: "velero"
+        - name: MINIO_SECRET_KEY
+          value: "velero-backup-secret-key"
+        - name: NATS_URL
+          value: "nats://apps:apps123@nats.event-driven:4222"
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+      volumes:
+      - name: manager-app
+        configMap:
+          name: backup-manager-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-manager-app
+  namespace: velero
+data:
+  backup_manager.py: |
+    #!/usr/bin/env python3
+    import json
+    import logging
+    import os
+    import requests
+    import schedule
+    import time
+    from datetime import datetime, timedelta
+    from kubernetes import client, config
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    # Prometheus metrics
+    BACKUPS_CREATED = Counter('velero_backups_created_total', 'Total backups created', ['architecture', 'namespace'])
+    BACKUPS_COMPLETED = Counter('velero_backups_completed_total', 'Total backups completed', ['architecture', 'status'])
+    BACKUP_SIZE_BYTES = Gauge('velero_backup_size_bytes', 'Backup size in bytes', ['backup_name', 'architecture'])
+    BACKUP_DURATION = Histogram('velero_backup_duration_seconds', 'Backup duration', ['architecture'])
+    RESTORE_DURATION = Histogram('velero_restore_duration_seconds', 'Restore duration', ['architecture'])
+
+    class BackupManager:
+        def __init__(self):
+            config.load_incluster_config()
+            self.k8s_client = client.CustomObjectsApi()
+            self.core_client = client.CoreV1Api()
+            self.namespace = os.getenv("VELERO_NAMESPACE", "velero")
+            
+        def get_node_architectures(self):
+            """Get available node architectures"""
+            try:
+                nodes = self.core_client.list_node()
+                architectures = set()
+                
+                for node in nodes.items:
+                    arch = node.metadata.labels.get("kubernetes.io/arch", "unknown")
+                    architectures.add(arch)
+                
+                return list(architectures)
+            except Exception as e:
+                logger.error(f"Failed to get node architectures: {e}")
+                return ["amd64", "arm64", "arm"]
+        
+        def create_architecture_backup(self, architecture):
+            """Create backup for specific architecture workloads"""
+            
+            # Define architecture-specific namespaces and labels
+            arch_config = {
+                "amd64": {
+                    "namespaces": ["default", "tracing", "tekton-pipelines"],
+                    "label_selector": "architecture!=arm64,architecture!=arm"
+                },
+                "arm64": {
+                    "namespaces": ["ml-serving", "logging", "flagger-system"],
+                    "label_selector": "architecture=arm64"
+                },
+                "arm": {
+                    "namespaces": ["event-driven"],
+                    "label_selector": "architecture=arm"
+                }
+            }
+            
+            if architecture not in arch_config:
+                logger.warning(f"Unknown architecture: {architecture}")
+                return None
+            
+            config_data = arch_config[architecture]
+            backup_name = f"arch-{architecture}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            
+            # Create Velero backup object
+            backup_spec = {
+                "apiVersion": "velero.io/v1",
+                "kind": "Backup",
+                "metadata": {
+                    "name": backup_name,
+                    "namespace": self.namespace,
+                    "labels": {
+                        "architecture": architecture,
+                        "backup-type": "architecture-specific",
+                        "schedule": "automated"
+                    }
+                },
+                "spec": {
+                    "includedNamespaces": config_data["namespaces"],
+                    "labelSelector": {
+                        "matchLabels": {
+                            "backup.velero.io/exclude": "false"
+                        }
+                    },
+                    "storageLocation": "default",
+                    "volumeSnapshotLocations": ["default"],
+                    "ttl": "720h0m0s",  # 30 days
+                    "includedResources": [
+                        "pods",
+                        "persistentvolumes",
+                        "persistentvolumeclaims",
+                        "configmaps",
+                        "secrets",
+                        "services",
+                        "deployments",
+                        "statefulsets",
+                        "daemonsets"
+                    ],
+                    "defaultVolumesToRestic": True
+                }
+            }
+            
+            try:
+                # Create the backup
+                result = self.k8s_client.create_namespaced_custom_object(
+                    group="velero.io",
+                    version="v1",
+                    namespace=self.namespace,
+                    plural="backups",
+                    body=backup_spec
+                )
+                
+                logger.info(f"Created backup {backup_name} for architecture {architecture}")
+                BACKUPS_CREATED.labels(architecture=architecture, namespace="multiple").inc()
+                
+                return backup_name
+                
+            except Exception as e:
+                logger.error(f"Failed to create backup for {architecture}: {e}")
+                return None
+        
+        def monitor_backup_status(self):
+            """Monitor status of running backups"""
+            try:
+                # Get all backups
+                backups = self.k8s_client.list_namespaced_custom_object(
+                    group="velero.io",
+                    version="v1",
+                    namespace=self.namespace,
+                    plural="backups"
+                )
+                
+                for backup in backups.get("items", []):
+                    name = backup["metadata"]["name"]
+                    status = backup.get("status", {})
+                    phase = status.get("phase", "Unknown")
+                    architecture = backup.get("metadata", {}).get("labels", {}).get("architecture", "unknown")
+                    
+                    # Update metrics based on status
+                    if phase == "Completed":
+                        BACKUPS_COMPLETED.labels(architecture=architecture, status="success").inc()
+                        
+                        # Update backup size if available
+                        backup_bytes = status.get("progress", {}).get("totalItems", 0)
+                        if backup_bytes > 0:
+                            BACKUP_SIZE_BYTES.labels(backup_name=name, architecture=architecture).set(backup_bytes)
+                        
+                        # Calculate duration
+                        start_time = backup.get("metadata", {}).get("creationTimestamp")
+                        completion_time = status.get("completionTimestamp")
+                        
+                        if start_time and completion_time:
+                            duration = self.calculate_duration(start_time, completion_time)
+                            BACKUP_DURATION.labels(architecture=architecture).observe(duration)
+                    
+                    elif phase == "Failed":
+                        BACKUPS_COMPLETED.labels(architecture=architecture, status="failed").inc()
+                        logger.error(f"Backup {name} failed: {status.get('failureReason', 'Unknown')}")
+                    
+                    elif phase in ["InProgress", "New"]:
+                        logger.info(f"Backup {name} is {phase}")
+                
+            except Exception as e:
+                logger.error(f"Failed to monitor backup status: {e}")
+        
+        def calculate_duration(self, start_time, end_time):
+            """Calculate duration between two timestamps"""
+            try:
+                from datetime import datetime
+                start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                end = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+                return (end - start).total_seconds()
+            except:
+                return 0
+        
+        def cleanup_old_backups(self):
+            """Clean up old backups based on retention policy"""
+            try:
+                backups = self.k8s_client.list_namespaced_custom_object(
+                    group="velero.io",
+                    version="v1", 
+                    namespace=self.namespace,
+                    plural="backups"
+                )
+                
+                cutoff_date = datetime.now() - timedelta(days=30)
+                cleaned = 0
+                
+                for backup in backups.get("items", []):
+                    creation_time = backup.get("metadata", {}).get("creationTimestamp")
+                    if creation_time:
+                        backup_date = datetime.fromisoformat(creation_time.replace('Z', '+00:00'))
+                        
+                        if backup_date < cutoff_date:
+                            # Delete old backup
+                            backup_name = backup["metadata"]["name"]
+                            self.k8s_client.delete_namespaced_custom_object(
+                                group="velero.io",
+                                version="v1",
+                                namespace=self.namespace,
+                                plural="backups",
+                                name=backup_name
+                            )
+                            logger.info(f"Deleted old backup: {backup_name}")
+                            cleaned += 1
+                
+                logger.info(f"Cleaned up {cleaned} old backups")
+                
+            except Exception as e:
+                logger.error(f"Failed to cleanup old backups: {e}")
+        
+        def verify_backup_integrity(self):
+            """Verify backup integrity and accessibility"""
+            try:
+                # Check MinIO connectivity
+                minio_endpoint = os.getenv("MINIO_ENDPOINT", "http://backup-minio:9000")
+                response = requests.get(f"{minio_endpoint}/minio/health/live", timeout=10)
+                
+                if response.status_code == 200:
+                    logger.info("Backup storage is accessible")
+                else:
+                    logger.error(f"Backup storage health check failed: {response.status_code}")
+                
+                # List recent backups
+                backups = self.k8s_client.list_namespaced_custom_object(
+                    group="velero.io",
+                    version="v1",
+                    namespace=self.namespace,
+                    plural="backups"
+                )
+                
+                recent_backups = []
+                cutoff = datetime.now() - timedelta(days=7)
+                
+                for backup in backups.get("items", []):
+                    creation_time = backup.get("metadata", {}).get("creationTimestamp")
+                    if creation_time:
+                        backup_date = datetime.fromisoformat(creation_time.replace('Z', '+00:00'))
+                        if backup_date > cutoff:
+                            recent_backups.append({
+                                "name": backup["metadata"]["name"],
+                                "status": backup.get("status", {}).get("phase", "Unknown"),
+                                "architecture": backup.get("metadata", {}).get("labels", {}).get("architecture", "unknown")
+                            })
+                
+                logger.info(f"Found {len(recent_backups)} recent backups")
+                for backup in recent_backups[:5]:  # Show last 5
+                    logger.info(f"  {backup['name']}: {backup['status']} ({backup['architecture']})")
+                
+            except Exception as e:
+                logger.error(f"Failed to verify backup integrity: {e}")
+        
+        def create_disaster_recovery_plan(self):
+            """Create disaster recovery plan and procedures"""
+            
+            dr_plan = {
+                "disaster_recovery_plan": {
+                    "version": "1.0",
+                    "created": datetime.now().isoformat(),
+                    "cluster": "homelab-multiarch",
+                    
+                    "recovery_priorities": [
+                        {
+                            "priority": 1,
+                            "services": ["nats", "dashboard-api"],
+                            "architectures": ["amd64", "arm64"],
+                            "rto": "15 minutes",
+                            "rpo": "6 hours"
+                        },
+                        {
+                            "priority": 2,
+                            "services": ["ml-serving", "elasticsearch"],
+                            "architectures": ["amd64", "arm64"],
+                            "rto": "30 minutes",
+                            "rpo": "24 hours"
+                        },
+                        {
+                            "priority": 3,
+                            "services": ["event-driven", "monitoring"],
+                            "architectures": ["arm64", "arm"],
+                            "rto": "1 hour",
+                            "rpo": "24 hours"
+                        }
+                    ],
+                    
+                    "procedures": {
+                        "full_cluster_restore": [
+                            "1. Provision new cluster with same architecture mix",
+                            "2. Install Velero on new cluster",
+                            "3. Configure backup storage access",
+                            "4. Restore critical services (priority 1) first",
+                            "5. Validate service connectivity", 
+                            "6. Restore remaining services by priority",
+                            "7. Update DNS and ingress configurations",
+                            "8. Verify all services are operational"
+                        ],
+                        
+                        "selective_restore": [
+                            "1. Identify affected services and architecture",
+                            "2. Create restore object with specific namespace",
+                            "3. Monitor restore progress",
+                            "4. Validate restored services",
+                            "5. Update configurations if needed"
+                        ],
+                        
+                        "architecture_specific_restore": [
+                            "1. Determine which architecture nodes are affected",
+                            "2. Restore architecture-specific backup",
+                            "3. Ensure workload distribution is correct",
+                            "4. Validate cross-architecture communication"
+                        ]
+                    },
+                    
+                    "testing_schedule": {
+                        "monthly": "Full cluster restore test",
+                        "weekly": "Selective service restore test", 
+                        "daily": "Backup verification and integrity check"
+                    }
+                }
+            }
+            
+            # Store DR plan as ConfigMap
+            try:
+                plan_configmap = {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "disaster-recovery-plan",
+                        "namespace": self.namespace
+                    },
+                    "data": {
+                        "dr-plan.json": json.dumps(dr_plan, indent=2)
+                    }
+                }
+                
+                self.core_client.create_namespaced_config_map(
+                    namespace=self.namespace,
+                    body=plan_configmap
+                )
+                
+                logger.info("Created disaster recovery plan")
+                
+            except Exception as e:
+                if "already exists" in str(e):
+                    logger.info("Disaster recovery plan already exists")
+                else:
+                    logger.error(f"Failed to create DR plan: {e}")
+        
+        async def send_backup_notification(self, backup_name, status, architecture):
+            """Send backup status notification"""
+            try:
+                import nats
+                
+                nats_client = await nats.connect(os.getenv("NATS_URL", "nats://localhost:4222"))
+                
+                notification = {
+                    "type": "homelab.backup.status",
+                    "source": "backup-manager",
+                    "data": {
+                        "backup_name": backup_name,
+                        "status": status,
+                        "architecture": architecture,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                }
+                
+                await nats_client.publish(
+                    "events.backup",
+                    json.dumps(notification).encode()
+                )
+                
+                await nats_client.close()
+                
+            except Exception as e:
+                logger.error(f"Failed to send backup notification: {e}")
+        
+        def run_scheduled_tasks(self):
+            """Run all scheduled backup tasks"""
+            logger.info("Running scheduled backup tasks...")
+            
+            # Get available architectures
+            architectures = self.get_node_architectures()
+            
+            # Create backups for each architecture
+            for arch in architectures:
+                if arch in ["amd64", "arm64", "arm"]:
+                    backup_name = self.create_architecture_backup(arch)
+                    if backup_name:
+                        logger.info(f"Started backup {backup_name} for {arch}")
+            
+            # Monitor existing backups
+            self.monitor_backup_status()
+            
+            # Verify backup integrity
+            self.verify_backup_integrity()
+        
+        def run(self):
+            """Run the backup manager"""
+            logger.info("Starting Backup Manager for Multi-Architecture Homelab")
+            
+            # Create DR plan on startup
+            self.create_disaster_recovery_plan()
+            
+            # Schedule backup tasks
+            schedule.every().day.at("02:00").do(self.run_scheduled_tasks)  # Daily backups
+            schedule.every().hour.do(self.monitor_backup_status)  # Hourly monitoring
+            schedule.every().week.do(self.cleanup_old_backups)  # Weekly cleanup
+            schedule.every(6).hours.do(self.verify_backup_integrity)  # Every 6 hours
+            
+            # Initial run after 2 minutes
+            schedule.every(2).minutes.do(self.run_scheduled_tasks).tag('startup')
+            
+            while True:
+                schedule.run_pending()
+                time.sleep(60)
+
+    if __name__ == "__main__":
+        # Start metrics server
+        start_http_server(8080)
+        logger.info("Prometheus metrics server started on port 8080")
+        
+        manager = BackupManager()
+        manager.run()
+
+---
+# Backup schedules for different data types
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: critical-data-backup
+  namespace: velero
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  template:
+    includedNamespaces:
+    - ml-serving
+    - logging
+    - tracing
+    - event-driven
+    - tekton-pipelines
+    storageLocation: default
+    volumeSnapshotLocations:
+    - default
+    ttl: 720h0m0s  # 30 days
+    includedResources:
+    - persistentvolumes
+    - persistentvolumeclaims
+    - secrets
+    - configmaps
+    defaultVolumesToRestic: true
+    labelSelector:
+      matchLabels:
+        backup.velero.io/critical: "true"
+
+---
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: application-config-backup
+  namespace: velero
+spec:
+  schedule: "0 */6 * * *"  # Every 6 hours
+  template:
+    includedResources:
+    - configmaps
+    - secrets
+    - services
+    - ingresses
+    excludedNamespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+    storageLocation: default
+    ttl: 168h0m0s  # 7 days
+
+---
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: weekly-full-backup
+  namespace: velero
+spec:
+  schedule: "0 1 * * 0"  # Weekly on Sunday at 1 AM
+  template:
+    includeClusterResources: true
+    storageLocation: default
+    volumeSnapshotLocations:
+    - default
+    ttl: 2160h0m0s  # 90 days
+    defaultVolumesToRestic: true
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: backup-minio
+  namespace: velero
+spec:
+  selector:
+    app: backup-minio
+  ports:
+  - name: api
+    port: 9000
+    targetPort: 9000
+  - name: console
+    port: 9001
+    targetPort: 9001
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: velero
+  namespace: velero
+spec:
+  selector:
+    component: velero
+  ports:
+  - name: metrics
+    port: 8085
+    targetPort: 8085
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backup-manager
+  namespace: velero
+spec:
+  selector:
+    app: backup-manager
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# Storage locations
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: default
+  namespace: velero
+spec:
+  provider: aws
+  objectStorage:
+    bucket: homelab-backups
+  config:
+    region: homelab
+    s3ForcePathStyle: "true"
+    s3Url: http://backup-minio:9000
+    publicUrl: http://backup-minio:9000
+
+---
+apiVersion: velero.io/v1
+kind: VolumeSnapshotLocation
+metadata:
+  name: default
+  namespace: velero
+spec:
+  provider: csi
+  config:
+    driver: driver.longhorn.io
+
+---
+# Secrets
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloud-credentials
+  namespace: velero
+type: Opaque
+data:
+  cloud: |
+    W2RlZmF1bHRdCmF3c19hY2Nlc3Nfa2V5X2lkID0gdmVsZXJvCmF3c19zZWNyZXRfYWNjZXNzX2tleSA9IHZlbGVyby1iYWNrdXAtc2VjcmV0LWtleQ==
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: velero
+  namespace: velero
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backup-manager
+  namespace: velero
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: velero
+rules:
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["*"]
+- nonResourceURLs: ["*"]
+  verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: backup-manager
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["velero.io"]
+  resources: ["backups", "restores", "schedules"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: velero
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: velero
+subjects:
+- kind: ServiceAccount
+  name: velero
+  namespace: velero
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: backup-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: backup-manager
+subjects:
+- kind: ServiceAccount
+  name: backup-manager
+  namespace: velero
+
+---
+# Ingress for backup storage console
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backup-console-ingress
+  namespace: velero
+spec:
+  rules:
+  - host: backups.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: backup-minio
+            port:
+              number: 9001

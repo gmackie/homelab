@@ -1,0 +1,897 @@
+# Edge Computing Orchestration for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge-computing
+  labels:
+    name: edge-computing
+    tier: edge
+
+---
+# Edge node discovery and management
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-config
+  namespace: edge-computing
+data:
+  edge-zones.yaml: |
+    # Edge computing zones configuration
+    zones:
+      living-room:
+        description: "Living room edge zone"
+        location: "192.168.1.0/24"
+        preferred_arch: ["arm64", "arm"]
+        capabilities: ["sensor-processing", "video-analytics", "home-automation"]
+        latency_requirements: "< 50ms"
+        power_budget: "15W"
+      
+      garage:
+        description: "Garage/workshop edge zone"
+        location: "192.168.2.0/24"
+        preferred_arch: ["arm64"]
+        capabilities: ["environmental-monitoring", "security-cameras", "door-control"]
+        latency_requirements: "< 100ms"
+        power_budget: "10W"
+      
+      outdoor:
+        description: "Outdoor sensors and monitoring"
+        location: "192.168.3.0/24"
+        preferred_arch: ["arm"]
+        capabilities: ["weather-monitoring", "motion-detection", "lighting-control"]
+        latency_requirements: "< 200ms"
+        power_budget: "5W"
+    
+    workload_profiles:
+      sensor-aggregation:
+        description: "Aggregate sensor data from multiple sources"
+        resource_requirements:
+          cpu: "50m"
+          memory: "64Mi"
+          storage: "1Gi"
+        processing_interval: "10s"
+        data_retention: "7d"
+      
+      real-time-analytics:
+        description: "Real-time analytics on edge data"
+        resource_requirements:
+          cpu: "200m"
+          memory: "256Mi"
+          storage: "5Gi"
+        processing_interval: "1s"
+        data_retention: "24h"
+      
+      video-processing:
+        description: "Video stream processing and object detection"
+        resource_requirements:
+          cpu: "500m"
+          memory: "512Mi"
+          storage: "10Gi"
+        processing_interval: "real-time"
+        gpu_acceleration: "preferred"
+
+  edge-discovery.sh: |
+    #!/bin/bash
+    
+    echo "Discovering edge computing capabilities..."
+    
+    # Get all ARM nodes
+    ARM_NODES=$(kubectl get nodes -l kubernetes.io/arch=arm,kubernetes.io/arch=arm64 -o name)
+    
+    for node in $ARM_NODES; do
+        NODE_NAME=$(echo $node | cut -d'/' -f2)
+        echo "Analyzing edge node: $NODE_NAME"
+        
+        # Get node architecture
+        ARCH=$(kubectl get $node -o jsonpath='{.metadata.labels.kubernetes\.io/arch}')
+        
+        # Get node IP
+        NODE_IP=$(kubectl get $node -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        
+        # Determine edge zone based on IP
+        ZONE="unknown"
+        if [[ $NODE_IP == 192.168.1.* ]]; then
+            ZONE="living-room"
+        elif [[ $NODE_IP == 192.168.2.* ]]; then
+            ZONE="garage"
+        elif [[ $NODE_IP == 192.168.3.* ]]; then
+            ZONE="outdoor"
+        fi
+        
+        # Label node with edge capabilities
+        kubectl label node $NODE_NAME edge-zone=$ZONE --overwrite
+        kubectl label node $NODE_NAME edge-capable=true --overwrite
+        kubectl label node $NODE_NAME power-class=low --overwrite
+        
+        # Architecture-specific labels
+        if [ "$ARCH" = "arm64" ]; then
+            kubectl label node $NODE_NAME edge-tier=processing --overwrite
+            kubectl label node $NODE_NAME edge-capabilities=sensor-processing,video-analytics --overwrite
+        elif [ "$ARCH" = "arm" ]; then
+            kubectl label node $NODE_NAME edge-tier=sensor --overwrite
+            kubectl label node $NODE_NAME edge-capabilities=sensor-collection,lightweight-processing --overwrite
+        fi
+        
+        echo "Node $NODE_NAME configured for edge zone: $ZONE"
+    done
+
+---
+# Edge orchestrator deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-orchestrator
+  namespace: edge-computing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-orchestrator
+  template:
+    metadata:
+      labels:
+        app: edge-orchestrator
+    spec:
+      # Run orchestrator on AMD64 for better performance
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      serviceAccountName: edge-orchestrator
+      containers:
+      - name: orchestrator
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes pyyaml requests redis asyncio aiohttp
+          python3 /app/edge_orchestrator.py
+        volumeMounts:
+        - name: orchestrator-app
+          mountPath: /app
+        - name: edge-config
+          mountPath: /config
+        env:
+        - name: REDIS_URL
+          value: "redis://edge-redis:6379"
+        - name: METRICS_ENDPOINT
+          value: "http://prometheus.monitoring:9090"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        ports:
+        - containerPort: 8080
+          name: api
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: orchestrator-app
+        configMap:
+          name: edge-orchestrator-app
+      - name: edge-config
+        configMap:
+          name: edge-config
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-orchestrator-app
+  namespace: edge-computing
+data:
+  edge_orchestrator.py: |
+    #!/usr/bin/env python3
+    import asyncio
+    import json
+    import logging
+    import os
+    import time
+    import yaml
+    from datetime import datetime, timedelta
+    from typing import Dict, List, Optional
+    from kubernetes import client, config, watch
+    from aiohttp import web
+    import redis
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class EdgeOrchestrator:
+        def __init__(self):
+            try:
+                config.load_incluster_config()
+            except:
+                config.load_kube_config()
+            
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            self.batch_v1 = client.BatchV1Api()
+            
+            # Connect to Redis for edge state management
+            redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+            self.redis_client = redis.from_url(redis_url)
+            
+            # Load edge configuration
+            with open('/config/edge-zones.yaml', 'r') as f:
+                self.edge_config = yaml.safe_load(f)
+            
+            self.edge_nodes = {}
+            self.workload_assignments = {}
+            
+        async def discover_edge_nodes(self):
+            """Discover and categorize edge nodes"""
+            logger.info("Discovering edge computing nodes...")
+            
+            nodes = self.v1.list_node(
+                label_selector="edge-capable=true"
+            )
+            
+            for node in nodes.items:
+                node_name = node.metadata.name
+                labels = node.metadata.labels or {}
+                
+                edge_info = {
+                    'name': node_name,
+                    'architecture': labels.get('kubernetes.io/arch', 'unknown'),
+                    'zone': labels.get('edge-zone', 'unknown'),
+                    'tier': labels.get('edge-tier', 'unknown'),
+                    'capabilities': labels.get('edge-capabilities', '').split(','),
+                    'power_class': labels.get('power-class', 'unknown'),
+                    'last_seen': datetime.now().isoformat(),
+                    'status': 'ready' if node.status.conditions[-1].type == 'Ready' else 'not-ready'
+                }
+                
+                # Get resource capacity
+                capacity = node.status.capacity
+                edge_info['resources'] = {
+                    'cpu': capacity.get('cpu', '0'),
+                    'memory': capacity.get('memory', '0'),
+                    'storage': capacity.get('ephemeral-storage', '0')
+                }
+                
+                # Get current resource usage
+                try:
+                    # This would require metrics-server
+                    metrics = self.v1.list_node(field_selector=f"metadata.name={node_name}")
+                    # Add usage metrics here
+                except:
+                    pass
+                
+                self.edge_nodes[node_name] = edge_info
+                
+                # Store in Redis
+                self.redis_client.hset(
+                    f"edge:nodes",
+                    node_name,
+                    json.dumps(edge_info)
+                )
+            
+            logger.info(f"Discovered {len(self.edge_nodes)} edge nodes")
+        
+        async def assign_workloads(self):
+            """Intelligently assign workloads to edge nodes"""
+            logger.info("Assigning workloads to edge nodes...")
+            
+            zones = self.edge_config['zones']
+            profiles = self.edge_config['workload_profiles']
+            
+            for zone_name, zone_config in zones.items():
+                # Find nodes in this zone
+                zone_nodes = [
+                    node for node in self.edge_nodes.values()
+                    if node['zone'] == zone_name and node['status'] == 'ready'
+                ]
+                
+                if not zone_nodes:
+                    logger.warning(f"No ready nodes found for zone {zone_name}")
+                    continue
+                
+                # Assign appropriate workloads based on zone capabilities
+                zone_capabilities = zone_config.get('capabilities', [])
+                
+                for capability in zone_capabilities:
+                    # Find best node for this capability
+                    best_node = self.select_best_node(zone_nodes, capability)
+                    
+                    if best_node:
+                        await self.deploy_edge_workload(
+                            best_node, capability, zone_name
+                        )
+        
+        def select_best_node(self, nodes: List[Dict], capability: str) -> Optional[Dict]:
+            """Select the best node for a given capability"""
+            
+            # Scoring function for node selection
+            def score_node(node):
+                score = 0
+                
+                # Architecture preference
+                if capability in ['sensor-processing', 'video-analytics']:
+                    score += 10 if node['architecture'] == 'arm64' else 5
+                elif capability in ['sensor-collection', 'lightweight-processing']:
+                    score += 10 if node['architecture'] == 'arm' else 3
+                
+                # Capability match
+                if capability in node['capabilities']:
+                    score += 15
+                
+                # Power efficiency
+                if node['power_class'] == 'low':
+                    score += 5
+                
+                # Load balancing (prefer less loaded nodes)
+                current_workloads = len(self.workload_assignments.get(node['name'], []))
+                score -= current_workloads * 2
+                
+                return score
+            
+            if not nodes:
+                return None
+            
+            # Score all nodes and return the best one
+            scored_nodes = [(node, score_node(node)) for node in nodes]
+            best_node = max(scored_nodes, key=lambda x: x[1])
+            
+            return best_node[0] if best_node[1] > 0 else None
+        
+        async def deploy_edge_workload(self, node: Dict, capability: str, zone: str):
+            """Deploy a workload to an edge node"""
+            logger.info(f"Deploying {capability} workload to {node['name']} in zone {zone}")
+            
+            # Create workload name
+            workload_name = f"edge-{capability.replace('_', '-')}-{zone}"
+            
+            # Select appropriate workload profile
+            profile_map = {
+                'sensor-processing': 'sensor-aggregation',
+                'video-analytics': 'video-processing',
+                'environmental-monitoring': 'sensor-aggregation',
+                'security-cameras': 'video-processing',
+                'sensor-collection': 'sensor-aggregation'
+            }
+            
+            profile_name = profile_map.get(capability, 'sensor-aggregation')
+            profile = self.edge_config['workload_profiles'][profile_name]
+            
+            # Create deployment manifest
+            deployment = {
+                'apiVersion': 'apps/v1',
+                'kind': 'Deployment',
+                'metadata': {
+                    'name': workload_name,
+                    'namespace': 'edge-computing',
+                    'labels': {
+                        'app': workload_name,
+                        'edge-zone': zone,
+                        'edge-capability': capability,
+                        'edge-profile': profile_name
+                    }
+                },
+                'spec': {
+                    'replicas': 1,
+                    'selector': {
+                        'matchLabels': {
+                            'app': workload_name
+                        }
+                    },
+                    'template': {
+                        'metadata': {
+                            'labels': {
+                                'app': workload_name,
+                                'edge-zone': zone,
+                                'edge-capability': capability
+                            }
+                        },
+                        'spec': {
+                            'nodeSelector': {
+                                'kubernetes.io/hostname': node['name']
+                            },
+                            'tolerations': [
+                                {
+                                    'key': 'edge-node',
+                                    'operator': 'Equal',
+                                    'value': 'true',
+                                    'effect': 'NoSchedule'
+                                }
+                            ],
+                            'containers': [
+                                {
+                                    'name': capability.replace('_', '-'),
+                                    'image': self.get_workload_image(capability, node['architecture']),
+                                    'resources': {
+                                        'requests': profile['resource_requirements'],
+                                        'limits': {
+                                            'cpu': str(int(profile['resource_requirements']['cpu'][:-1]) * 2) + 'm',
+                                            'memory': profile['resource_requirements']['memory']
+                                        }
+                                    },
+                                    'env': [
+                                        {
+                                            'name': 'EDGE_ZONE',
+                                            'value': zone
+                                        },
+                                        {
+                                            'name': 'EDGE_CAPABILITY',
+                                            'value': capability
+                                        },
+                                        {
+                                            'name': 'NODE_ARCH',
+                                            'value': node['architecture']
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+            
+            try:
+                # Deploy the workload
+                self.apps_v1.create_namespaced_deployment(
+                    namespace='edge-computing',
+                    body=deployment
+                )
+                
+                # Track assignment
+                if node['name'] not in self.workload_assignments:
+                    self.workload_assignments[node['name']] = []
+                self.workload_assignments[node['name']].append({
+                    'workload': workload_name,
+                    'capability': capability,
+                    'zone': zone,
+                    'deployed_at': datetime.now().isoformat()
+                })
+                
+                # Store in Redis
+                self.redis_client.hset(
+                    f"edge:workloads",
+                    workload_name,
+                    json.dumps({
+                        'node': node['name'],
+                        'capability': capability,
+                        'zone': zone,
+                        'profile': profile_name,
+                        'deployed_at': datetime.now().isoformat()
+                    })
+                )
+                
+                logger.info(f"Successfully deployed {workload_name}")
+                
+            except Exception as e:
+                logger.error(f"Failed to deploy {workload_name}: {e}")
+        
+        def get_workload_image(self, capability: str, architecture: str) -> str:
+            """Get appropriate container image for workload and architecture"""
+            
+            base_images = {
+                'sensor-processing': 'homelab/edge-sensor-processor',
+                'video-analytics': 'homelab/edge-video-analytics',
+                'environmental-monitoring': 'homelab/edge-env-monitor',
+                'security-cameras': 'homelab/edge-security-cam',
+                'sensor-collection': 'homelab/edge-sensor-collector',
+                'motion-detection': 'homelab/edge-motion-detect',
+                'lighting-control': 'homelab/edge-lighting'
+            }
+            
+            base_image = base_images.get(capability, 'alpine:latest')
+            
+            # Add architecture suffix for multi-arch images
+            if architecture in ['arm64', 'arm']:
+                return f"{base_image}:{architecture}"
+            else:
+                return f"{base_image}:latest"
+        
+        async def monitor_edge_health(self):
+            """Monitor health of edge workloads"""
+            while True:
+                try:
+                    logger.info("Monitoring edge workload health...")
+                    
+                    # Check all edge deployments
+                    deployments = self.apps_v1.list_namespaced_deployment(
+                        namespace='edge-computing',
+                        label_selector='edge-zone'
+                    )
+                    
+                    for deployment in deployments.items:
+                        name = deployment.metadata.name
+                        status = deployment.status
+                        
+                        # Check if deployment is healthy
+                        ready_replicas = status.ready_replicas or 0
+                        desired_replicas = status.replicas or 0
+                        
+                        health_status = {
+                            'name': name,
+                            'ready_replicas': ready_replicas,
+                            'desired_replicas': desired_replicas,
+                            'healthy': ready_replicas == desired_replicas,
+                            'last_check': datetime.now().isoformat()
+                        }
+                        
+                        # Store health status
+                        self.redis_client.hset(
+                            'edge:health',
+                            name,
+                            json.dumps(health_status)
+                        )
+                        
+                        # Alert if unhealthy
+                        if not health_status['healthy']:
+                            logger.warning(f"Edge workload {name} is unhealthy: {ready_replicas}/{desired_replicas}")
+                
+                except Exception as e:
+                    logger.error(f"Error monitoring edge health: {e}")
+                
+                await asyncio.sleep(30)  # Check every 30 seconds
+        
+        async def api_handler(self, request):
+            """Handle API requests"""
+            path = request.path
+            
+            if path == '/health':
+                return web.json_response({'status': 'healthy'})
+            elif path == '/nodes':
+                return web.json_response(self.edge_nodes)
+            elif path == '/workloads':
+                return web.json_response(self.workload_assignments)
+            elif path == '/zones':
+                return web.json_response(self.edge_config['zones'])
+            else:
+                return web.json_response({'error': 'Not found'}, status=404)
+        
+        async def run(self):
+            """Main run loop"""
+            logger.info("Starting Edge Orchestrator...")
+            
+            # Set up web server
+            app = web.Application()
+            app.router.add_get('/{path:.*}', self.api_handler)
+            
+            # Start background tasks
+            tasks = [
+                asyncio.create_task(self.monitor_edge_health()),
+                asyncio.create_task(self.periodic_discovery()),
+                asyncio.create_task(self.start_web_server(app))
+            ]
+            
+            # Initial discovery and assignment
+            await self.discover_edge_nodes()
+            await self.assign_workloads()
+            
+            # Run forever
+            await asyncio.gather(*tasks)
+        
+        async def periodic_discovery(self):
+            """Periodically rediscover and reassign workloads"""
+            while True:
+                await asyncio.sleep(300)  # Every 5 minutes
+                await self.discover_edge_nodes()
+                await self.assign_workloads()
+        
+        async def start_web_server(self, app):
+            """Start the web server"""
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, '0.0.0.0', 8080)
+            await site.start()
+            logger.info("API server started on port 8080")
+            
+            # Keep running
+            while True:
+                await asyncio.sleep(3600)
+    
+    if __name__ == "__main__":
+        orchestrator = EdgeOrchestrator()
+        asyncio.run(orchestrator.run())
+
+---
+# Redis for edge state management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-redis
+  namespace: edge-computing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-redis
+  template:
+    metadata:
+      labels:
+        app: edge-redis
+    spec:
+      # Prefer ARM64 for power efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-redis
+  namespace: edge-computing
+spec:
+  selector:
+    app: edge-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+# Edge workload examples
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: edge-sensor-collector
+  namespace: edge-computing
+spec:
+  selector:
+    matchLabels:
+      app: edge-sensor-collector
+  template:
+    metadata:
+      labels:
+        app: edge-sensor-collector
+    spec:
+      nodeSelector:
+        edge-capable: "true"
+        edge-tier: "sensor"
+      tolerations:
+      - key: edge-node
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      hostNetwork: true
+      containers:
+      - name: sensor-collector
+        image: alpine:latest
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          echo "Edge sensor collector starting on $(uname -m)..."
+          
+          while true; do
+            # Simulate sensor data collection
+            TIMESTAMP=$(date -Iseconds)
+            CPU_TEMP=$(cat /host/sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo "0")
+            CPU_TEMP_C=$((CPU_TEMP / 1000))
+            
+            LOAD_AVG=$(cat /host/proc/loadavg | awk '{print $1}')
+            
+            # Send data to central collector
+            echo "{\"timestamp\":\"$TIMESTAMP\",\"node\":\"$NODE_NAME\",\"zone\":\"$EDGE_ZONE\",\"cpu_temp\":$CPU_TEMP_C,\"load\":$LOAD_AVG}" > /tmp/sensor-data.json
+            
+            # In real implementation, this would send to message queue or API
+            echo "Collected sensor data: $(cat /tmp/sensor-data.json)"
+            
+            sleep 30
+          done
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: EDGE_ZONE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['edge-zone']
+        resources:
+          requests:
+            cpu: "25m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "64Mi"
+        volumeMounts:
+        - name: host-sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: host-proc
+          mountPath: /host/proc
+          readOnly: true
+      volumes:
+      - name: host-sys
+        hostPath:
+          path: /sys
+      - name: host-proc
+        hostPath:
+          path: /proc
+
+---
+# Edge data processing pipeline
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: edge-data-aggregator
+  namespace: edge-computing
+spec:
+  schedule: "*/2 * * * *"  # Every 2 minutes
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: arm64
+            edge-tier: processing
+          containers:
+          - name: aggregator
+            image: python:3.11-alpine
+            command: ["/bin/sh"]
+            args:
+            - -c
+            - |
+              pip install redis requests
+              python3 -c "
+              import redis, json, time
+              from datetime import datetime, timedelta
+              
+              # Connect to Redis
+              r = redis.Redis(host='edge-redis', port=6379, decode_responses=True)
+              
+              print('Processing edge data aggregation...')
+              
+              # Collect data from all edge zones
+              zones = ['living-room', 'garage', 'outdoor']
+              
+              for zone in zones:
+                  print(f'Processing zone: {zone}')
+                  
+                  # In real implementation, collect from sensor data
+                  # This is a simulation
+                  aggregated_data = {
+                      'zone': zone,
+                      'timestamp': datetime.now().isoformat(),
+                      'sensor_count': 5,
+                      'avg_temperature': 22.5,
+                      'avg_load': 0.3,
+                      'alerts': []
+                  }
+                  
+                  # Store aggregated data
+                  r.hset(f'edge:aggregated:{zone}', 
+                         datetime.now().strftime('%Y%m%d%H%M'),
+                         json.dumps(aggregated_data))
+                  
+                  print(f'Aggregated data for {zone}: {aggregated_data}')
+              
+              print('Edge data aggregation completed')
+              "
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "128Mi"
+              limits:
+                cpu: "300m"
+                memory: "256Mi"
+          restartPolicy: OnFailure
+
+---
+# RBAC for edge orchestrator
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edge-orchestrator
+  namespace: edge-computing
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: edge-orchestrator
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: edge-orchestrator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edge-orchestrator
+subjects:
+- kind: ServiceAccount
+  name: edge-orchestrator
+  namespace: edge-computing
+
+---
+# Service for edge orchestrator API
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-orchestrator
+  namespace: edge-computing
+spec:
+  selector:
+    app: edge-orchestrator
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: api
+
+---
+# Initialize edge nodes
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: initialize-edge-nodes
+  namespace: edge-computing
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      restartPolicy: OnFailure
+      containers:
+      - name: initializer
+        image: bitnami/kubectl:latest
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          echo "Initializing edge computing nodes..."
+          
+          # Run edge discovery script
+          /scripts/edge-discovery.sh
+          
+          # Add edge node tolerations
+          kubectl get nodes -l edge-capable=true -o name | while read node; do
+            echo "Adding edge tolerations to $node"
+            kubectl taint $node edge-node=true:NoSchedule --overwrite
+          done
+          
+          echo "Edge node initialization completed"
+        volumeMounts:
+        - name: edge-config
+          mountPath: /scripts
+      volumes:
+      - name: edge-config
+        configMap:
+          name: edge-config
+          defaultMode: 0755

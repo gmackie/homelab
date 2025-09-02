@@ -1,0 +1,1486 @@
+# NATS + CloudEvents Event-Driven Architecture for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: event-driven
+  labels:
+    name: event-driven
+
+---
+# NATS configuration for multi-arch deployment
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: event-driven
+data:
+  nats.conf: |
+    # NATS Server Configuration for Multi-Architecture Homelab
+    server_name: homelab-nats
+    
+    # Network settings
+    host: "0.0.0.0"
+    port: 4222
+    
+    # HTTP monitoring
+    http_port: 8222
+    
+    # Clustering settings
+    cluster {
+      name: homelab
+      host: "0.0.0.0"
+      port: 6222
+      
+      # Routes to other NATS servers
+      routes: [
+        "nats://nats-0.nats:6222"
+        "nats://nats-1.nats:6222"
+        "nats://nats-2.nats:6222"
+      ]
+    }
+    
+    # JetStream settings
+    jetstream {
+      store_dir: "/data/jetstream"
+      max_memory_store: 1GB
+      max_file_store: 10GB
+      
+      # Architecture-specific stream placement
+      placement {
+        tags: ["arch:$NATS_ARCH"]
+      }
+    }
+    
+    # Logging
+    log_file: "/var/log/nats.log"
+    logtime: true
+    debug: false
+    trace: false
+    
+    # Authorization (simple for homelab)
+    authorization {
+      users: [
+        {
+          user: "admin"
+          password: "nats123"
+          permissions: {
+            publish: ">"
+            subscribe: ">"
+          }
+        }
+        {
+          user: "apps"
+          password: "apps123"
+          permissions: {
+            publish: ["events.>", "commands.>", "telemetry.>"]
+            subscribe: ["events.>", "notifications.>", "responses.>"]
+          }
+        }
+      ]
+    }
+
+  jetstream.conf: |
+    # JetStream configuration
+    jetstream: enabled
+    
+    # Architecture-aware streams
+    streams: [
+      {
+        name: "TELEMETRY"
+        subjects: ["telemetry.*.>"]
+        storage: file
+        max_age: "7d"
+        placement: {
+          tags: ["arch:arm", "arch:arm64"]  # IoT data on ARM nodes
+        }
+      }
+      {
+        name: "EVENTS" 
+        subjects: ["events.>"]
+        storage: file
+        max_age: "30d"
+        placement: {
+          tags: ["arch:amd64"]  # Critical events on AMD64
+        }
+      }
+      {
+        name: "COMMANDS"
+        subjects: ["commands.>"]
+        storage: memory
+        max_age: "1h"
+        placement: {
+          tags: ["arch:amd64", "arch:arm64"]  # Fast command processing
+        }
+      }
+      {
+        name: "ML_INFERENCE"
+        subjects: ["ml.inference.>", "ml.results.>"]
+        storage: file
+        max_age: "24h"
+        placement: {
+          tags: ["arch:amd64"]  # ML workloads on AMD64
+        }
+      }
+    ]
+
+---
+# NATS StatefulSet for clustering
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+  namespace: event-driven
+spec:
+  serviceName: nats
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      # Distribute across different architectures
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: [nats]
+              topologyKey: kubernetes.io/hostname
+          - weight: 50
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: [nats]
+              topologyKey: kubernetes.io/arch
+      containers:
+      - name: nats
+        image: nats:2.10-alpine
+        args:
+        - "--config"
+        - "/etc/nats/nats.conf"
+        env:
+        - name: NATS_ARCH
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['kubernetes.io/arch']
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - containerPort: 4222
+          name: nats
+        - containerPort: 6222
+          name: cluster
+        - containerPort: 8222
+          name: monitor
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/nats
+        - name: data-volume
+          mountPath: /data
+        - name: log-volume
+          mountPath: /var/log
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8222
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8222
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config-volume
+        configMap:
+          name: nats-config
+      - name: log-volume
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data-volume
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ssd
+      resources:
+        requests:
+          storage: 5Gi
+
+---
+# Event Producer for architecture-aware events
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-producer
+  namespace: event-driven
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: event-producer
+  template:
+    metadata:
+      labels:
+        app: event-producer
+    spec:
+      serviceAccountName: event-producer
+      containers:
+      - name: producer
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install asyncio-nats-client cloudevents prometheus-client kubernetes
+          python3 /app/event_producer.py
+        volumeMounts:
+        - name: producer-app
+          mountPath: /app
+        env:
+        - name: NATS_URL
+          value: "nats://apps:apps123@nats:4222"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: producer-app
+        configMap:
+          name: event-producer-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: event-producer-app
+  namespace: event-driven
+data:
+  event_producer.py: |
+    #!/usr/bin/env python3
+    import asyncio
+    import json
+    import logging
+    import os
+    import time
+    import random
+    from datetime import datetime, timezone
+    from typing import Dict, Any
+    
+    import nats
+    from cloudevents.http import CloudEvent
+    from prometheus_client import Counter, Histogram, Gauge, start_http_server
+    from kubernetes import client, config
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Prometheus metrics
+    EVENTS_PRODUCED = Counter('events_produced_total', 'Total events produced', ['event_type', 'architecture'])
+    EVENT_LATENCY = Histogram('event_production_latency_seconds', 'Event production latency', ['event_type'])
+    ACTIVE_CONNECTIONS = Gauge('nats_connections_active', 'Active NATS connections')
+    CLUSTER_HEALTH = Gauge('cluster_health_score', 'Cluster health score')
+    
+    class EventProducer:
+        def __init__(self):
+            self.nats_client = None
+            self.js = None  # JetStream context
+            self.node_name = os.getenv("NODE_NAME", "unknown")
+            self.namespace = os.getenv("POD_NAMESPACE", "default")
+            
+            # Initialize Kubernetes client
+            try:
+                config.load_incluster_config()
+                self.k8s_client = client.CoreV1Api()
+                self.apps_client = client.AppsV1Api()
+                self.metrics_client = client.CustomObjectsApi()
+            except Exception as e:
+                logger.error(f"Failed to initialize K8s client: {e}")
+                self.k8s_client = None
+        
+        async def connect_nats(self):
+            """Connect to NATS"""
+            nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
+            
+            try:
+                self.nats_client = await nats.connect(nats_url)
+                self.js = self.nats_client.jetstream()
+                
+                ACTIVE_CONNECTIONS.set(1)
+                logger.info(f"Connected to NATS at {nats_url}")
+                
+                # Create streams if they don't exist
+                await self.setup_streams()
+                
+            except Exception as e:
+                logger.error(f"Failed to connect to NATS: {e}")
+                ACTIVE_CONNECTIONS.set(0)
+                raise
+        
+        async def setup_streams(self):
+            """Setup JetStream streams"""
+            streams = [
+                {
+                    "name": "TELEMETRY",
+                    "subjects": ["telemetry.*.*"],
+                    "storage": "file",
+                    "max_age": 7 * 24 * 3600,  # 7 days
+                },
+                {
+                    "name": "EVENTS",
+                    "subjects": ["events.*"],
+                    "storage": "file", 
+                    "max_age": 30 * 24 * 3600,  # 30 days
+                },
+                {
+                    "name": "COMMANDS",
+                    "subjects": ["commands.*"],
+                    "storage": "memory",
+                    "max_age": 3600,  # 1 hour
+                },
+                {
+                    "name": "ML_INFERENCE",
+                    "subjects": ["ml.inference.*", "ml.results.*"],
+                    "storage": "file",
+                    "max_age": 24 * 3600,  # 24 hours
+                }
+            ]
+            
+            for stream_config in streams:
+                try:
+                    await self.js.stream_info(stream_config["name"])
+                    logger.info(f"Stream {stream_config['name']} already exists")
+                except:
+                    try:
+                        await self.js.add_stream(
+                            name=stream_config["name"],
+                            subjects=stream_config["subjects"],
+                            storage=stream_config["storage"],
+                            max_age=stream_config["max_age"]
+                        )
+                        logger.info(f"Created stream {stream_config['name']}")
+                    except Exception as e:
+                        logger.error(f"Failed to create stream {stream_config['name']}: {e}")
+        
+        def create_cloud_event(self, event_type: str, source: str, data: Dict[Any, Any]) -> CloudEvent:
+            """Create a CloudEvent"""
+            attributes = {
+                "type": f"homelab.{event_type}",
+                "source": f"homelab/{source}",
+                "id": f"{event_type}-{int(time.time() * 1000)}",
+                "time": datetime.now(timezone.utc).isoformat(),
+                "datacontenttype": "application/json",
+                "specversion": "1.0"
+            }
+            
+            # Add homelab-specific extensions
+            attributes["architecture"] = self.get_node_architecture()
+            attributes["cluster"] = "homelab-multiarch"
+            attributes["namespace"] = self.namespace
+            attributes["node"] = self.node_name
+            
+            return CloudEvent(attributes, data)
+        
+        def get_node_architecture(self) -> str:
+            """Get node architecture"""
+            if not self.k8s_client:
+                return "unknown"
+            
+            try:
+                node = self.k8s_client.read_node(self.node_name)
+                return node.metadata.labels.get("kubernetes.io/arch", "unknown")
+            except:
+                return "unknown"
+        
+        async def produce_telemetry_events(self):
+            """Produce telemetry events from different architectures"""
+            while True:
+                try:
+                    # Get cluster metrics
+                    cluster_metrics = await self.get_cluster_metrics()
+                    
+                    # Create telemetry event
+                    event = self.create_cloud_event(
+                        event_type="telemetry.cluster",
+                        source="monitoring/cluster",
+                        data=cluster_metrics
+                    )
+                    
+                    # Publish to NATS
+                    start_time = time.time()
+                    subject = f"telemetry.{self.get_node_architecture()}.cluster"
+                    
+                    await self.nats_client.publish(
+                        subject,
+                        json.dumps(event).encode()
+                    )
+                    
+                    # Metrics
+                    EVENT_LATENCY.labels(event_type="telemetry").observe(time.time() - start_time)
+                    EVENTS_PRODUCED.labels(event_type="telemetry", architecture=self.get_node_architecture()).inc()
+                    
+                    logger.info(f"Published telemetry event to {subject}")
+                    
+                    await asyncio.sleep(30)  # Every 30 seconds
+                    
+                except Exception as e:
+                    logger.error(f"Failed to produce telemetry event: {e}")
+                    await asyncio.sleep(10)
+        
+        async def produce_ml_events(self):
+            """Produce ML-related events"""
+            while True:
+                try:
+                    # Simulate ML inference request
+                    inference_data = {
+                        "model_name": random.choice(["fraud_detection", "spam_classifier", "sensor_predictor"]),
+                        "architecture": self.get_node_architecture(),
+                        "input_size": random.randint(1, 100),
+                        "timestamp": time.time(),
+                        "request_id": f"req-{random.randint(1000, 9999)}"
+                    }
+                    
+                    # Create inference request event
+                    event = self.create_cloud_event(
+                        event_type="ml.inference.request",
+                        source="ml-serving/client",
+                        data=inference_data
+                    )
+                    
+                    # Publish to NATS
+                    subject = "ml.inference.request"
+                    await self.nats_client.publish(
+                        subject,
+                        json.dumps(event).encode()
+                    )
+                    
+                    EVENTS_PRODUCED.labels(event_type="ml_inference", architecture=self.get_node_architecture()).inc()
+                    
+                    # Simulate processing time based on architecture
+                    arch = self.get_node_architecture()
+                    if arch == "amd64":
+                        processing_time = random.uniform(0.1, 0.5)  # Fast
+                    elif arch == "arm64": 
+                        processing_time = random.uniform(0.2, 0.8)  # Medium
+                    else:  # arm
+                        processing_time = random.uniform(0.5, 2.0)  # Slow
+                    
+                    await asyncio.sleep(processing_time)
+                    
+                    # Produce result event
+                    result_data = {
+                        "request_id": inference_data["request_id"],
+                        "model_name": inference_data["model_name"],
+                        "architecture": arch,
+                        "processing_time_ms": processing_time * 1000,
+                        "result": random.uniform(0, 1),
+                        "confidence": random.uniform(0.8, 1.0),
+                        "timestamp": time.time()
+                    }
+                    
+                    result_event = self.create_cloud_event(
+                        event_type="ml.inference.result",
+                        source=f"ml-serving/{arch}",
+                        data=result_data
+                    )
+                    
+                    await self.nats_client.publish(
+                        "ml.results.inference",
+                        json.dumps(result_event).encode()
+                    )
+                    
+                    logger.info(f"Published ML inference events for {inference_data['model_name']}")
+                    
+                    await asyncio.sleep(random.uniform(5, 15))  # Random interval
+                    
+                except Exception as e:
+                    logger.error(f"Failed to produce ML event: {e}")
+                    await asyncio.sleep(5)
+        
+        async def produce_system_events(self):
+            """Produce system events"""
+            while True:
+                try:
+                    # Generate different types of system events
+                    event_types = [
+                        ("deployment.scaled", "apps/deployment"),
+                        ("node.resource.warning", "system/node"),
+                        ("pod.failed", "system/pod"),
+                        ("service.unavailable", "network/service"),
+                        ("storage.threshold", "storage/volume")
+                    ]
+                    
+                    event_type, source = random.choice(event_types)
+                    
+                    # Generate event data based on type
+                    if "deployment" in event_type:
+                        data = {
+                            "deployment": f"app-{random.randint(1, 10)}",
+                            "namespace": random.choice(["default", "ml-serving", "monitoring"]),
+                            "old_replicas": random.randint(1, 3),
+                            "new_replicas": random.randint(1, 5),
+                            "architecture": self.get_node_architecture()
+                        }
+                    elif "resource" in event_type:
+                        data = {
+                            "node": self.node_name,
+                            "architecture": self.get_node_architecture(),
+                            "cpu_usage": random.uniform(70, 95),
+                            "memory_usage": random.uniform(60, 90),
+                            "threshold": 80
+                        }
+                    else:
+                        data = {
+                            "component": random.choice(["api-server", "etcd", "kubelet"]),
+                            "node": self.node_name,
+                            "architecture": self.get_node_architecture(),
+                            "severity": random.choice(["warning", "error", "critical"])
+                        }
+                    
+                    event = self.create_cloud_event(
+                        event_type=event_type,
+                        source=source,
+                        data=data
+                    )
+                    
+                    # Publish to appropriate subject
+                    if "warning" in event_type or "failed" in event_type:
+                        subject = "events.alerts"
+                    else:
+                        subject = "events.system"
+                    
+                    await self.nats_client.publish(
+                        subject,
+                        json.dumps(event).encode()
+                    )
+                    
+                    EVENTS_PRODUCED.labels(event_type="system", architecture=self.get_node_architecture()).inc()
+                    
+                    logger.info(f"Published system event: {event_type}")
+                    
+                    await asyncio.sleep(random.uniform(60, 300))  # 1-5 minutes
+                    
+                except Exception as e:
+                    logger.error(f"Failed to produce system event: {e}")
+                    await asyncio.sleep(30)
+        
+        async def get_cluster_metrics(self) -> Dict:
+            """Get cluster metrics for telemetry"""
+            metrics = {
+                "timestamp": time.time(),
+                "cluster_name": "homelab-multiarch",
+                "node": self.node_name,
+                "architecture": self.get_node_architecture()
+            }
+            
+            if self.k8s_client:
+                try:
+                    # Get node metrics
+                    nodes = self.k8s_client.list_node()
+                    metrics["total_nodes"] = len(nodes.items)
+                    
+                    arch_count = {}
+                    for node in nodes.items:
+                        arch = node.metadata.labels.get("kubernetes.io/arch", "unknown")
+                        arch_count[arch] = arch_count.get(arch, 0) + 1
+                    metrics["nodes_by_architecture"] = arch_count
+                    
+                    # Get pod metrics
+                    pods = self.k8s_client.list_pod_for_all_namespaces()
+                    metrics["total_pods"] = len(pods.items)
+                    
+                    pod_status = {}
+                    for pod in pods.items:
+                        status = pod.status.phase
+                        pod_status[status] = pod_status.get(status, 0) + 1
+                    metrics["pods_by_status"] = pod_status
+                    
+                    # Calculate health score
+                    running_pods = pod_status.get("Running", 0)
+                    total_pods = metrics["total_pods"]
+                    health_score = (running_pods / total_pods) * 100 if total_pods > 0 else 100
+                    metrics["health_score"] = health_score
+                    CLUSTER_HEALTH.set(health_score)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to get cluster metrics: {e}")
+                    metrics["error"] = str(e)
+            
+            return metrics
+        
+        async def run(self):
+            """Run the event producer"""
+            await self.connect_nats()
+            
+            # Start all producer coroutines
+            await asyncio.gather(
+                self.produce_telemetry_events(),
+                self.produce_ml_events(),
+                self.produce_system_events()
+            )
+    
+    async def main():
+        # Start Prometheus metrics server
+        start_http_server(8080)
+        logger.info("Prometheus metrics server started on port 8080")
+        
+        # Create and run event producer
+        producer = EventProducer()
+        await producer.run()
+    
+    if __name__ == "__main__":
+        asyncio.run(main())
+
+---
+# Event Consumer for different architectures
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-consumer-amd64
+  namespace: event-driven
+  labels:
+    app: event-consumer
+    architecture: amd64
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: event-consumer
+      architecture: amd64
+  template:
+    metadata:
+      labels:
+        app: event-consumer
+        architecture: amd64
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: consumer
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install asyncio-nats-client cloudevents prometheus-client
+          python3 /app/event_consumer.py
+        volumeMounts:
+        - name: consumer-app
+          mountPath: /app
+        env:
+        - name: NATS_URL
+          value: "nats://apps:apps123@nats:4222"
+        - name: CONSUMER_GROUP
+          value: "amd64-processors"
+        - name: ARCHITECTURE
+          value: "amd64"
+        - name: CONSUMER_SUBJECTS
+          value: "events.alerts,ml.inference.request,commands.>"
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+      volumes:
+      - name: consumer-app
+        configMap:
+          name: event-consumer-app
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-consumer-arm64
+  namespace: event-driven
+  labels:
+    app: event-consumer
+    architecture: arm64
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: event-consumer
+      architecture: arm64
+  template:
+    metadata:
+      labels:
+        app: event-consumer
+        architecture: arm64
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: consumer
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install asyncio-nats-client cloudevents prometheus-client
+          python3 /app/event_consumer.py
+        volumeMounts:
+        - name: consumer-app
+          mountPath: /app
+        env:
+        - name: NATS_URL
+          value: "nats://apps:apps123@nats:4222"
+        - name: CONSUMER_GROUP
+          value: "arm64-processors"
+        - name: ARCHITECTURE
+          value: "arm64"
+        - name: CONSUMER_SUBJECTS
+          value: "telemetry.arm64.*,ml.results.*,events.system"
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: consumer-app
+        configMap:
+          name: event-consumer-app
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: event-consumer-arm
+  namespace: event-driven
+  labels:
+    app: event-consumer
+    architecture: arm
+spec:
+  selector:
+    matchLabels:
+      app: event-consumer
+      architecture: arm
+  template:
+    metadata:
+      labels:
+        app: event-consumer
+        architecture: arm
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: consumer
+        image: python:3.11-alpine
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          pip install asyncio-nats-client cloudevents prometheus-client --no-cache-dir
+          python3 /app/event_consumer.py
+        volumeMounts:
+        - name: consumer-app
+          mountPath: /app
+        env:
+        - name: NATS_URL
+          value: "nats://apps:apps123@nats:4222"
+        - name: CONSUMER_GROUP
+          value: "arm-processors"
+        - name: ARCHITECTURE
+          value: "arm"
+        - name: CONSUMER_SUBJECTS
+          value: "telemetry.arm.*,events.system"
+        ports:
+        - containerPort: 8080
+          name: metrics
+          hostPort: 8081  # Different port for ARM
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+      volumes:
+      - name: consumer-app
+        configMap:
+          name: event-consumer-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: event-consumer-app
+  namespace: event-driven
+data:
+  event_consumer.py: |
+    #!/usr/bin/env python3
+    import asyncio
+    import json
+    import logging
+    import os
+    import time
+    from typing import Dict, List
+    
+    import nats
+    from cloudevents.http import CloudEvent
+    from prometheus_client import Counter, Histogram, Gauge, start_http_server
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Prometheus metrics
+    EVENTS_CONSUMED = Counter('events_consumed_total', 'Total events consumed', ['event_type', 'architecture', 'consumer_group'])
+    EVENT_PROCESSING_TIME = Histogram('event_processing_seconds', 'Event processing time', ['event_type', 'architecture'])
+    QUEUE_DEPTH = Gauge('event_queue_depth', 'Event queue depth', ['subject', 'consumer_group'])
+    CONSUMER_LAG = Gauge('consumer_lag_seconds', 'Consumer lag in seconds', ['subject', 'consumer_group'])
+    
+    class EventConsumer:
+        def __init__(self):
+            self.nats_client = None
+            self.js = None
+            self.architecture = os.getenv("ARCHITECTURE", "unknown")
+            self.consumer_group = os.getenv("CONSUMER_GROUP", "default")
+            self.subjects = os.getenv("CONSUMER_SUBJECTS", "events.*").split(",")
+            
+        async def connect_nats(self):
+            """Connect to NATS"""
+            nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
+            
+            try:
+                self.nats_client = await nats.connect(nats_url)
+                self.js = self.nats_client.jetstream()
+                logger.info(f"Connected to NATS at {nats_url}")
+                
+            except Exception as e:
+                logger.error(f"Failed to connect to NATS: {e}")
+                raise
+        
+        async def process_telemetry_event(self, event_data: Dict):
+            """Process telemetry events"""
+            start_time = time.time()
+            
+            try:
+                cluster_name = event_data.get("cluster_name", "unknown")
+                architecture = event_data.get("architecture", "unknown") 
+                health_score = event_data.get("health_score", 0)
+                
+                logger.info(f"Processing telemetry from {architecture} cluster: health={health_score}%")
+                
+                # Architecture-specific processing
+                if self.architecture == "amd64":
+                    # Heavy analytics on AMD64
+                    if health_score < 80:
+                        logger.warning(f"Cluster health degraded: {health_score}%")
+                        await self.send_alert("cluster.health.degraded", event_data)
+                
+                elif self.architecture == "arm64":
+                    # Efficient processing on ARM64
+                    await self.update_dashboard_metrics(event_data)
+                    
+                elif self.architecture == "arm":
+                    # Minimal processing on ARM
+                    if health_score < 50:
+                        logger.critical(f"Critical cluster health: {health_score}%")
+                
+                processing_time = time.time() - start_time
+                EVENT_PROCESSING_TIME.labels(event_type="telemetry", architecture=self.architecture).observe(processing_time)
+                
+            except Exception as e:
+                logger.error(f"Failed to process telemetry event: {e}")
+        
+        async def process_ml_event(self, event_data: Dict):
+            """Process ML events"""
+            start_time = time.time()
+            
+            try:
+                if "inference.request" in event_data.get("type", ""):
+                    # Process ML inference request
+                    model_name = event_data.get("data", {}).get("model_name", "unknown")
+                    request_architecture = event_data.get("architecture", "unknown")
+                    
+                    logger.info(f"Processing ML inference request for {model_name} on {request_architecture}")
+                    
+                    # Route based on our architecture
+                    if self.architecture == "amd64":
+                        # Handle heavy ML models
+                        if model_name in ["fraud_detection", "deep_learning_model"]:
+                            result = await self.process_heavy_ml(event_data)
+                            await self.publish_ml_result(result)
+                    
+                    elif self.architecture == "arm64":
+                        # Handle medium ML models
+                        if model_name in ["spam_classifier", "lightweight_model"]:
+                            result = await self.process_medium_ml(event_data)
+                            await self.publish_ml_result(result)
+                
+                elif "inference.result" in event_data.get("type", ""):
+                    # Process ML results
+                    await self.store_ml_result(event_data)
+                
+                processing_time = time.time() - start_time
+                EVENT_PROCESSING_TIME.labels(event_type="ml", architecture=self.architecture).observe(processing_time)
+                
+            except Exception as e:
+                logger.error(f"Failed to process ML event: {e}")
+        
+        async def process_system_event(self, event_data: Dict):
+            """Process system events"""
+            start_time = time.time()
+            
+            try:
+                event_type = event_data.get("type", "")
+                severity = event_data.get("data", {}).get("severity", "info")
+                
+                logger.info(f"Processing system event: {event_type} (severity: {severity})")
+                
+                # Route alerts based on architecture capabilities
+                if severity in ["error", "critical"]:
+                    if self.architecture == "amd64":
+                        # Heavy analysis and automated remediation
+                        await self.analyze_and_remediate(event_data)
+                    else:
+                        # Forward to AMD64 for processing
+                        await self.forward_to_amd64(event_data)
+                
+                elif severity == "warning":
+                    # All architectures can handle warnings
+                    await self.log_warning(event_data)
+                
+                processing_time = time.time() - start_time
+                EVENT_PROCESSING_TIME.labels(event_type="system", architecture=self.architecture).observe(processing_time)
+                
+            except Exception as e:
+                logger.error(f"Failed to process system event: {e}")
+        
+        async def process_heavy_ml(self, event_data: Dict) -> Dict:
+            """Process heavy ML workload on AMD64"""
+            # Simulate heavy computation
+            await asyncio.sleep(0.5)  # 500ms processing
+            
+            return {
+                "request_id": event_data.get("data", {}).get("request_id"),
+                "result": 0.85,
+                "confidence": 0.92,
+                "processing_node": self.architecture,
+                "processing_time_ms": 500
+            }
+        
+        async def process_medium_ml(self, event_data: Dict) -> Dict:
+            """Process medium ML workload on ARM64"""
+            # Simulate medium computation
+            await asyncio.sleep(0.2)  # 200ms processing
+            
+            return {
+                "request_id": event_data.get("data", {}).get("request_id"), 
+                "result": 0.78,
+                "confidence": 0.88,
+                "processing_node": self.architecture,
+                "processing_time_ms": 200
+            }
+        
+        async def publish_ml_result(self, result: Dict):
+            """Publish ML result"""
+            event = {
+                "type": "homelab.ml.inference.result",
+                "source": f"ml-consumer/{self.architecture}",
+                "data": result,
+                "timestamp": time.time()
+            }
+            
+            await self.nats_client.publish(
+                "ml.results.inference",
+                json.dumps(event).encode()
+            )
+        
+        async def store_ml_result(self, event_data: Dict):
+            """Store ML result"""
+            logger.info(f"Storing ML result: {event_data.get('data', {}).get('request_id')}")
+        
+        async def send_alert(self, alert_type: str, data: Dict):
+            """Send alert"""
+            alert = {
+                "type": f"homelab.alert.{alert_type}",
+                "source": f"consumer/{self.architecture}",
+                "data": data,
+                "timestamp": time.time(),
+                "severity": "warning"
+            }
+            
+            await self.nats_client.publish("events.alerts", json.dumps(alert).encode())
+            logger.info(f"Sent alert: {alert_type}")
+        
+        async def update_dashboard_metrics(self, data: Dict):
+            """Update dashboard metrics (ARM64 efficient)"""
+            logger.info("Updated dashboard metrics")
+        
+        async def analyze_and_remediate(self, event_data: Dict):
+            """Analyze and remediate (AMD64 heavy processing)"""
+            # Simulate analysis
+            await asyncio.sleep(1.0)
+            logger.info("Performed analysis and automated remediation")
+        
+        async def forward_to_amd64(self, event_data: Dict):
+            """Forward event to AMD64 for processing"""
+            await self.nats_client.publish("commands.remediate", json.dumps(event_data).encode())
+            logger.info("Forwarded event to AMD64 for remediation")
+        
+        async def log_warning(self, event_data: Dict):
+            """Log warning"""
+            logger.warning(f"System warning: {event_data}")
+        
+        async def message_handler(self, msg):
+            """Handle incoming NATS messages"""
+            start_time = time.time()
+            
+            try:
+                # Parse CloudEvent
+                event_data = json.loads(msg.data.decode())
+                event_type = event_data.get("type", "unknown")
+                
+                # Update metrics
+                EVENTS_CONSUMED.labels(
+                    event_type=event_type.split('.')[-1],
+                    architecture=self.architecture,
+                    consumer_group=self.consumer_group
+                ).inc()
+                
+                # Calculate lag
+                event_timestamp = event_data.get("timestamp", time.time())
+                lag = time.time() - event_timestamp
+                CONSUMER_LAG.labels(subject=msg.subject, consumer_group=self.consumer_group).set(lag)
+                
+                # Route to appropriate processor
+                if "telemetry" in event_type:
+                    await self.process_telemetry_event(event_data)
+                elif "ml" in event_type:
+                    await self.process_ml_event(event_data)
+                elif "system" in event_type or "alert" in event_type:
+                    await self.process_system_event(event_data)
+                else:
+                    logger.info(f"Unknown event type: {event_type}")
+                
+                # Acknowledge message
+                await msg.ack()
+                
+            except Exception as e:
+                logger.error(f"Failed to process message: {e}")
+                # Negative acknowledge to retry later
+                await msg.nak()
+        
+        async def subscribe_to_subjects(self):
+            """Subscribe to configured subjects"""
+            for subject in self.subjects:
+                subject = subject.strip()
+                logger.info(f"Subscribing to {subject}")
+                
+                try:
+                    # Create consumer if it doesn't exist
+                    consumer_config = {
+                        "durable_name": f"{self.consumer_group}_{subject.replace('.', '_')}",
+                        "deliver_policy": "all",
+                        "ack_policy": "explicit",
+                        "max_deliver": 3,
+                        "ack_wait": 30,
+                        "replay_policy": "instant"
+                    }
+                    
+                    await self.js.subscribe(
+                        subject,
+                        cb=self.message_handler,
+                        **consumer_config
+                    )
+                    
+                    logger.info(f"Subscribed to {subject} with consumer group {self.consumer_group}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to subscribe to {subject}: {e}")
+        
+        async def run(self):
+            """Run the consumer"""
+            await self.connect_nats()
+            await self.subscribe_to_subjects()
+            
+            # Keep running
+            logger.info(f"Consumer running on {self.architecture} with subjects: {self.subjects}")
+            while True:
+                await asyncio.sleep(10)
+                # Update queue depth metrics periodically
+                for subject in self.subjects:
+                    try:
+                        info = await self.js.consumer_info(
+                            f"EVENTS",  # Stream name
+                            f"{self.consumer_group}_{subject.replace('.', '_')}"
+                        )
+                        pending = info.num_pending
+                        QUEUE_DEPTH.labels(subject=subject, consumer_group=self.consumer_group).set(pending)
+                    except:
+                        pass  # Consumer might not exist yet
+    
+    async def main():
+        # Start Prometheus metrics server
+        start_http_server(8080)
+        logger.info("Prometheus metrics server started on port 8080")
+        
+        # Create and run consumer
+        consumer = EventConsumer()
+        await consumer.run()
+    
+    if __name__ == "__main__":
+        asyncio.run(main())
+
+---
+# Event Router for intelligent routing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-router
+  namespace: event-driven
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: event-router
+  template:
+    metadata:
+      labels:
+        app: event-router
+    spec:
+      # Run on AMD64 for routing logic
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: router
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install asyncio-nats-client cloudevents
+          python3 /app/event_router.py
+        volumeMounts:
+        - name: router-app
+          mountPath: /app
+        env:
+        - name: NATS_URL
+          value: "nats://apps:apps123@nats:4222"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+      volumes:
+      - name: router-app
+        configMap:
+          name: event-router-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: event-router-app
+  namespace: event-driven
+data:
+  event_router.py: |
+    #!/usr/bin/env python3
+    import asyncio
+    import json
+    import logging
+    import os
+    from typing import Dict, List
+    
+    import nats
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class EventRouter:
+        def __init__(self):
+            self.nats_client = None
+            self.routing_rules = {
+                # Route heavy ML inference to AMD64
+                "ml.inference.heavy": ["commands.ml.amd64"],
+                "ml.inference.tensorflow": ["commands.ml.amd64"],
+                "ml.inference.pytorch": ["commands.ml.amd64"],
+                
+                # Route lightweight ML to ARM64
+                "ml.inference.sklearn": ["commands.ml.arm64"],
+                "ml.inference.lightgbm": ["commands.ml.arm64"],
+                
+                # Route edge ML to ARM
+                "ml.inference.edge": ["commands.ml.arm"],
+                
+                # Route alerts to all architectures
+                "events.alerts": ["notifications.amd64", "notifications.arm64", "notifications.arm"],
+                
+                # Route telemetry based on source
+                "telemetry.amd64.*": ["analytics.amd64"],
+                "telemetry.arm64.*": ["analytics.arm64", "dashboard.arm64"],
+                "telemetry.arm.*": ["iot.processing.arm"],
+            }
+        
+        async def connect_nats(self):
+            """Connect to NATS"""
+            nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
+            
+            try:
+                self.nats_client = await nats.connect(nats_url)
+                logger.info(f"Connected to NATS at {nats_url}")
+                
+            except Exception as e:
+                logger.error(f"Failed to connect to NATS: {e}")
+                raise
+        
+        def get_routing_destinations(self, subject: str, event_data: Dict) -> List[str]:
+            """Get routing destinations for an event"""
+            destinations = []
+            
+            # Check direct subject matches
+            for pattern, dests in self.routing_rules.items():
+                if self.matches_pattern(subject, pattern):
+                    destinations.extend(dests)
+            
+            # Content-based routing
+            event_type = event_data.get("type", "")
+            event_source = event_data.get("source", "")
+            event_arch = event_data.get("architecture", "")
+            
+            # ML model routing based on content
+            if "ml.inference" in event_type:
+                model_name = event_data.get("data", {}).get("model_name", "")
+                
+                if model_name in ["fraud_detection", "deep_learning"]:
+                    destinations.append("commands.ml.amd64")
+                elif model_name in ["spam_classifier", "lightweight_model"]:
+                    destinations.append("commands.ml.arm64")
+                elif model_name in ["sensor_predictor", "edge_model"]:
+                    destinations.append("commands.ml.arm")
+            
+            # Architecture-specific routing
+            if event_arch:
+                destinations.append(f"telemetry.{event_arch}")
+            
+            # Remove duplicates
+            return list(set(destinations))
+        
+        def matches_pattern(self, subject: str, pattern: str) -> bool:
+            """Check if subject matches pattern"""
+            if pattern == subject:
+                return True
+            
+            # Handle wildcard patterns
+            pattern_parts = pattern.split('.')
+            subject_parts = subject.split('.')
+            
+            if len(pattern_parts) != len(subject_parts):
+                return False
+            
+            for p, s in zip(pattern_parts, subject_parts):
+                if p != "*" and p != s:
+                    return False
+            
+            return True
+        
+        async def route_message(self, msg):
+            """Route message to appropriate destinations"""
+            try:
+                event_data = json.loads(msg.data.decode())
+                destinations = self.get_routing_destinations(msg.subject, event_data)
+                
+                if destinations:
+                    logger.info(f"Routing {msg.subject} to: {destinations}")
+                    
+                    # Forward to each destination
+                    for dest in destinations:
+                        await self.nats_client.publish(dest, msg.data)
+                    
+                    logger.info(f"Routed message from {msg.subject} to {len(destinations)} destinations")
+                else:
+                    logger.info(f"No routing rules for {msg.subject}")
+                
+                await msg.ack()
+                
+            except Exception as e:
+                logger.error(f"Failed to route message: {e}")
+                await msg.nak()
+        
+        async def subscribe_for_routing(self):
+            """Subscribe to subjects that need routing"""
+            routing_subjects = [
+                "events.>",
+                "ml.inference.>",
+                "telemetry.>",
+                "commands.>"
+            ]
+            
+            for subject in routing_subjects:
+                logger.info(f"Subscribing to {subject} for routing")
+                await self.nats_client.subscribe(subject, cb=self.route_message)
+        
+        async def run(self):
+            """Run the router"""
+            await self.connect_nats()
+            await self.subscribe_for_routing()
+            
+            logger.info("Event router running...")
+            while True:
+                await asyncio.sleep(10)
+    
+    async def main():
+        router = EventRouter()
+        await router.run()
+    
+    if __name__ == "__main__":
+        asyncio.run(main())
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: event-driven
+spec:
+  selector:
+    app: nats
+  ports:
+  - name: nats
+    port: 4222
+    targetPort: 4222
+  - name: cluster
+    port: 6222
+    targetPort: 6222
+  - name: monitor
+    port: 8222
+    targetPort: 8222
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: event-producer
+  namespace: event-driven
+spec:
+  selector:
+    app: event-producer
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# Ingress for NATS monitoring
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nats-ingress
+  namespace: event-driven
+spec:
+  rules:
+  - host: nats.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nats
+            port:
+              number: 8222
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: event-producer
+  namespace: event-driven
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: event-producer
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: event-producer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: event-producer
+subjects:
+- kind: ServiceAccount
+  name: event-producer
+  namespace: event-driven

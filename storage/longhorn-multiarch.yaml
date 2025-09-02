@@ -1,0 +1,135 @@
+# Longhorn distributed storage optimized for multi-arch
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: longhorn-system
+
+---
+# Longhorn with architecture-specific configurations
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: longhorn-storageclass
+  namespace: longhorn-system
+data:
+  storageclass.yaml: |
+    # High-performance storage class for AMD64 nodes
+    kind: StorageClass
+    apiVersion: storage.k8s.io/v1
+    metadata:
+      name: longhorn-ssd
+    provisioner: driver.longhorn.io
+    allowVolumeExpansion: true
+    parameters:
+      numberOfReplicas: "2"
+      staleReplicaTimeout: "2880"
+      fromBackup: ""
+      fsType: "ext4"
+      nodeSelector: "kubernetes.io/arch=amd64"
+    ---
+    # Power-efficient storage for ARM64 nodes  
+    kind: StorageClass
+    apiVersion: storage.k8s.io/v1
+    metadata:
+      name: longhorn-efficient
+    provisioner: driver.longhorn.io
+    allowVolumeExpansion: true
+    parameters:
+      numberOfReplicas: "3"
+      staleReplicaTimeout: "2880" 
+      fromBackup: ""
+      fsType: "ext4"
+      nodeSelector: "kubernetes.io/arch=arm64"
+    ---
+    # Fast local storage for databases
+    kind: StorageClass
+    apiVersion: storage.k8s.io/v1
+    metadata:
+      name: longhorn-local-ssd
+    provisioner: driver.longhorn.io
+    allowVolumeExpansion: true
+    parameters:
+      numberOfReplicas: "1"
+      staleReplicaTimeout: "2880"
+      fromBackup: ""
+      fsType: "ext4"
+      nodeSelector: "kubernetes.io/arch=amd64,node-role/storage=true"
+
+---
+# Install Longhorn
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: longhorn-install
+  namespace: longhorn-system
+data:
+  install.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Installing Longhorn for multi-arch cluster..."
+    
+    # Check node readiness
+    kubectl get nodes -o wide
+    
+    # Install Longhorn
+    kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/v1.5.3/deploy/longhorn.yaml
+    
+    # Wait for deployment
+    echo "Waiting for Longhorn to be ready..."
+    kubectl -n longhorn-system wait --for=condition=ready pod --selector=app=longhorn-manager --timeout=600s
+    
+    # Apply custom storage classes
+    kubectl apply -f storageclass.yaml
+    
+    echo "Longhorn installation complete!"
+
+---
+# Backup configuration
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: longhorn-backup
+  namespace: longhorn-system
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: amd64  # Run backups on powerful nodes
+          containers:
+          - name: backup
+            image: longhornio/longhorn-cli:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Starting Longhorn backup..."
+              
+              # List all volumes
+              longhorn-cli volume list
+              
+              # Create snapshots for all volumes
+              for volume in $(longhorn-cli volume list -o json | jq -r '.[].name'); do
+                echo "Creating snapshot for volume: $volume"
+                longhorn-cli snapshot create --volume $volume --name "auto-$(date +%Y%m%d-%H%M%S)"
+              done
+              
+              # Clean up old snapshots (keep last 7 days)
+              longhorn-cli snapshot cleanup --keep-days 7
+              
+              echo "Backup completed!"
+            env:
+            - name: LONGHORN_MANAGER_URL
+              value: "http://longhorn-backend:9500"
+            resources:
+              requests:
+                memory: "64Mi"
+                cpu: "50m"
+              limits:
+                memory: "128Mi"
+                cpu: "100m"
+          restartPolicy: OnFailure

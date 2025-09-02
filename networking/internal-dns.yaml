@@ -1,0 +1,377 @@
+# Internal DNS with PiHole on ARM64 nodes for power efficiency
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns-system
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pihole-config
+  namespace: dns-system
+data:
+  custom.list: |
+    # Internal homelab domains
+    192.168.1.200 dashboard.homelab.local
+    192.168.1.200 traefik.homelab.local
+    192.168.1.200 grafana.homelab.local
+    192.168.1.200 prometheus.homelab.local
+    192.168.1.200 jellyfin.homelab.local
+    192.168.1.100 nuc.homelab.local
+  
+  05-pihole-custom-cname.conf: |
+    # Custom CNAME records
+    cname=monitoring.homelab.local,grafana.homelab.local
+    cname=media.homelab.local,jellyfin.homelab.local
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pihole-secret
+  namespace: dns-system
+type: Opaque
+data:
+  # Password: homelab123 (base64 encoded)
+  password: aG9tZWxhYjEyMw==
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pihole-primary
+  namespace: dns-system
+  labels:
+    app: pihole
+    role: primary
+spec:
+  serviceName: pihole-primary
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pihole
+      role: primary
+  template:
+    metadata:
+      labels:
+        app: pihole
+        role: primary
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9617"
+    spec:
+      # Force to ARM64 for power efficiency
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        node-role/edge: "true"
+      securityContext:
+        fsGroup: 999
+      containers:
+      - name: pihole
+        image: pihole/pihole:latest
+        imagePullPolicy: Always
+        env:
+        - name: TZ
+          value: "America/New_York"
+        - name: WEBPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: pihole-secret
+              key: password
+        - name: DNS1
+          value: "1.1.1.1"
+        - name: DNS2
+          value: "1.0.0.1"
+        - name: ServerIP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: DNSMASQ_LISTENING
+          value: "all"
+        ports:
+        - containerPort: 53
+          name: dns-udp
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        - containerPort: 80
+          name: web
+          protocol: TCP
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: etc-pihole
+          mountPath: /etc/pihole
+        - name: etc-dnsmasq
+          mountPath: /etc/dnsmasq.d
+        - name: custom-list
+          mountPath: /etc/pihole/custom.list
+          subPath: custom.list
+        livenessProbe:
+          httpGet:
+            path: /admin/
+            port: 80
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /admin/
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      
+      - name: pihole-exporter
+        image: ekofr/pihole-exporter:latest
+        ports:
+        - containerPort: 9617
+          name: metrics
+        env:
+        - name: PIHOLE_HOSTNAME
+          value: "localhost"
+        - name: PIHOLE_PORT
+          value: "80"
+        - name: PIHOLE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: pihole-secret
+              key: password
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "10m"
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+            
+      volumes:
+      - name: custom-list
+        configMap:
+          name: pihole-config
+          items:
+          - key: custom.list
+            path: custom.list
+            
+  volumeClaimTemplates:
+  - metadata:
+      name: etc-pihole
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: local-arm-storage
+  - metadata:
+      name: etc-dnsmasq
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: local-arm-storage
+
+---
+# Secondary PiHole for redundancy
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pihole-secondary
+  namespace: dns-system
+  labels:
+    app: pihole
+    role: secondary
+spec:
+  serviceName: pihole-secondary
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pihole
+      role: secondary
+  template:
+    metadata:
+      labels:
+        app: pihole
+        role: secondary
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9617"
+    spec:
+      # Run on different ARM64 node
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        node-role/edge: "true"
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: role
+                operator: In
+                values: ["primary"]
+            topologyKey: kubernetes.io/hostname
+      securityContext:
+        fsGroup: 999
+      containers:
+      - name: pihole
+        image: pihole/pihole:latest
+        imagePullPolicy: Always
+        env:
+        - name: TZ
+          value: "America/New_York"
+        - name: WEBPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: pihole-secret
+              key: password
+        - name: DNS1
+          value: "8.8.8.8"
+        - name: DNS2
+          value: "8.8.4.4"
+        - name: ServerIP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: DNSMASQ_LISTENING
+          value: "all"
+        ports:
+        - containerPort: 53
+          name: dns-udp
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        - containerPort: 80
+          name: web
+          protocol: TCP
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: etc-pihole
+          mountPath: /etc/pihole
+        - name: etc-dnsmasq
+          mountPath: /etc/dnsmasq.d
+        - name: custom-list
+          mountPath: /etc/pihole/custom.list
+          subPath: custom.list
+      
+      - name: pihole-exporter
+        image: ekofr/pihole-exporter:latest
+        ports:
+        - containerPort: 9617
+          name: metrics
+        env:
+        - name: PIHOLE_HOSTNAME
+          value: "localhost"
+        - name: PIHOLE_PORT
+          value: "80"
+        - name: PIHOLE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: pihole-secret
+              key: password
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "10m"
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+            
+      volumes:
+      - name: custom-list
+        configMap:
+          name: pihole-config
+          items:
+          - key: custom.list
+            path: custom.list
+            
+  volumeClaimTemplates:
+  - metadata:
+      name: etc-pihole
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: local-arm-storage
+  - metadata:
+      name: etc-dnsmasq
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+      storageClassName: local-arm-storage
+
+---
+# Services for DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: pihole-dns
+  namespace: dns-system
+  annotations:
+    metallb.universe.tf/address-pool: homelab-pool
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 53
+    name: dns-udp
+    targetPort: dns-udp
+    protocol: UDP
+  - port: 53
+    name: dns-tcp  
+    targetPort: dns-tcp
+    protocol: TCP
+  selector:
+    app: pihole
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pihole-web
+  namespace: dns-system
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    name: web
+    targetPort: web
+  selector:
+    app: pihole
+
+---
+# Ingress for PiHole admin interface
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pihole-ingress
+  namespace: dns-system
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  rules:
+  - host: pihole.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: pihole-web
+            port:
+              number: 80

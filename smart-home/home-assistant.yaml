@@ -1,0 +1,1280 @@
+# Home Assistant Smart Home Platform
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: smart-home
+  labels:
+    name: smart-home
+
+---
+# Home Assistant Core
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: home-assistant
+  namespace: smart-home
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: home-assistant
+  template:
+    metadata:
+      labels:
+        app: home-assistant
+    spec:
+      # Run on ARM64 for efficiency and smart home workloads
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: home-assistant
+        image: ghcr.io/home-assistant/home-assistant:2024.1
+        ports:
+        - containerPort: 8123
+          name: web
+        env:
+        - name: TZ
+          value: "America/New_York"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: media
+          mountPath: /media
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+        securityContext:
+          privileged: true  # Needed for device access
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8123
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8123
+          initialDelaySeconds: 15
+          periodSeconds: 15
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: home-assistant-config
+      - name: media
+        persistentVolumeClaim:
+          claimName: media-storage
+
+---
+# Home Assistant Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: home-assistant-config
+  namespace: smart-home
+data:
+  configuration.yaml: |
+    # Home Assistant Configuration for Homelab
+    
+    # Default config
+    default_config:
+    
+    # Homelab integration
+    homelab:
+      name: "Multi-Architecture Homelab"
+      latitude: 40.7128
+      longitude: -74.0060
+      elevation: 10
+      unit_system: metric
+      time_zone: America/New_York
+      
+    # HTTP configuration
+    http:
+      use_x_forwarded_for: true
+      trusted_proxies:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    
+    # Prometheus metrics export
+    prometheus:
+      namespace: homelab
+      filter:
+        include_domains:
+          - sensor
+          - binary_sensor
+          - light
+          - switch
+          - climate
+          - device_tracker
+    
+    # MQTT for IoT devices
+    mqtt:
+      broker: edge-mqtt.edge.svc.cluster.local
+      port: 1883
+      username: edge
+      password: edgepassword
+      discovery: true
+      discovery_prefix: homeassistant
+    
+    # Recorder for database
+    recorder:
+      db_url: postgresql://homeassistant:homeassistant@postgres:5432/homeassistant
+      purge_keep_days: 30
+      auto_purge: true
+      
+    # History
+    history:
+      include:
+        domains:
+          - sensor
+          - binary_sensor
+          - light
+          - switch
+          - climate
+    
+    # Logbook
+    logbook:
+      exclude:
+        domains:
+          - automation
+          - script
+    
+    # Energy monitoring
+    energy:
+      
+    # Scenes
+    scene: !include scenes.yaml
+    
+    # Automations
+    automation: !include automations.yaml
+    
+    # Scripts
+    script: !include scripts.yaml
+    
+    # Groups
+    group: !include groups.yaml
+    
+    # Sensors
+    sensor:
+      # Homelab cluster metrics
+      - platform: rest
+        name: "Cluster CPU Usage"
+        resource: http://prometheus.monitoring:9090/api/v1/query?query=avg(100%20-%20(irate(node_cpu_seconds_total{mode="idle"}[5m])%20*%20100))
+        value_template: "{{ value_json.data.result[0].value[1] | round(1) }}"
+        unit_of_measurement: "%"
+        
+      - platform: rest
+        name: "Cluster Memory Usage"
+        resource: http://prometheus.monitoring:9090/api/v1/query?query=avg((1%20-%20(node_memory_MemAvailable_bytes%20/%20node_memory_MemTotal_bytes))%20*%20100)
+        value_template: "{{ value_json.data.result[0].value[1] | round(1) }}"
+        unit_of_measurement: "%"
+        
+      - platform: rest
+        name: "Cluster Power Consumption"
+        resource: http://prometheus.monitoring:9090/api/v1/query?query=sum(node_power_consumption_watts)
+        value_template: "{{ value_json.data.result[0].value[1] | round(1) }}"
+        unit_of_measurement: "W"
+        
+      - platform: rest
+        name: "GPU Utilization"
+        resource: http://prometheus.monitoring:9090/api/v1/query?query=avg(DCGM_FI_DEV_GPU_UTIL)
+        value_template: "{{ value_json.data.result[0].value[1] | round(1) }}"
+        unit_of_measurement: "%"
+        
+      # Room Temperature Sensors
+      - platform: mqtt
+        name: "Living Room Temperature"
+        state_topic: "homeassistant/sensor/living_room_temp/state"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        
+      - platform: mqtt
+        name: "Bedroom Temperature"
+        state_topic: "homeassistant/sensor/bedroom_temp/state"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        
+      - platform: mqtt
+        name: "Kitchen Temperature"
+        state_topic: "homeassistant/sensor/kitchen_temp/state"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        
+      - platform: mqtt
+        name: "Office Temperature"
+        state_topic: "homeassistant/sensor/office_temp/state"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        
+      - platform: mqtt
+        name: "Server Room Temperature"
+        state_topic: "homeassistant/sensor/server_room_temp/state"
+        unit_of_measurement: "°C"
+        device_class: temperature
+        
+      # Humidity Sensors
+      - platform: mqtt
+        name: "Living Room Humidity"
+        state_topic: "homeassistant/sensor/living_room_humidity/state"
+        unit_of_measurement: "%"
+        device_class: humidity
+        
+      - platform: mqtt
+        name: "Bedroom Humidity"
+        state_topic: "homeassistant/sensor/bedroom_humidity/state"
+        unit_of_measurement: "%"
+        device_class: humidity
+        
+      - platform: mqtt
+        name: "Kitchen Humidity"
+        state_topic: "homeassistant/sensor/kitchen_humidity/state"
+        unit_of_measurement: "%"
+        device_class: humidity
+        
+      # HVAC Power Consumption Sensors
+      - platform: mqtt
+        name: "Main HVAC Power"
+        state_topic: "homeassistant/sensor/main_hvac_power/state"
+        unit_of_measurement: "W"
+        device_class: power
+        
+      - platform: mqtt
+        name: "Zone 1 HVAC Power"
+        state_topic: "homeassistant/sensor/zone1_hvac_power/state"
+        unit_of_measurement: "W"
+        device_class: power
+        
+      - platform: mqtt
+        name: "Zone 2 HVAC Power"
+        state_topic: "homeassistant/sensor/zone2_hvac_power/state"
+        unit_of_measurement: "W"
+        device_class: power
+        
+      # Energy Sensors
+      - platform: mqtt
+        name: "Total HVAC Energy"
+        state_topic: "homeassistant/sensor/total_hvac_energy/state"
+        unit_of_measurement: "kWh"
+        device_class: energy
+        state_class: total_increasing
+        
+      - platform: mqtt
+        name: "Lighting Energy"
+        state_topic: "homeassistant/sensor/lighting_energy/state"
+        unit_of_measurement: "kWh"
+        device_class: energy
+        state_class: total_increasing
+        
+      # Template sensors for homelab
+      - platform: template
+        sensors:
+          homelab_efficiency:
+            friendly_name: "Homelab Efficiency"
+            value_template: >-
+              {% set cpu = states('sensor.cluster_cpu_usage') | float %}
+              {% set power = states('sensor.cluster_power_consumption') | float %}
+              {% if power > 0 %}
+                {{ (cpu / power * 100) | round(1) }}
+              {% else %}
+                0
+              {% endif %}
+            unit_of_measurement: "CPU%/W"
+            
+          average_indoor_temperature:
+            friendly_name: "Average Indoor Temperature"
+            value_template: >-
+              {% set temps = [
+                states('sensor.living_room_temperature') | float(0),
+                states('sensor.bedroom_temperature') | float(0),
+                states('sensor.kitchen_temperature') | float(0),
+                states('sensor.office_temperature') | float(0)
+              ] %}
+              {% set valid_temps = temps | select('>', 0) | list %}
+              {% if valid_temps | length > 0 %}
+                {{ (valid_temps | sum / valid_temps | length) | round(1) }}
+              {% else %}
+                0
+              {% endif %}
+            unit_of_measurement: "°C"
+            device_class: temperature
+            
+          total_hvac_runtime_today:
+            friendly_name: "Total HVAC Runtime Today"
+            value_template: >-
+              {% set heating = states('sensor.heating_runtime_today') | float(0) %}
+              {% set cooling = states('sensor.cooling_runtime_today') | float(0) %}
+              {{ (heating + cooling) | round(1) }}
+            unit_of_measurement: "hours"
+            
+          hvac_efficiency_score:
+            friendly_name: "HVAC Efficiency Score"
+            value_template: >-
+              {% set energy = states('sensor.total_hvac_energy') | float(1) %}
+              {% set runtime = states('sensor.total_hvac_runtime_today') | float(1) %}
+              {% if runtime > 0 %}
+                {{ (10 - (energy / runtime)) | round(1) | max(0) | min(10) }}
+              {% else %}
+                10
+              {% endif %}
+            unit_of_measurement: "score"
+            
+    # Binary sensors
+    binary_sensor:
+      # Homelab service health
+      - platform: rest
+        name: "Dashboard Health"
+        resource: http://dashboard-api.default:8080/health
+        
+      - platform: rest
+        name: "ML Serving Health"
+        resource: http://tensorflow-serving-amd64.ml-serving:8501/v1/models
+        
+      - platform: rest
+        name: "Monitoring Health"
+        resource: http://prometheus.monitoring:9090/-/healthy
+    
+    # Switches for homelab control
+    switch:
+      # Placeholder for homelab service controls
+      - platform: template
+        switches:
+          homelab_backup:
+            friendly_name: "Trigger Backup"
+            value_template: "{{ states('input_boolean.backup_running') }}"
+            turn_on:
+              service: shell_command.trigger_backup
+            turn_off:
+              service: input_boolean.turn_off
+              entity_id: input_boolean.backup_running
+    
+    # Shell commands for homelab operations
+    shell_command:
+      trigger_backup: >-
+        kubectl create job backup-$(date +%Y%m%d-%H%M%S) 
+        --from=cronjob/velero-backup -n velero
+      restart_service: >-
+        kubectl rollout restart deployment/{{ service_name }} -n {{ namespace }}
+      
+    # Input booleans for UI
+    input_boolean:
+      backup_running:
+        name: "Backup Running"
+        initial: false
+        
+    # Device tracker
+    device_tracker:
+      - platform: nmap_tracker
+        hosts: 192.168.1.1/24
+        home_interval: 10
+        
+    # Camera integration with homelab security
+    camera:
+      - platform: generic
+        still_image_url: http://edge-ai-inference.edge:5000/camera/latest
+        name: "Edge Camera"
+        
+    # Climate control integration
+    climate:
+      - platform: generic_thermostat
+        name: "Server Room Thermostat"
+        heater: switch.server_room_fan
+        target_sensor: sensor.server_room_temperature
+        min_temp: 15
+        max_temp: 30
+        target_temp: 22
+        
+      - platform: mqtt
+        name: "Living Room Thermostat"
+        current_temperature_topic: "homeassistant/sensor/living_room_temp/state"
+        temperature_command_topic: "homeassistant/climate/living_room/target_temp"
+        temperature_state_topic: "homeassistant/climate/living_room/target_temp/state"
+        mode_command_topic: "homeassistant/climate/living_room/mode"
+        mode_state_topic: "homeassistant/climate/living_room/mode/state"
+        action_topic: "homeassistant/climate/living_room/action/state"
+        modes:
+          - "off"
+          - "heat"
+          - "cool"
+          - "auto"
+        min_temp: 15
+        max_temp: 30
+        temp_step: 0.5
+        
+      - platform: mqtt
+        name: "Bedroom Thermostat"
+        current_temperature_topic: "homeassistant/sensor/bedroom_temp/state"
+        temperature_command_topic: "homeassistant/climate/bedroom/target_temp"
+        temperature_state_topic: "homeassistant/climate/bedroom/target_temp/state"
+        mode_command_topic: "homeassistant/climate/bedroom/mode"
+        mode_state_topic: "homeassistant/climate/bedroom/mode/state"
+        action_topic: "homeassistant/climate/bedroom/action/state"
+        modes:
+          - "off"
+          - "heat"
+          - "cool"
+          - "auto"
+        min_temp: 15
+        max_temp: 30
+        temp_step: 0.5
+        
+      - platform: mqtt
+        name: "Main HVAC Zone"
+        current_temperature_topic: "homeassistant/sensor/average_indoor_temperature/state"
+        temperature_command_topic: "homeassistant/climate/main_hvac/target_temp"
+        temperature_state_topic: "homeassistant/climate/main_hvac/target_temp/state"
+        mode_command_topic: "homeassistant/climate/main_hvac/mode"
+        mode_state_topic: "homeassistant/climate/main_hvac/mode/state"
+        action_topic: "homeassistant/climate/main_hvac/action/state"
+        modes:
+          - "off"
+          - "heat"
+          - "cool"
+          - "auto"
+          - "fan_only"
+        min_temp: 15
+        max_temp: 30
+        temp_step: 0.5
+        
+    # Notify
+    notify:
+      - name: homelab_alerts
+        platform: rest
+        resource: http://alert-webhook.monitoring:8080/homeassistant
+        method: POST_JSON
+        
+    # Panel for homelab dashboard
+    panel_custom:
+      - name: homelab-grafana
+        sidebar_title: "Metrics"
+        sidebar_icon: mdi:chart-line
+        url_path: "grafana"
+        url: "http://grafana.monitoring:3000"
+        
+      - name: homelab-argocd
+        sidebar_title: "GitOps"
+        sidebar_icon: mdi:git
+        url_path: "argocd"
+        url: "http://argocd-server.argocd:80"
+
+  automations.yaml: |
+    # Homelab Automations
+    
+    - id: high_cpu_alert
+      alias: "High CPU Usage Alert"
+      trigger:
+        platform: numeric_state
+        entity_id: sensor.cluster_cpu_usage
+        above: 85
+        for:
+          minutes: 5
+      action:
+        - service: notify.homelab_alerts
+          data:
+            title: "High CPU Usage"
+            message: "Cluster CPU usage is {{ states('sensor.cluster_cpu_usage') }}%"
+            
+    - id: high_power_consumption
+      alias: "High Power Consumption Alert"
+      trigger:
+        platform: numeric_state
+        entity_id: sensor.cluster_power_consumption
+        above: 100
+        for:
+          minutes: 10
+      action:
+        - service: notify.homelab_alerts
+          data:
+            title: "High Power Consumption"
+            message: "Cluster consuming {{ states('sensor.cluster_power_consumption') }}W"
+            
+    - id: service_down_alert
+      alias: "Service Down Alert"
+      trigger:
+        - platform: state
+          entity_id: binary_sensor.dashboard_health
+          to: 'off'
+          for:
+            minutes: 2
+        - platform: state
+          entity_id: binary_sensor.ml_serving_health
+          to: 'off'
+          for:
+            minutes: 2
+        - platform: state
+          entity_id: binary_sensor.monitoring_health
+          to: 'off'
+          for:
+            minutes: 2
+      action:
+        - service: notify.homelab_alerts
+          data:
+            title: "Service Down"
+            message: "{{ trigger.to_state.attributes.friendly_name }} is down"
+            
+    - id: daily_backup_trigger
+      alias: "Daily Backup Trigger"
+      trigger:
+        platform: time
+        at: "02:00:00"
+      action:
+        - service: switch.turn_on
+          entity_id: switch.homelab_backup
+        - service: input_boolean.turn_on
+          entity_id: input_boolean.backup_running
+          
+    - id: optimize_power_consumption
+      alias: "Optimize Power Consumption"
+      trigger:
+        platform: time_pattern
+        minutes: "/30"  # Every 30 minutes
+      condition:
+        condition: numeric_state
+        entity_id: sensor.cluster_power_consumption
+        above: 90
+      action:
+        - service: shell_command.restart_service
+          data:
+            service_name: "performance-tuner"
+            namespace: "performance"
+            
+    - id: temperature_too_high_alert
+      alias: "Temperature Too High Alert"
+      trigger:
+        - platform: numeric_state
+          entity_id: sensor.living_room_temperature
+          above: 28
+          for:
+            minutes: 5
+        - platform: numeric_state
+          entity_id: sensor.bedroom_temperature
+          above: 28
+          for:
+            minutes: 5
+      action:
+        - service: notify.homelab_alerts
+          data:
+            title: "High Temperature Alert"
+            message: "{{ trigger.to_state.attributes.friendly_name }} is {{ trigger.to_state.state }}°C"
+        - service: climate.set_temperature
+          target:
+            entity_id: >
+              {% if 'living_room' in trigger.entity_id %}
+                climate.living_room_thermostat
+              {% elif 'bedroom' in trigger.entity_id %}
+                climate.bedroom_thermostat
+              {% endif %}
+          data:
+            temperature: 24
+            
+    - id: temperature_too_low_alert
+      alias: "Temperature Too Low Alert"
+      trigger:
+        - platform: numeric_state
+          entity_id: sensor.living_room_temperature
+          below: 16
+          for:
+            minutes: 10
+        - platform: numeric_state
+          entity_id: sensor.bedroom_temperature
+          below: 16
+          for:
+            minutes: 10
+      action:
+        - service: notify.homelab_alerts
+          data:
+            title: "Low Temperature Alert"
+            message: "{{ trigger.to_state.attributes.friendly_name }} is {{ trigger.to_state.state }}°C"
+        - service: climate.set_temperature
+          target:
+            entity_id: >
+              {% if 'living_room' in trigger.entity_id %}
+                climate.living_room_thermostat
+              {% elif 'bedroom' in trigger.entity_id %}
+                climate.bedroom_thermostat
+              {% endif %}
+          data:
+            temperature: 20
+            
+    - id: hvac_energy_optimization
+      alias: "HVAC Energy Optimization"
+      trigger:
+        platform: time_pattern
+        minutes: "/15"  # Every 15 minutes
+      condition:
+        - condition: numeric_state
+          entity_id: sensor.total_hvac_energy
+          above: 5  # More than 5 kWh today
+        - condition: time
+          after: "08:00:00"
+          before: "22:00:00"
+      action:
+        - service: climate.set_hvac_mode
+          target:
+            entity_id: climate.main_hvac_zone
+          data:
+            hvac_mode: "auto"
+        - service: climate.set_temperature
+          target:
+            entity_id: climate.main_hvac_zone
+          data:
+            temperature: >
+              {% set outdoor_temp = states('sensor.outdoor_temperature') | float(20) %}
+              {% if outdoor_temp > 25 %}
+                26  # Raise cooling target when it's hot outside
+              {% elif outdoor_temp < 10 %}
+                19  # Lower heating target when it's cold outside
+              {% else %}
+                22  # Normal target
+              {% endif %}
+              
+    - id: server_room_cooling
+      alias: "Server Room Cooling"
+      trigger:
+        platform: numeric_state
+        entity_id: sensor.server_room_temperature
+        above: 25
+        for:
+          minutes: 2
+      action:
+        - service: switch.turn_on
+          entity_id: switch.server_room_fan
+        - service: notify.homelab_alerts
+          data:
+            title: "Server Room Cooling Activated"
+            message: "Server room temperature is {{ states('sensor.server_room_temperature') }}°C"
+            
+    - id: hvac_maintenance_reminder
+      alias: "HVAC Maintenance Reminder"
+      trigger:
+        platform: time
+        at: "08:00:00"
+      condition:
+        condition: template
+        value_template: "{{ now().day == 1 }}"  # First day of month
+      action:
+        - service: notify.homelab_alerts
+          data:
+            title: "HVAC Maintenance Reminder"
+            message: "Monthly HVAC maintenance check due. Runtime this month: {{ states('sensor.total_hvac_runtime_today') }} hours"
+            
+    - id: energy_saving_night_mode
+      alias: "Energy Saving Night Mode"
+      trigger:
+        - platform: time
+          at: "22:00:00"
+      action:
+        - service: climate.set_temperature
+          target:
+            entity_id: 
+              - climate.living_room_thermostat
+              - climate.main_hvac_zone
+          data:
+            temperature: 19  # Lower temp at night for energy savings
+        - service: climate.set_temperature
+          target:
+            entity_id: climate.bedroom_thermostat
+          data:
+            temperature: 18  # Even lower for sleeping
+            
+    - id: energy_saving_morning_mode
+      alias: "Energy Saving Morning Mode"
+      trigger:
+        - platform: time
+          at: "06:00:00"
+      action:
+        - service: climate.set_temperature
+          target:
+            entity_id:
+              - climate.living_room_thermostat
+              - climate.bedroom_thermostat
+              - climate.main_hvac_zone
+          data:
+            temperature: 21  # Comfortable morning temp
+
+  scripts.yaml: |
+    # Homelab Scripts
+    
+    homelab_health_check:
+      alias: "Homelab Health Check"
+      sequence:
+        - service: homeassistant.update_entity
+          entity_id: 
+            - sensor.cluster_cpu_usage
+            - sensor.cluster_memory_usage
+            - sensor.cluster_power_consumption
+            - binary_sensor.dashboard_health
+            - binary_sensor.ml_serving_health
+            - binary_sensor.monitoring_health
+        - delay: '00:00:05'
+        - service: notify.homelab_alerts
+          data:
+            title: "Health Check Complete"
+            message: >
+              CPU: {{ states('sensor.cluster_cpu_usage') }}%
+              Memory: {{ states('sensor.cluster_memory_usage') }}%
+              Power: {{ states('sensor.cluster_power_consumption') }}W
+              
+    homelab_restart_services:
+      alias: "Restart Homelab Services"
+      sequence:
+        - service: shell_command.restart_service
+          data:
+            service_name: "dashboard-ui"
+            namespace: "default"
+        - delay: '00:00:10'
+        - service: shell_command.restart_service
+          data:
+            service_name: "dashboard-api"
+            namespace: "default"
+            
+    homelab_backup_now:
+      alias: "Backup Now"
+      sequence:
+        - service: shell_command.trigger_backup
+        - service: input_boolean.turn_on
+          entity_id: input_boolean.backup_running
+        - delay: '00:05:00'
+        - service: input_boolean.turn_off
+          entity_id: input_boolean.backup_running
+
+  scenes.yaml: |
+    # Homelab Scenes
+    
+    - name: "Normal Operation"
+      entities:
+        input_boolean.backup_running: false
+        
+    - name: "Maintenance Mode"
+      entities:
+        input_boolean.backup_running: true
+
+  groups.yaml: |
+    # Homelab Groups
+    
+    homelab_overview:
+      name: "Homelab Overview"
+      entities:
+        - sensor.cluster_cpu_usage
+        - sensor.cluster_memory_usage
+        - sensor.cluster_power_consumption
+        - sensor.gpu_utilization
+        - sensor.homelab_efficiency
+        
+    homelab_services:
+      name: "Homelab Services"
+      entities:
+        - binary_sensor.dashboard_health
+        - binary_sensor.ml_serving_health
+        - binary_sensor.monitoring_health
+        
+    homelab_controls:
+      name: "Homelab Controls"
+      entities:
+        - switch.homelab_backup
+        - input_boolean.backup_running
+        
+    temperature_monitoring:
+      name: "Temperature Monitoring"
+      entities:
+        - sensor.living_room_temperature
+        - sensor.bedroom_temperature
+        - sensor.kitchen_temperature
+        - sensor.office_temperature
+        - sensor.server_room_temperature
+        - sensor.average_indoor_temperature
+        
+    humidity_monitoring:
+      name: "Humidity Monitoring"
+      entities:
+        - sensor.living_room_humidity
+        - sensor.bedroom_humidity
+        - sensor.kitchen_humidity
+        
+    hvac_controls:
+      name: "HVAC Controls"
+      entities:
+        - climate.living_room_thermostat
+        - climate.bedroom_thermostat
+        - climate.main_hvac_zone
+        - climate.server_room_thermostat
+        
+    hvac_monitoring:
+      name: "HVAC Monitoring"
+      entities:
+        - sensor.main_hvac_power
+        - sensor.zone_1_hvac_power
+        - sensor.zone_2_hvac_power
+        - sensor.total_hvac_energy
+        - sensor.total_hvac_runtime_today
+        - sensor.hvac_efficiency_score
+        
+    energy_monitoring:
+      name: "Energy Monitoring"
+      entities:
+        - sensor.total_hvac_energy
+        - sensor.lighting_energy
+        - sensor.cluster_power_consumption
+
+---
+# PostgreSQL for Home Assistant
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: smart-home
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: "homeassistant"
+        - name: POSTGRES_USER
+          value: "homeassistant"
+        - name: POSTGRES_PASSWORD
+          value: "homeassistant"
+        - name: PGDATA
+          value: "/var/lib/postgresql/data/pgdata"
+        ports:
+        - containerPort: 5432
+          name: postgres
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ssd
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+# Node-RED for Automation
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-red
+  namespace: smart-home
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-red
+  template:
+    metadata:
+      labels:
+        app: node-red
+    spec:
+      # Run on ARM for ultra-low power
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: node-red
+        image: nodered/node-red:latest
+        ports:
+        - containerPort: 1880
+          name: web
+        env:
+        - name: TZ
+          value: "America/New_York"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "512Mi"
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: node-red-data
+
+---
+# ESPHome for Device Management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: esphome
+  namespace: smart-home
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: esphome
+  template:
+    metadata:
+      labels:
+        app: esphome
+    spec:
+      containers:
+      - name: esphome
+        image: esphome/esphome:latest
+        ports:
+        - containerPort: 6052
+          name: web
+        env:
+        - name: ESPHOME_DASHBOARD_USE_PING
+          value: "true"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: esphome-config
+
+---
+# Zigbee2MQTT for IoT Device Integration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zigbee2mqtt
+  namespace: smart-home
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zigbee2mqtt
+  template:
+    metadata:
+      labels:
+        app: zigbee2mqtt
+    spec:
+      # Run on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: zigbee2mqtt
+        image: koenkk/zigbee2mqtt:latest
+        ports:
+        - containerPort: 8080
+          name: web
+        env:
+        - name: TZ
+          value: "America/New_York"
+        volumeMounts:
+        - name: data
+          mountPath: /app/data
+        - name: config
+          mountPath: /app/data/configuration.yaml
+          subPath: configuration.yaml
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+        securityContext:
+          privileged: true  # Needed for USB device access
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: zigbee2mqtt-data
+      - name: config
+        configMap:
+          name: zigbee2mqtt-config
+
+---
+# Zigbee2MQTT Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zigbee2mqtt-config
+  namespace: smart-home
+data:
+  configuration.yaml: |
+    # Zigbee2MQTT Configuration
+    
+    # Home Assistant integration
+    homeassistant: true
+    
+    # MQTT settings
+    mqtt:
+      base_topic: zigbee2mqtt
+      server: mqtt://edge-mqtt.edge.svc.cluster.local:1883
+      user: edge
+      password: edgepassword
+      
+    # Serial settings (adjust for your Zigbee adapter)
+    serial:
+      port: /dev/ttyUSB0
+      adapter: zstack
+      
+    # Enable frontend
+    frontend:
+      port: 8080
+      
+    # Enable new device join
+    permit_join: false
+    
+    # Advanced settings
+    advanced:
+      log_level: info
+      pan_id: 0x1a62
+      channel: 11
+      network_key: GENERATE
+      
+    # Device options
+    device_options:
+      legacy: false
+      
+    # Groups
+    groups: groups.yaml
+    
+    # Devices
+    devices: devices.yaml
+
+---
+# Persistent Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: home-assistant-config
+  namespace: smart-home
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: node-red-data
+  namespace: smart-home
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: esphome-config
+  namespace: smart-home
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: zigbee2mqtt-data
+  namespace: smart-home
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: media-storage
+  namespace: smart-home
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: longhorn-ssd
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: home-assistant
+  namespace: smart-home
+spec:
+  selector:
+    app: home-assistant
+  ports:
+  - port: 8123
+    targetPort: 8123
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: smart-home
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-red
+  namespace: smart-home
+spec:
+  selector:
+    app: node-red
+  ports:
+  - port: 1880
+    targetPort: 1880
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: esphome
+  namespace: smart-home
+spec:
+  selector:
+    app: esphome
+  ports:
+  - port: 6052
+    targetPort: 6052
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zigbee2mqtt
+  namespace: smart-home
+spec:
+  selector:
+    app: zigbee2mqtt
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# Ingress for Smart Home Services
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: smart-home-ingress
+  namespace: smart-home
+spec:
+  rules:
+  - host: homeassistant.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: home-assistant
+            port:
+              number: 8123
+  - host: nodered.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: node-red
+            port:
+              number: 1880
+  - host: esphome.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: esphome
+            port:
+              number: 6052
+  - host: zigbee.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: zigbee2mqtt
+            port:
+              number: 8080

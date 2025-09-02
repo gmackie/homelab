@@ -1,0 +1,559 @@
+# ESPHome Device Configurations for Smart Home Monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: esphome-temperature-sensors
+  namespace: smart-home
+data:
+  living-room-sensor.yaml: |
+    # Living Room Temperature & Humidity Sensor
+    esphome:
+      name: living-room-sensor
+      platform: ESP32
+      board: nodemcu-32s
+    
+    wifi:
+      ssid: "homelab-iot"
+      password: "homelab-wifi-password"
+      
+    logger:
+    api:
+    ota:
+    
+    mqtt:
+      broker: edge-mqtt.edge.svc.cluster.local
+      port: 1883
+      username: edge
+      password: edgepassword
+      discovery: true
+      topic_prefix: homeassistant/sensor/living_room
+    
+    i2c:
+      sda: 21
+      scl: 22
+      scan: true
+    
+    sensor:
+      - platform: dht
+        pin: GPIO4
+        model: DHT22
+        temperature:
+          name: "Living Room Temperature"
+          id: living_room_temp
+          accuracy_decimals: 1
+          filters:
+            - calibrate_linear:
+                - 0.0 -> 0.0
+                - 25.0 -> 25.2  # Calibration offset
+        humidity:
+          name: "Living Room Humidity"
+          id: living_room_humidity
+          accuracy_decimals: 1
+        update_interval: 30s
+        
+      - platform: bmp280
+        temperature:
+          name: "Living Room Pressure Temperature"
+          oversampling: 16x
+        pressure:
+          name: "Living Room Pressure"
+          id: living_room_pressure
+        address: 0x76
+        update_interval: 60s
+        
+      - platform: template
+        name: "Living Room Heat Index"
+        id: living_room_heat_index
+        unit_of_measurement: "°C"
+        lambda: |-
+          float temp = id(living_room_temp).state;
+          float humidity = id(living_room_humidity).state;
+          return (temp + humidity * 0.1);
+        update_interval: 60s
+    
+    binary_sensor:
+      - platform: gpio
+        pin: 
+          number: GPIO18
+          mode: INPUT_PULLUP
+        name: "Living Room Motion"
+        device_class: motion
+        
+    switch:
+      - platform: gpio
+        pin: GPIO23
+        name: "Living Room Fan Control"
+        id: living_room_fan
+
+  bedroom-sensor.yaml: |
+    # Bedroom Temperature & Humidity Sensor
+    esphome:
+      name: bedroom-sensor
+      platform: ESP32
+      board: nodemcu-32s
+    
+    wifi:
+      ssid: "homelab-iot"
+      password: "homelab-wifi-password"
+      
+    logger:
+    api:
+    ota:
+    
+    mqtt:
+      broker: edge-mqtt.edge.svc.cluster.local
+      port: 1883
+      username: edge
+      password: edgepassword
+      discovery: true
+      topic_prefix: homeassistant/sensor/bedroom
+    
+    i2c:
+      sda: 21
+      scl: 22
+    
+    sensor:
+      - platform: sht3xd
+        temperature:
+          name: "Bedroom Temperature"
+          id: bedroom_temp
+          accuracy_decimals: 1
+        humidity:
+          name: "Bedroom Humidity"
+          id: bedroom_humidity
+          accuracy_decimals: 1
+        address: 0x44
+        update_interval: 30s
+        
+      - platform: template
+        name: "Bedroom Comfort Level"
+        id: bedroom_comfort
+        unit_of_measurement: "score"
+        lambda: |-
+          float temp = id(bedroom_temp).state;
+          float humidity = id(bedroom_humidity).state;
+          float comfort = 10;
+          if (temp < 18 || temp > 24) comfort -= 3;
+          if (humidity < 40 || humidity > 60) comfort -= 2;
+          return max(0.0f, comfort);
+        update_interval: 60s
+    
+    binary_sensor:
+      - platform: gpio
+        pin: 
+          number: GPIO18
+          mode: INPUT_PULLUP
+        name: "Bedroom Motion"
+        device_class: motion
+        
+      - platform: gpio
+        pin: 
+          number: GPIO19
+          mode: INPUT_PULLUP
+        name: "Bedroom Window"
+        device_class: window
+    
+    light:
+      - platform: neopixelbus
+        type: GRB
+        pin: GPIO2
+        num_leds: 12
+        name: "Bedroom Accent Light"
+        id: bedroom_light
+        effects:
+          - pulse:
+          - rainbow:
+
+  kitchen-sensor.yaml: |
+    # Kitchen Multi-Sensor
+    esphome:
+      name: kitchen-sensor
+      platform: ESP8266
+      board: nodemcuv2
+    
+    wifi:
+      ssid: "homelab-iot"
+      password: "homelab-wifi-password"
+      
+    logger:
+    api:
+    ota:
+    
+    mqtt:
+      broker: edge-mqtt.edge.svc.cluster.local
+      port: 1883
+      username: edge
+      password: edgepassword
+      discovery: true
+      topic_prefix: homeassistant/sensor/kitchen
+    
+    dallas:
+      - pin: GPIO2
+    
+    sensor:
+      - platform: dallas
+        address: 0x1c0000031edd2a28
+        name: "Kitchen Temperature"
+        id: kitchen_temp
+        
+      - platform: adc
+        pin: A0
+        name: "Kitchen Gas Sensor"
+        id: kitchen_gas
+        update_interval: 10s
+        filters:
+          - multiply: 3.3  # Convert to voltage
+          
+      - platform: template
+        name: "Kitchen Air Quality"
+        id: kitchen_air_quality
+        unit_of_measurement: "AQI"
+        lambda: |-
+          float gas = id(kitchen_gas).state;
+          if (gas < 1.0) return 50;  # Good
+          else if (gas < 2.0) return 100;  # Moderate  
+          else return 150;  # Unhealthy
+        update_interval: 30s
+    
+    binary_sensor:
+      - platform: gpio
+        pin: 
+          number: GPIO4
+          mode: INPUT_PULLUP
+        name: "Kitchen Motion"
+        device_class: motion
+        
+    switch:
+      - platform: gpio
+        pin: GPIO12
+        name: "Kitchen Exhaust Fan"
+        id: kitchen_exhaust
+
+  office-sensor.yaml: |
+    # Office Environmental Sensor
+    esphome:
+      name: office-sensor
+      platform: ESP32
+      board: esp32dev
+    
+    wifi:
+      ssid: "homelab-iot"
+      password: "homelab-wifi-password"
+      
+    logger:
+    api:
+    ota:
+    
+    mqtt:
+      broker: edge-mqtt.edge.svc.cluster.local
+      port: 1883
+      username: edge
+      password: edgepassword
+      discovery: true
+      topic_prefix: homeassistant/sensor/office
+    
+    i2c:
+      sda: 21
+      scl: 22
+    
+    sensor:
+      - platform: bme680
+        temperature:
+          name: "Office Temperature"
+          id: office_temp
+          oversampling: 16x
+        pressure:
+          name: "Office Pressure"
+          id: office_pressure
+        humidity:
+          name: "Office Humidity"
+          id: office_humidity
+        gas_resistance:
+          name: "Office Gas Resistance"
+          id: office_gas_resistance
+        address: 0x77
+        update_interval: 60s
+        
+      - platform: sgp30
+        eco2:
+          name: "Office eCO2"
+          accuracy_decimals: 1
+          id: office_eco2
+        tvoc:
+          name: "Office TVOC"
+          accuracy_decimals: 1
+          id: office_tvoc
+        address: 0x58
+        update_interval: 1s
+        
+      - platform: template
+        name: "Office Productivity Index"
+        id: office_productivity
+        unit_of_measurement: "score"
+        lambda: |-
+          float temp = id(office_temp).state;
+          float humidity = id(office_humidity).state;
+          float co2 = id(office_eco2).state;
+          float score = 100;
+          if (temp < 20 || temp > 25) score -= 20;
+          if (humidity < 40 || humidity > 60) score -= 15;
+          if (co2 > 1000) score -= 30;
+          return max(0.0f, score);
+        update_interval: 120s
+    
+    binary_sensor:
+      - platform: gpio
+        pin: 
+          number: GPIO18
+          mode: INPUT_PULLUP
+        name: "Office Motion"
+        device_class: motion
+        
+      - platform: gpio
+        pin: 
+          number: GPIO19
+          mode: INPUT_PULLUP
+        name: "Office Door"
+        device_class: door
+
+  server-room-sensor.yaml: |
+    # Server Room Environmental Monitor
+    esphome:
+      name: server-room-sensor
+      platform: ESP32
+      board: esp32dev
+    
+    wifi:
+      ssid: "homelab-iot"
+      password: "homelab-wifi-password"
+      
+    logger:
+    api:
+    ota:
+    
+    mqtt:
+      broker: edge-mqtt.edge.svc.cluster.local
+      port: 1883
+      username: edge
+      password: edgepassword
+      discovery: true
+      topic_prefix: homeassistant/sensor/server_room
+    
+    i2c:
+      sda: 21
+      scl: 22
+    
+    sensor:
+      - platform: sht3xd
+        temperature:
+          name: "Server Room Temperature"
+          id: server_room_temp
+          accuracy_decimals: 1
+          filters:
+            - throttle: 10s  # High frequency for critical monitoring
+        humidity:
+          name: "Server Room Humidity"
+          id: server_room_humidity
+          accuracy_decimals: 1
+        address: 0x44
+        update_interval: 10s
+        
+      - platform: adc
+        pin: A0
+        name: "Server Room Noise Level"
+        id: server_room_noise
+        update_interval: 30s
+        filters:
+          - multiply: 100  # Convert to dB approximation
+          
+      - platform: template
+        name: "Server Room Health Score"
+        id: server_room_health
+        unit_of_measurement: "score"
+        lambda: |-
+          float temp = id(server_room_temp).state;
+          float humidity = id(server_room_humidity).state;
+          float score = 100;
+          if (temp > 25) score -= 30;  # Critical for servers
+          if (temp > 30) score -= 50;  # Emergency
+          if (humidity > 70) score -= 20;  # Condensation risk
+          if (humidity < 30) score -= 15;  # Static risk
+          return max(0.0f, score);
+        update_interval: 30s
+    
+    binary_sensor:
+      - platform: gpio
+        pin: 
+          number: GPIO18
+          mode: INPUT_PULLUP
+        name: "Server Room Motion"
+        device_class: motion
+        
+      - platform: gpio
+        pin: 
+          number: GPIO19
+          mode: INPUT_PULLUP
+        name: "Server Room Door"
+        device_class: door
+        
+      - platform: template
+        name: "Server Room Temperature Alert"
+        lambda: |-
+          return id(server_room_temp).state > 28;
+        device_class: problem
+    
+    switch:
+      - platform: gpio
+        pin: GPIO23
+        name: "Server Room Fan"
+        id: server_room_fan
+        
+      - platform: gpio
+        pin: GPIO22
+        name: "Server Room Emergency Cooling"
+        id: server_room_emergency_cooling
+    
+    fan:
+      - platform: speed
+        output: server_room_fan_speed
+        name: "Server Room Variable Fan"
+        id: server_room_variable_fan
+    
+    output:
+      - platform: ledc
+        pin: GPIO25
+        id: server_room_fan_speed
+
+  hvac-controller.yaml: |
+    # HVAC System Controller
+    esphome:
+      name: hvac-controller
+      platform: ESP32
+      board: esp32dev
+    
+    wifi:
+      ssid: "homelab-iot"
+      password: "homelab-wifi-password"
+      
+    logger:
+    api:
+    ota:
+    
+    mqtt:
+      broker: edge-mqtt.edge.svc.cluster.local
+      port: 1883
+      username: edge
+      password: edgepassword
+      discovery: true
+      topic_prefix: homeassistant/climate/main_hvac
+    
+    climate:
+      - platform: thermostat
+        name: "Main HVAC Controller"
+        id: main_hvac
+        sensor: main_hvac_temp
+        min_temperature: 15
+        max_temperature: 30
+        target_temperature: 22
+        heat_action:
+          - switch.turn_on: hvac_heat
+        cool_action:
+          - switch.turn_on: hvac_cool
+        idle_action:
+          - switch.turn_off: hvac_heat
+          - switch.turn_off: hvac_cool
+        heat_deadband: 0.5
+        cool_deadband: 0.5
+        min_heating_off_time: 300s
+        min_cooling_off_time: 300s
+        min_heating_run_time: 300s
+        min_cooling_run_time: 300s
+    
+    sensor:
+      - platform: homeassistant
+        id: main_hvac_temp
+        entity_id: sensor.average_indoor_temperature
+        
+      - platform: pulse_counter
+        pin: GPIO2
+        name: "HVAC Power Meter"
+        id: hvac_power
+        unit_of_measurement: "W"
+        filters:
+          - multiply: 0.06  # Calibration factor
+        update_interval: 10s
+    
+    switch:
+      - platform: gpio
+        pin: GPIO18
+        name: "HVAC Heat"
+        id: hvac_heat
+        
+      - platform: gpio
+        pin: GPIO19
+        name: "HVAC Cool"
+        id: hvac_cool
+        
+      - platform: gpio
+        pin: GPIO21
+        name: "HVAC Fan"
+        id: hvac_fan
+    
+    binary_sensor:
+      - platform: gpio
+        pin: 
+          number: GPIO22
+          mode: INPUT_PULLUP
+        name: "HVAC Status"
+        id: hvac_status
+
+---
+# ESPHome Compilation Job
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: esphome-compile-devices
+  namespace: smart-home
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]  # Use AMD64 for faster compilation
+      containers:
+      - name: esphome-compiler
+        image: esphome/esphome:latest
+        command: ["/bin/bash"]
+        args:
+          - -c
+          - |
+            echo "Compiling ESPHome device configurations..."
+            cd /config
+            for device in *.yaml; do
+              echo "Compiling $device..."
+              esphome compile $device || echo "Failed to compile $device"
+            done
+            echo "Compilation complete"
+        volumeMounts:
+        - name: esphome-configs
+          mountPath: /config
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+      volumes:
+      - name: esphome-configs
+        configMap:
+          name: esphome-temperature-sensors
+      restartPolicy: Never
+  backoffLimit: 3

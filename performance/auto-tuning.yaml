@@ -1,0 +1,1061 @@
+# Automated Performance Tuning for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: performance
+  labels:
+    name: performance
+
+---
+# Performance Tuning Controller
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: performance-tuner
+  namespace: performance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: performance-tuner
+  template:
+    metadata:
+      labels:
+        app: performance-tuner
+    spec:
+      serviceAccountName: performance-tuner
+      # Run on AMD64 for computational performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: tuner
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes prometheus-client numpy scipy scikit-learn pandas
+          python3 /app/performance_tuner.py
+        volumeMounts:
+        - name: tuner-app
+          mountPath: /app
+        env:
+        - name: PROMETHEUS_URL
+          value: "http://prometheus.monitoring:9090"
+        - name: GRAFANA_URL
+          value: "http://grafana.monitoring:3000"
+        - name: TUNING_INTERVAL
+          value: "300"  # 5 minutes
+        - name: OPTIMIZATION_MODE
+          value: "balanced"  # balanced, performance, efficiency
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+      volumes:
+      - name: tuner-app
+        configMap:
+          name: performance-tuner-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: performance-tuner-app
+  namespace: performance
+data:
+  performance_tuner.py: |
+    #!/usr/bin/env python3
+    import os
+    import time
+    import json
+    import logging
+    import math
+    import requests
+    import numpy as np
+    from datetime import datetime, timedelta
+    from kubernetes import client, config
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.preprocessing import StandardScaler
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Metrics
+    TUNING_OPERATIONS = Counter('performance_tuning_operations_total', 'Total tuning operations', ['type', 'result'])
+    RESOURCE_EFFICIENCY = Gauge('resource_efficiency_ratio', 'Resource efficiency ratio', ['architecture', 'resource'])
+    PREDICTED_SAVINGS = Gauge('predicted_power_savings_watts', 'Predicted power savings', ['optimization'])
+    OPTIMIZATION_SCORE = Gauge('optimization_score', 'Overall optimization score', ['architecture'])
+    
+    class PerformanceTuner:
+        def __init__(self):
+            config.load_incluster_config()
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            self.custom_api = client.CustomObjectsApi()
+            
+            self.prometheus_url = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
+            self.tuning_interval = int(os.getenv("TUNING_INTERVAL", "300"))
+            self.optimization_mode = os.getenv("OPTIMIZATION_MODE", "balanced")
+            
+            # ML models for prediction
+            self.resource_predictor = RandomForestRegressor(n_estimators=100, random_state=42)
+            self.scaler = StandardScaler()
+            self.model_trained = False
+            
+            # Architecture specifications
+            self.arch_specs = {
+                "amd64": {
+                    "base_power": 45,  # Watts
+                    "cpu_efficiency": 1.0,
+                    "memory_bandwidth": 1.0,
+                    "optimal_cpu_util": 0.8,
+                    "max_pods_per_core": 4
+                },
+                "arm64": {
+                    "base_power": 7,   # Watts
+                    "cpu_efficiency": 0.7,
+                    "memory_bandwidth": 0.6,
+                    "optimal_cpu_util": 0.9,
+                    "max_pods_per_core": 6
+                },
+                "arm": {
+                    "base_power": 3,   # Watts
+                    "cpu_efficiency": 0.4,
+                    "memory_bandwidth": 0.3,
+                    "optimal_cpu_util": 0.95,
+                    "max_pods_per_core": 8
+                }
+            }
+        
+        def query_prometheus(self, query, start_time=None, end_time=None):
+            """Query Prometheus for metrics data"""
+            try:
+                if start_time and end_time:
+                    # Range query
+                    params = {
+                        'query': query,
+                        'start': start_time,
+                        'end': end_time,
+                        'step': '15s'
+                    }
+                    response = requests.get(f"{self.prometheus_url}/api/v1/query_range", params=params)
+                else:
+                    # Instant query
+                    params = {'query': query}
+                    response = requests.get(f"{self.prometheus_url}/api/v1/query", params=params)
+                
+                if response.status_code == 200:
+                    return response.json()['data']['result']
+                
+                return []
+                
+            except Exception as e:
+                logger.error(f"Failed to query Prometheus: {e}")
+                return []
+        
+        def collect_training_data(self):
+            """Collect historical data for ML model training"""
+            try:
+                end_time = datetime.utcnow()
+                start_time = end_time - timedelta(hours=24)  # Last 24 hours
+                
+                start_ts = int(start_time.timestamp())
+                end_ts = int(end_time.timestamp())
+                
+                # Collect CPU utilization data
+                cpu_query = 'avg by (node, architecture) (100 - (irate(node_cpu_seconds_total{mode="idle"}[5m]) * 100))'
+                cpu_data = self.query_prometheus(cpu_query, start_ts, end_ts)
+                
+                # Collect memory utilization data
+                mem_query = 'avg by (node, architecture) ((1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100)'
+                mem_data = self.query_prometheus(mem_query, start_ts, end_ts)
+                
+                # Collect power consumption estimates
+                power_query = 'avg by (node, architecture) (node_power_consumption_watts)'
+                power_data = self.query_prometheus(power_query, start_ts, end_ts)
+                
+                # Collect pod count data
+                pod_query = 'count by (node, architecture) (kube_pod_info)'
+                pod_data = self.query_prometheus(pod_query, start_ts, end_ts)
+                
+                # Prepare training dataset
+                features = []
+                targets = []
+                
+                # Combine data points
+                data_points = {}
+                
+                for item in cpu_data:
+                    node = item['metric']['node']
+                    arch = item['metric'].get('architecture', 'unknown')
+                    values = item['values']
+                    
+                    for timestamp, value in values:
+                        key = f"{node}_{timestamp}"
+                        if key not in data_points:
+                            data_points[key] = {'node': node, 'arch': arch, 'timestamp': timestamp}
+                        data_points[key]['cpu'] = float(value)
+                
+                # Add memory data
+                for item in mem_data:
+                    node = item['metric']['node']
+                    values = item['values']
+                    
+                    for timestamp, value in values:
+                        key = f"{node}_{timestamp}"
+                        if key in data_points:
+                            data_points[key]['memory'] = float(value)
+                
+                # Add power data (target variable)
+                for item in power_data:
+                    node = item['metric']['node']
+                    values = item['values']
+                    
+                    for timestamp, value in values:
+                        key = f"{node}_{timestamp}"
+                        if key in data_points:
+                            data_points[key]['power'] = float(value)
+                
+                # Add pod count data
+                for item in pod_data:
+                    node = item['metric']['node']
+                    values = item['values']
+                    
+                    for timestamp, value in values:
+                        key = f"{node}_{timestamp}"
+                        if key in data_points:
+                            data_points[key]['pods'] = float(value)
+                
+                # Convert to training data
+                for key, data in data_points.items():
+                    if all(k in data for k in ['cpu', 'memory', 'power', 'pods', 'arch']):
+                        arch_spec = self.arch_specs.get(data['arch'], self.arch_specs['amd64'])
+                        
+                        feature = [
+                            data['cpu'],
+                            data['memory'],
+                            data['pods'],
+                            arch_spec['cpu_efficiency'],
+                            arch_spec['memory_bandwidth'],
+                            arch_spec['base_power']
+                        ]
+                        
+                        features.append(feature)
+                        targets.append(data['power'])
+                
+                if len(features) > 100:  # Need sufficient data
+                    features = np.array(features)
+                    targets = np.array(targets)
+                    
+                    # Train the model
+                    features_scaled = self.scaler.fit_transform(features)
+                    self.resource_predictor.fit(features_scaled, targets)
+                    self.model_trained = True
+                    
+                    logger.info(f"Trained performance model with {len(features)} data points")
+                    
+                    return True
+                else:
+                    logger.warning(f"Insufficient data for training: {len(features)} points")
+                    return False
+                
+            except Exception as e:
+                logger.error(f"Failed to collect training data: {e}")
+                return False
+        
+        def predict_resource_requirements(self, workload_profile):
+            """Predict optimal resource requirements for a workload"""
+            if not self.model_trained:
+                return None
+            
+            try:
+                arch = workload_profile.get('architecture', 'amd64')
+                arch_spec = self.arch_specs.get(arch, self.arch_specs['amd64'])
+                
+                # Feature vector: [expected_cpu, expected_memory, pod_count, arch_efficiency, bandwidth, base_power]
+                features = np.array([[
+                    workload_profile.get('expected_cpu_util', 50),
+                    workload_profile.get('expected_memory_util', 60),
+                    workload_profile.get('pod_count', 1),
+                    arch_spec['cpu_efficiency'],
+                    arch_spec['memory_bandwidth'],
+                    arch_spec['base_power']
+                ]])
+                
+                features_scaled = self.scaler.transform(features)
+                predicted_power = self.resource_predictor.predict(features_scaled)[0]
+                
+                # Calculate efficiency score
+                efficiency_score = workload_profile.get('expected_cpu_util', 50) / predicted_power
+                
+                return {
+                    'predicted_power': predicted_power,
+                    'efficiency_score': efficiency_score,
+                    'recommended_arch': arch
+                }
+                
+            except Exception as e:
+                logger.error(f"Failed to predict resource requirements: {e}")
+                return None
+        
+        def analyze_workload_placement(self):
+            """Analyze current workload placement and suggest optimizations"""
+            try:
+                optimizations = []
+                
+                # Get all pods with their resource usage
+                pods = self.v1.list_pod_for_all_namespaces()
+                
+                for pod in pods.items:
+                    if pod.status.phase != "Running":
+                        continue
+                    
+                    node_name = pod.spec.node_name
+                    if not node_name:
+                        continue
+                    
+                    # Get node architecture
+                    node = self.v1.read_node(node_name)
+                    arch = node.metadata.labels.get('kubernetes.io/arch', 'unknown')
+                    
+                    if arch not in self.arch_specs:
+                        continue
+                    
+                    # Analyze pod resource requests vs actual usage
+                    pod_name = pod.metadata.name
+                    namespace = pod.metadata.namespace
+                    
+                    # Query actual resource usage
+                    cpu_query = f'avg(rate(container_cpu_usage_seconds_total{{pod="{pod_name}", namespace="{namespace}"}}[5m]))'
+                    cpu_data = self.query_prometheus(cpu_query)
+                    
+                    mem_query = f'avg(container_memory_working_set_bytes{{pod="{pod_name}", namespace="{namespace}"}})'
+                    mem_data = self.query_prometheus(mem_query)
+                    
+                    actual_cpu = float(cpu_data[0]['value'][1]) if cpu_data else 0
+                    actual_memory = float(mem_data[0]['value'][1]) if mem_data else 0
+                    
+                    # Get requested resources
+                    requested_cpu = 0
+                    requested_memory = 0
+                    
+                    for container in pod.spec.containers:
+                        if container.resources and container.resources.requests:
+                            if 'cpu' in container.resources.requests:
+                                cpu_str = container.resources.requests['cpu']
+                                if cpu_str.endswith('m'):
+                                    requested_cpu += float(cpu_str[:-1]) / 1000
+                                else:
+                                    requested_cpu += float(cpu_str)
+                            
+                            if 'memory' in container.resources.requests:
+                                mem_str = container.resources.requests['memory']
+                                if mem_str.endswith('Gi'):
+                                    requested_memory += float(mem_str[:-2]) * 1024 * 1024 * 1024
+                                elif mem_str.endswith('Mi'):
+                                    requested_memory += float(mem_str[:-2]) * 1024 * 1024
+                    
+                    # Calculate efficiency ratios
+                    cpu_efficiency = actual_cpu / requested_cpu if requested_cpu > 0 else 0
+                    mem_efficiency = actual_memory / requested_memory if requested_memory > 0 else 0
+                    
+                    # Update metrics
+                    RESOURCE_EFFICIENCY.labels(architecture=arch, resource='cpu').set(cpu_efficiency)
+                    RESOURCE_EFFICIENCY.labels(architecture=arch, resource='memory').set(mem_efficiency)
+                    
+                    # Check for optimization opportunities
+                    if cpu_efficiency < 0.3 and requested_cpu > 0.1:  # Under-utilized
+                        optimizations.append({
+                            'type': 'rightsizing',
+                            'pod': f"{namespace}/{pod_name}",
+                            'recommendation': 'Reduce CPU request',
+                            'current_cpu': requested_cpu,
+                            'suggested_cpu': max(actual_cpu * 1.2, 0.05),
+                            'potential_savings': (requested_cpu - actual_cpu * 1.2) * self.arch_specs[arch]['base_power'] * 0.1
+                        })
+                    
+                    elif cpu_efficiency > 0.9 and arch == 'amd64':  # Over-utilized on high-power arch
+                        # Check if workload could be moved to more efficient architecture
+                        if self.is_workload_suitable_for_arch(pod, 'arm64'):
+                            power_savings = self.arch_specs['amd64']['base_power'] - self.arch_specs['arm64']['base_power']
+                            optimizations.append({
+                                'type': 'architecture_migration',
+                                'pod': f"{namespace}/{pod_name}",
+                                'recommendation': 'Move to ARM64',
+                                'current_arch': 'amd64',
+                                'suggested_arch': 'arm64',
+                                'potential_savings': power_savings
+                            })
+                
+                return optimizations
+                
+            except Exception as e:
+                logger.error(f"Failed to analyze workload placement: {e}")
+                return []
+        
+        def is_workload_suitable_for_arch(self, pod, target_arch):
+            """Check if a workload is suitable for a target architecture"""
+            try:
+                # Check pod labels and annotations
+                labels = pod.metadata.labels or {}
+                annotations = pod.metadata.annotations or {}
+                
+                # Exclude heavy workloads from ARM
+                if target_arch == 'arm' and labels.get('workload-type') == 'heavy':
+                    return False
+                
+                # Check if pod has architecture requirements
+                if 'required-architecture' in annotations:
+                    return annotations['required-architecture'] == target_arch
+                
+                # Check image architecture compatibility
+                for container in pod.spec.containers:
+                    image = container.image
+                    
+                    # Simple heuristic: check if image is known to be architecture-specific
+                    if any(arch_specific in image.lower() for arch_specific in ['amd64', 'x86_64', 'nvidia']):
+                        if target_arch in ['arm64', 'arm']:
+                            return False
+                    
+                    if any(arch_specific in image.lower() for arch_specific in ['arm64', 'aarch64']):
+                        if target_arch == 'amd64':
+                            return False
+                
+                # Check resource requirements
+                total_cpu = 0
+                total_memory = 0
+                
+                for container in pod.spec.containers:
+                    if container.resources and container.resources.requests:
+                        if 'cpu' in container.resources.requests:
+                            cpu_str = container.resources.requests['cpu']
+                            if cpu_str.endswith('m'):
+                                total_cpu += float(cpu_str[:-1]) / 1000
+                            else:
+                                total_cpu += float(cpu_str)
+                        
+                        if 'memory' in container.resources.requests:
+                            mem_str = container.resources.requests['memory']
+                            if mem_str.endswith('Gi'):
+                                total_memory += float(mem_str[:-2])
+                            elif mem_str.endswith('Mi'):
+                                total_memory += float(mem_str[:-2]) / 1024
+                
+                # ARM nodes typically have lower resource limits
+                if target_arch == 'arm':
+                    return total_cpu <= 0.5 and total_memory <= 1.0
+                elif target_arch == 'arm64':
+                    return total_cpu <= 2.0 and total_memory <= 4.0
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to check workload suitability: {e}")
+                return False
+        
+        def apply_optimization(self, optimization):
+            """Apply a specific optimization recommendation"""
+            try:
+                opt_type = optimization['type']
+                pod_ref = optimization['pod']
+                namespace, pod_name = pod_ref.split('/')
+                
+                if opt_type == 'rightsizing':
+                    # Find the deployment/statefulset that owns this pod
+                    pod = self.v1.read_namespaced_pod(pod_name, namespace)
+                    
+                    owner_ref = None
+                    for owner in pod.metadata.owner_references or []:
+                        if owner.kind in ['ReplicaSet', 'StatefulSet', 'DaemonSet']:
+                            owner_ref = owner
+                            break
+                    
+                    if owner_ref and owner_ref.kind == 'ReplicaSet':
+                        # Get the deployment
+                        rs = self.apps_v1.read_namespaced_replica_set(owner_ref.name, namespace)
+                        for owner in rs.metadata.owner_references or []:
+                            if owner.kind == 'Deployment':
+                                # Update deployment resource requests
+                                deployment = self.apps_v1.read_namespaced_deployment(owner.name, namespace)
+                                
+                                # Update CPU request
+                                for container in deployment.spec.template.spec.containers:
+                                    if container.resources and container.resources.requests:
+                                        container.resources.requests['cpu'] = f"{optimization['suggested_cpu']:.3f}"
+                                
+                                # Apply the update
+                                self.apps_v1.patch_namespaced_deployment(
+                                    name=owner.name,
+                                    namespace=namespace,
+                                    body=deployment
+                                )
+                                
+                                logger.info(f"Applied rightsizing to {owner.name}: CPU {optimization['current_cpu']:.3f} -> {optimization['suggested_cpu']:.3f}")
+                                TUNING_OPERATIONS.labels(type='rightsizing', result='success').inc()
+                                PREDICTED_SAVINGS.labels(optimization='rightsizing').set(optimization['potential_savings'])
+                                
+                                return True
+                
+                elif opt_type == 'architecture_migration':
+                    # Add node selector to move workload to different architecture
+                    pod = self.v1.read_namespaced_pod(pod_name, namespace)
+                    
+                    # Find owner deployment
+                    owner_ref = None
+                    for owner in pod.metadata.owner_references or []:
+                        if owner.kind == 'ReplicaSet':
+                            rs = self.apps_v1.read_namespaced_replica_set(owner.name, namespace)
+                            for rs_owner in rs.metadata.owner_references or []:
+                                if rs_owner.kind == 'Deployment':
+                                    owner_ref = rs_owner
+                                    break
+                    
+                    if owner_ref:
+                        deployment = self.apps_v1.read_namespaced_deployment(owner_ref.name, namespace)
+                        
+                        # Update node selector
+                        if not deployment.spec.template.spec.node_selector:
+                            deployment.spec.template.spec.node_selector = {}
+                        
+                        deployment.spec.template.spec.node_selector['kubernetes.io/arch'] = optimization['suggested_arch']
+                        
+                        # Apply the update
+                        self.apps_v1.patch_namespaced_deployment(
+                            name=owner_ref.name,
+                            namespace=namespace,
+                            body=deployment
+                        )
+                        
+                        logger.info(f"Migrated {owner_ref.name} from {optimization['current_arch']} to {optimization['suggested_arch']}")
+                        TUNING_OPERATIONS.labels(type='migration', result='success').inc()
+                        PREDICTED_SAVINGS.labels(optimization='migration').set(optimization['potential_savings'])
+                        
+                        return True
+                
+                return False
+                
+            except Exception as e:
+                logger.error(f"Failed to apply optimization: {e}")
+                TUNING_OPERATIONS.labels(type=optimization['type'], result='error').inc()
+                return False
+        
+        def calculate_architecture_scores(self):
+            """Calculate optimization scores for each architecture"""
+            try:
+                for arch in self.arch_specs.keys():
+                    # Get current utilization
+                    cpu_query = f'avg(100 - (irate(node_cpu_seconds_total{{architecture="{arch}", mode="idle"}}[5m]) * 100))'
+                    cpu_data = self.query_prometheus(cpu_query)
+                    
+                    mem_query = f'avg((1 - (node_memory_MemAvailable_bytes{{architecture="{arch}"}} / node_memory_MemTotal_bytes{{architecture="{arch}"}})) * 100)'
+                    mem_data = self.query_prometheus(mem_query)
+                    
+                    cpu_util = float(cpu_data[0]['value'][1]) if cpu_data else 0
+                    mem_util = float(mem_data[0]['value'][1]) if mem_data else 0
+                    
+                    # Calculate optimization score (0-100)
+                    optimal_cpu = self.arch_specs[arch]['optimal_cpu_util'] * 100
+                    
+                    cpu_score = max(0, 100 - abs(cpu_util - optimal_cpu))
+                    mem_score = max(0, 100 - abs(mem_util - 70))  # Target 70% memory utilization
+                    
+                    # Power efficiency factor
+                    power_efficiency = 100 / self.arch_specs[arch]['base_power']
+                    
+                    # Overall score
+                    overall_score = (cpu_score * 0.4 + mem_score * 0.3 + power_efficiency * 0.3)
+                    
+                    OPTIMIZATION_SCORE.labels(architecture=arch).set(overall_score)
+                    
+            except Exception as e:
+                logger.error(f"Failed to calculate architecture scores: {e}")
+        
+        def run_optimization_cycle(self):
+            """Run a complete optimization cycle"""
+            logger.info("Starting optimization cycle")
+            
+            try:
+                # Train/update ML models
+                if not self.model_trained:
+                    logger.info("Training performance prediction model...")
+                    self.collect_training_data()
+                
+                # Analyze current workload placement
+                optimizations = self.analyze_workload_placement()
+                
+                logger.info(f"Found {len(optimizations)} optimization opportunities")
+                
+                # Apply optimizations based on mode
+                applied_count = 0
+                total_savings = 0
+                
+                for optimization in optimizations:
+                    if self.optimization_mode == "aggressive" or optimization['potential_savings'] > 5:
+                        # Apply high-impact optimizations
+                        if self.apply_optimization(optimization):
+                            applied_count += 1
+                            total_savings += optimization['potential_savings']
+                    
+                    elif self.optimization_mode == "balanced" and optimization['potential_savings'] > 2:
+                        # Apply medium-impact optimizations
+                        if self.apply_optimization(optimization):
+                            applied_count += 1
+                            total_savings += optimization['potential_savings']
+                    
+                    elif self.optimization_mode == "conservative" and optimization['potential_savings'] > 10:
+                        # Apply only high-impact optimizations
+                        if self.apply_optimization(optimization):
+                            applied_count += 1
+                            total_savings += optimization['potential_savings']
+                
+                # Calculate architecture scores
+                self.calculate_architecture_scores()
+                
+                logger.info(f"Applied {applied_count} optimizations, estimated savings: {total_savings:.2f}W")
+                
+                return {
+                    'optimizations_found': len(optimizations),
+                    'optimizations_applied': applied_count,
+                    'estimated_savings': total_savings
+                }
+                
+            except Exception as e:
+                logger.error(f"Failed to run optimization cycle: {e}")
+                return None
+        
+        def run(self):
+            """Main performance tuning loop"""
+            logger.info("Starting Performance Tuner")
+            
+            # Start metrics server
+            start_http_server(8080)
+            
+            while True:
+                try:
+                    result = self.run_optimization_cycle()
+                    
+                    if result:
+                        logger.info(f"Optimization cycle completed: {result}")
+                    
+                except Exception as e:
+                    logger.error(f"Error in optimization cycle: {e}")
+                
+                # Wait before next cycle
+                time.sleep(self.tuning_interval)
+    
+    if __name__ == "__main__":
+        tuner = PerformanceTuner()
+        tuner.run()
+
+---
+# Vertical Pod Autoscaler (VPA) Configuration
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: dashboard-api-vpa
+  namespace: default
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: dashboard-api
+  updatePolicy:
+    updateMode: "Auto"  # Automatically apply recommendations
+  resourcePolicy:
+    containerPolicies:
+    - containerName: dashboard-api
+      minAllowed:
+        cpu: 100m
+        memory: 128Mi
+      maxAllowed:
+        cpu: 2000m
+        memory: 4Gi
+      controlledResources: ["cpu", "memory"]
+
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: ml-serving-vpa
+  namespace: ml-serving
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tensorflow-serving-amd64
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: tensorflow-serving
+      minAllowed:
+        cpu: 500m
+        memory: 1Gi
+      maxAllowed:
+        cpu: 8000m
+        memory: 16Gi
+      controlledResources: ["cpu", "memory"]
+
+---
+# Cluster Autoscaler Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-autoscaler-config
+  namespace: performance
+data:
+  autoscaler.yaml: |
+    # Cluster Autoscaler configuration for multi-architecture homelab
+    autoscaler:
+      # Architecture-specific node groups
+      nodeGroups:
+        amd64-workers:
+          minSize: 1
+          maxSize: 4
+          targetSize: 2
+          instanceType: "high-performance"
+          
+        arm64-workers:
+          minSize: 1
+          maxSize: 6
+          targetSize: 3
+          instanceType: "balanced"
+          
+        arm-workers:
+          minSize: 1
+          maxSize: 8
+          targetSize: 2
+          instanceType: "edge"
+      
+      # Scaling policies
+      scaleDownDelayAfterAdd: "10m"
+      scaleDownUnneededTime: "5m"
+      scaleDownUtilizationThreshold: 0.5
+      skipNodesWithLocalStorage: false
+      skipNodesWithSystemPods: false
+      
+      # Architecture-aware scaling
+      nodeGroupAutoDiscovery:
+        asg:
+          tag:
+          - "k8s.io/cluster-autoscaler/enabled"
+          - "k8s.io/cluster-autoscaler/homelab"
+      
+      # Power-aware scaling priorities
+      priorities:
+      - nodeSelector:
+          matchLabels:
+            kubernetes.io/arch: "arm"
+        weight: 100  # Prefer ARM for scaling
+      - nodeSelector:
+          matchLabels:
+            kubernetes.io/arch: "arm64"
+        weight: 80   # Second preference
+      - nodeSelector:
+          matchLabels:
+            kubernetes.io/arch: "amd64"
+        weight: 60   # Last preference (high power)
+
+---
+# Node Resource Monitor
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-resource-monitor
+  namespace: performance
+spec:
+  selector:
+    matchLabels:
+      app: node-resource-monitor
+  template:
+    metadata:
+      labels:
+        app: node-resource-monitor
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: monitor
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install psutil prometheus-client
+          python3 /app/node_monitor.py
+        volumeMounts:
+        - name: monitor-app
+          mountPath: /app
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NODE_ARCH
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['kubernetes.io/arch']
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+        securityContext:
+          privileged: true
+      volumes:
+      - name: monitor-app
+        configMap:
+          name: node-monitor-app
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-monitor-app
+  namespace: performance
+data:
+  node_monitor.py: |
+    #!/usr/bin/env python3
+    import os
+    import time
+    import psutil
+    import logging
+    from prometheus_client import Gauge, Counter, start_http_server
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Metrics
+    NODE_CPU_FREQUENCY = Gauge('node_cpu_frequency_hertz', 'Current CPU frequency', ['node', 'architecture', 'cpu'])
+    NODE_CPU_TEMPERATURE = Gauge('node_cpu_temperature_celsius', 'CPU temperature', ['node', 'architecture', 'sensor'])
+    NODE_POWER_CONSUMPTION = Gauge('node_power_consumption_watts', 'Estimated power consumption', ['node', 'architecture'])
+    NODE_THERMAL_THROTTLING = Counter('node_thermal_throttling_total', 'Thermal throttling events', ['node', 'architecture'])
+    NODE_EFFICIENCY_SCORE = Gauge('node_efficiency_score', 'Node efficiency score', ['node', 'architecture'])
+    
+    class NodeMonitor:
+        def __init__(self):
+            self.node_name = os.getenv('NODE_NAME', 'unknown')
+            self.node_arch = os.getenv('NODE_ARCH', 'unknown')
+            
+            # Architecture-specific power profiles
+            self.power_profiles = {
+                'amd64': {'base': 45, 'per_core': 8, 'per_gb': 2},
+                'arm64': {'base': 7, 'per_core': 1.5, 'per_gb': 0.5},
+                'arm': {'base': 3, 'per_core': 0.8, 'per_gb': 0.3}
+            }
+        
+        def get_cpu_frequency(self):
+            """Get current CPU frequencies"""
+            try:
+                frequencies = psutil.cpu_freq(percpu=True)
+                for i, freq in enumerate(frequencies):
+                    if freq:
+                        NODE_CPU_FREQUENCY.labels(
+                            node=self.node_name,
+                            architecture=self.node_arch,
+                            cpu=str(i)
+                        ).set(freq.current * 1000000)  # Convert to Hz
+            except Exception as e:
+                logger.error(f"Failed to get CPU frequency: {e}")
+        
+        def get_cpu_temperature(self):
+            """Get CPU temperature from sensors"""
+            try:
+                temps = psutil.sensors_temperatures()
+                
+                for sensor_name, sensor_list in temps.items():
+                    for i, sensor in enumerate(sensor_list):
+                        NODE_CPU_TEMPERATURE.labels(
+                            node=self.node_name,
+                            architecture=self.node_arch,
+                            sensor=f"{sensor_name}_{i}"
+                        ).set(sensor.current)
+                        
+                        # Check for thermal throttling
+                        if sensor.high and sensor.current > sensor.high:
+                            NODE_THERMAL_THROTTLING.labels(
+                                node=self.node_name,
+                                architecture=self.node_arch
+                            ).inc()
+                            
+            except Exception as e:
+                logger.error(f"Failed to get CPU temperature: {e}")
+        
+        def estimate_power_consumption(self):
+            """Estimate current power consumption"""
+            try:
+                profile = self.power_profiles.get(self.node_arch, self.power_profiles['amd64'])
+                
+                # Base power
+                power = profile['base']
+                
+                # CPU load contribution
+                cpu_percent = psutil.cpu_percent(interval=1)
+                cpu_count = psutil.cpu_count()
+                power += (cpu_percent / 100) * cpu_count * profile['per_core']
+                
+                # Memory usage contribution
+                memory = psutil.virtual_memory()
+                memory_gb = memory.total / (1024**3)
+                memory_usage_percent = memory.percent
+                power += (memory_usage_percent / 100) * memory_gb * profile['per_gb']
+                
+                # Disk I/O contribution (small factor)
+                disk_io = psutil.disk_io_counters()
+                if disk_io:
+                    io_activity = (disk_io.read_bytes + disk_io.write_bytes) / (1024**3)  # GB
+                    power += min(io_activity * 0.1, 5)  # Cap at 5W for I/O
+                
+                NODE_POWER_CONSUMPTION.labels(
+                    node=self.node_name,
+                    architecture=self.node_arch
+                ).set(power)
+                
+                return power
+                
+            except Exception as e:
+                logger.error(f"Failed to estimate power consumption: {e}")
+                return 0
+        
+        def calculate_efficiency_score(self):
+            """Calculate node efficiency score (0-100)"""
+            try:
+                # Get resource utilization
+                cpu_percent = psutil.cpu_percent()
+                memory_percent = psutil.virtual_memory().percent
+                
+                # Get estimated power consumption
+                power = self.estimate_power_consumption()
+                profile = self.power_profiles.get(self.node_arch, self.power_profiles['amd64'])
+                
+                # Calculate efficiency metrics
+                cpu_efficiency = min(cpu_percent / 80, 1.0)  # Target 80% CPU utilization
+                memory_efficiency = min(memory_percent / 85, 1.0)  # Target 85% memory utilization
+                power_efficiency = profile['base'] / power if power > 0 else 0
+                
+                # Combined efficiency score
+                efficiency_score = (cpu_efficiency * 0.4 + memory_efficiency * 0.3 + power_efficiency * 0.3) * 100
+                
+                NODE_EFFICIENCY_SCORE.labels(
+                    node=self.node_name,
+                    architecture=self.node_arch
+                ).set(efficiency_score)
+                
+                return efficiency_score
+                
+            except Exception as e:
+                logger.error(f"Failed to calculate efficiency score: {e}")
+                return 0
+        
+        def run(self):
+            """Main monitoring loop"""
+            logger.info(f"Starting Node Monitor for {self.node_name} ({self.node_arch})")
+            
+            # Start metrics server
+            start_http_server(8080)
+            
+            while True:
+                try:
+                    self.get_cpu_frequency()
+                    self.get_cpu_temperature()
+                    power = self.estimate_power_consumption()
+                    efficiency = self.calculate_efficiency_score()
+                    
+                    logger.info(f"Node {self.node_name}: Power={power:.1f}W, Efficiency={efficiency:.1f}%")
+                    
+                except Exception as e:
+                    logger.error(f"Error in monitoring loop: {e}")
+                
+                time.sleep(30)  # Update every 30 seconds
+    
+    if __name__ == "__main__":
+        monitor = NodeMonitor()
+        monitor.run()
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: performance-tuner
+  namespace: performance
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: performance-tuner
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "replicasets"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers", "verticalpodautoscalers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: performance-tuner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: performance-tuner
+subjects:
+- kind: ServiceAccount
+  name: performance-tuner
+  namespace: performance
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: performance-tuner
+  namespace: performance
+spec:
+  selector:
+    app: performance-tuner
+  ports:
+  - port: 8080
+    targetPort: 8080

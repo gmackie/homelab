@@ -1,0 +1,956 @@
+# GPU Support for ML Workloads in Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-ml
+  labels:
+    name: gpu-ml
+    gpu-enabled: "true"
+
+---
+# NVIDIA GPU Device Plugin DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin
+  namespace: gpu-ml
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin
+    spec:
+      # Only run on nodes with NVIDIA GPUs
+      nodeSelector:
+        feature.node.kubernetes.io/pci-10de.present: "true"  # NVIDIA vendor ID
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      priorityClassName: system-node-critical
+      containers:
+      - name: nvidia-device-plugin
+        image: nvcr.io/nvidia/k8s-device-plugin:v0.14.0
+        env:
+        - name: FAIL_ON_INIT_ERROR
+          value: "false"
+        - name: PASS_DEVICE_SPECS
+          value: "true"
+        - name: DEVICE_LIST_STRATEGY
+          value: "envvar"
+        - name: DEVICE_ID_STRATEGY
+          value: "uuid"
+        - name: NVIDIA_MIG_MONITOR_DEVICES
+          value: "all"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: device-plugin
+          mountPath: /var/lib/kubelet/device-plugins
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "50Mi"
+          limits:
+            cpu: "100m"
+            memory: "100Mi"
+      volumes:
+      - name: device-plugin
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+
+---
+# Intel GPU Device Plugin (for integrated GPUs)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: intel-gpu-plugin
+  namespace: gpu-ml
+spec:
+  selector:
+    matchLabels:
+      name: intel-gpu-plugin
+  template:
+    metadata:
+      labels:
+        name: intel-gpu-plugin
+    spec:
+      nodeSelector:
+        feature.node.kubernetes.io/pci-8086.present: "true"  # Intel vendor ID
+      containers:
+      - name: intel-gpu-plugin
+        image: intel/intel-gpu-plugin:0.27.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+        volumeMounts:
+        - name: devfs
+          mountPath: /dev
+          readOnly: true
+        - name: sysfs
+          mountPath: /sys
+          readOnly: true
+        - name: kubeletsockets
+          mountPath: /var/lib/kubelet/device-plugins
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "50Mi"
+          limits:
+            cpu: "100m"
+            memory: "100Mi"
+      volumes:
+      - name: devfs
+        hostPath:
+          path: /dev
+      - name: sysfs
+        hostPath:
+          path: /sys
+      - name: kubeletsockets
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+
+---
+# GPU Operator Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-operator-config
+  namespace: gpu-ml
+data:
+  config.yaml: |
+    # GPU Operator configuration for multi-architecture support
+    operator:
+      defaultRuntime: containerd
+      use_ocp_driver_toolkit: false
+      
+    driver:
+      enabled: true
+      version: "535.54.03"
+      
+    toolkit:
+      enabled: true
+      version: "1.13.5"
+      
+    devicePlugin:
+      enabled: true
+      config:
+        name: "device-plugin-config"
+        default: "default"
+        data:
+          default: |
+            version: v1
+            flags:
+              migStrategy: "none"
+            sharing:
+              timeSlicing:
+                resources:
+                - name: nvidia.com/gpu
+                  replicas: 4  # Allow GPU time-slicing for better utilization
+                  
+    dcgmExporter:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        
+    gfd:  # GPU Feature Discovery
+      enabled: true
+      
+    mig:  # Multi-Instance GPU
+      strategy: "mixed"
+
+---
+# GPU Scheduler Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-scheduler-config
+  namespace: gpu-ml
+data:
+  config.yaml: |
+    profiles:
+    - schedulerName: gpu-scheduler
+      plugins:
+        preFilter:
+          enabled:
+          - name: NodeResourcesFit
+          - name: NodeAffinity
+          - name: GPUDeviceShare
+        filter:
+          enabled:
+          - name: NodeResourcesFit
+          - name: NodeAffinity
+          - name: GPUDeviceShare
+        score:
+          enabled:
+          - name: GPUDeviceShare
+            weight: 100
+      pluginConfig:
+      - name: GPUDeviceShare
+        args:
+          scoringStrategy:
+            type: LeastAllocated
+            resources:
+            - name: nvidia.com/gpu
+              weight: 100
+            - name: intel.com/gpu
+              weight: 50
+
+---
+# GPU-Accelerated TensorFlow Serving
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tensorflow-gpu-serving
+  namespace: gpu-ml
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tensorflow-gpu-serving
+  template:
+    metadata:
+      labels:
+        app: tensorflow-gpu-serving
+        workload-type: gpu-heavy
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8501"
+    spec:
+      # Schedule on nodes with GPUs
+      nodeSelector:
+        accelerator: "gpu"
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: nvidia.com/gpu.present
+                operator: In
+                values: ["true"]
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: intel.com/gpu.present
+                operator: In
+                values: ["true"]
+      containers:
+      - name: tensorflow-serving
+        image: tensorflow/serving:2.13.0-gpu
+        args:
+        - --model_config_file=/models/models.config
+        - --monitoring_config_file=/models/monitoring.config
+        - --enable_batching=true
+        - --batching_parameters_file=/models/batching.config
+        ports:
+        - containerPort: 8500
+          name: grpc
+        - containerPort: 8501
+          name: rest
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: TF_FORCE_GPU_ALLOW_GROWTH
+          value: "true"
+        - name: TF_GPU_MEMORY_FRACTION
+          value: "0.8"
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "4Gi"
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "4000m"
+            memory: "8Gi"
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: model-store
+          mountPath: /models
+        - name: shm
+          mountPath: /dev/shm
+        livenessProbe:
+          tcpSocket:
+            port: 8500
+          initialDelaySeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /v1/models/model
+            port: 8501
+          initialDelaySeconds: 30
+      volumes:
+      - name: model-store
+        persistentVolumeClaim:
+          claimName: gpu-model-store
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+
+---
+# PyTorch GPU Serving
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pytorch-gpu-serving
+  namespace: gpu-ml
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pytorch-gpu-serving
+  template:
+    metadata:
+      labels:
+        app: pytorch-gpu-serving
+        workload-type: gpu-heavy
+    spec:
+      nodeSelector:
+        accelerator: "gpu"
+      containers:
+      - name: torchserve
+        image: pytorch/torchserve:0.8.0-gpu
+        args:
+        - torchserve
+        - --start
+        - --model-store=/models
+        - --ts-config=/config/config.properties
+        ports:
+        - containerPort: 8080
+          name: inference
+        - containerPort: 8081
+          name: management
+        - containerPort: 8082
+          name: metrics
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: TORCH_CUDA_ARCH_LIST
+          value: "7.0;7.5;8.0;8.6"  # Support multiple GPU architectures
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "4Gi"
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "4000m"
+            memory: "8Gi"
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: model-store
+          mountPath: /models
+        - name: config
+          mountPath: /config
+      volumes:
+      - name: model-store
+        persistentVolumeClaim:
+          claimName: gpu-model-store
+      - name: config
+        configMap:
+          name: torchserve-config
+
+---
+# TorchServe Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: torchserve-config
+  namespace: gpu-ml
+data:
+  config.properties: |
+    inference_address=http://0.0.0.0:8080
+    management_address=http://0.0.0.0:8081
+    metrics_address=http://0.0.0.0:8082
+    number_of_gpu=1
+    batch_size=32
+    max_batch_delay=100
+    job_queue_size=1000
+    async_logging=true
+    default_response_timeout=120
+    model_store=/models
+    load_models=all
+    models={\
+      "resnet50": {\
+        "1.0": {\
+            "defaultVersion": true,\
+            "marName": "resnet50.mar",\
+            "minWorkers": 1,\
+            "maxWorkers": 4,\
+            "batchSize": 32,\
+            "maxBatchDelay": 100,\
+            "responseTimeout": 120\
+        }\
+      }\
+    }
+
+---
+# GPU-Accelerated Jupyter Lab for Development
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jupyter-gpu
+  namespace: gpu-ml
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jupyter-gpu
+  template:
+    metadata:
+      labels:
+        app: jupyter-gpu
+    spec:
+      nodeSelector:
+        accelerator: "gpu"
+      containers:
+      - name: jupyter
+        image: jupyter/tensorflow-notebook:latest
+        command:
+        - jupyter
+        - lab
+        - --ip=0.0.0.0
+        - --port=8888
+        - --no-browser
+        - --allow-root
+        - --NotebookApp.token=''
+        - --NotebookApp.password=''
+        ports:
+        - containerPort: 8888
+          name: jupyter
+        env:
+        - name: JUPYTER_ENABLE_LAB
+          value: "yes"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "2000m"
+            memory: "8Gi"
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: jupyter-storage
+          mountPath: /home/jovyan/work
+      volumes:
+      - name: jupyter-storage
+        persistentVolumeClaim:
+          claimName: jupyter-storage
+
+---
+# GPU Autoscaler
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-autoscaler
+  namespace: gpu-ml
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-autoscaler
+  template:
+    metadata:
+      labels:
+        app: gpu-autoscaler
+    spec:
+      serviceAccountName: gpu-autoscaler
+      containers:
+      - name: autoscaler
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes prometheus-client
+          python3 /app/gpu_autoscaler.py
+        volumeMounts:
+        - name: autoscaler-app
+          mountPath: /app
+        env:
+        - name: PROMETHEUS_URL
+          value: "http://prometheus.monitoring:9090"
+        - name: MIN_GPU_REPLICAS
+          value: "1"
+        - name: MAX_GPU_REPLICAS
+          value: "4"
+        - name: TARGET_GPU_UTILIZATION
+          value: "70"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: autoscaler-app
+        configMap:
+          name: gpu-autoscaler-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-autoscaler-app
+  namespace: gpu-ml
+data:
+  gpu_autoscaler.py: |
+    #!/usr/bin/env python3
+    import os
+    import time
+    import logging
+    import requests
+    from kubernetes import client, config
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Metrics
+    GPU_UTILIZATION = Gauge('gpu_utilization_percent', 'GPU utilization percentage', ['node', 'gpu_id'])
+    GPU_MEMORY_USED = Gauge('gpu_memory_used_bytes', 'GPU memory used', ['node', 'gpu_id'])
+    GPU_MEMORY_TOTAL = Gauge('gpu_memory_total_bytes', 'GPU memory total', ['node', 'gpu_id'])
+    GPU_TEMPERATURE = Gauge('gpu_temperature_celsius', 'GPU temperature', ['node', 'gpu_id'])
+    GPU_POWER_USAGE = Gauge('gpu_power_usage_watts', 'GPU power usage', ['node', 'gpu_id'])
+    SCALING_EVENTS = Counter('gpu_scaling_events_total', 'GPU scaling events', ['direction', 'reason'])
+    
+    class GPUAutoscaler:
+        def __init__(self):
+            config.load_incluster_config()
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            self.prometheus_url = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
+            self.min_replicas = int(os.getenv("MIN_GPU_REPLICAS", "1"))
+            self.max_replicas = int(os.getenv("MAX_GPU_REPLICAS", "4"))
+            self.target_utilization = float(os.getenv("TARGET_GPU_UTILIZATION", "70"))
+            
+        def get_gpu_metrics(self):
+            """Get GPU metrics from Prometheus/DCGM"""
+            try:
+                # Query for GPU utilization
+                query = 'avg(DCGM_FI_DEV_GPU_UTIL)'
+                response = requests.get(f"{self.prometheus_url}/api/v1/query", 
+                                       params={'query': query})
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data['data']['result']:
+                        utilization = float(data['data']['result'][0]['value'][1])
+                        return utilization
+                
+                return 0.0
+                
+            except Exception as e:
+                logger.error(f"Failed to get GPU metrics: {e}")
+                return 0.0
+        
+        def get_gpu_deployments(self):
+            """Get all deployments that use GPUs"""
+            gpu_deployments = []
+            
+            try:
+                deployments = self.apps_v1.list_deployment_for_all_namespaces()
+                
+                for deployment in deployments.items:
+                    # Check if deployment requests GPUs
+                    for container in deployment.spec.template.spec.containers:
+                        if container.resources and container.resources.requests:
+                            requests = container.resources.requests
+                            if 'nvidia.com/gpu' in requests or 'intel.com/gpu' in requests:
+                                gpu_deployments.append(deployment)
+                                break
+                
+                return gpu_deployments
+                
+            except Exception as e:
+                logger.error(f"Failed to get GPU deployments: {e}")
+                return []
+        
+        def calculate_desired_replicas(self, current_replicas, gpu_utilization):
+            """Calculate desired number of replicas based on GPU utilization"""
+            
+            if gpu_utilization > self.target_utilization + 10:
+                # Scale up if utilization is too high
+                desired = current_replicas + 1
+                reason = "high_utilization"
+                direction = "up"
+                
+            elif gpu_utilization < self.target_utilization - 10 and current_replicas > self.min_replicas:
+                # Scale down if utilization is too low
+                desired = current_replicas - 1
+                reason = "low_utilization"
+                direction = "down"
+                
+            else:
+                # No scaling needed
+                return current_replicas, None, None
+            
+            # Apply limits
+            desired = max(self.min_replicas, min(desired, self.max_replicas))
+            
+            if desired != current_replicas:
+                SCALING_EVENTS.labels(direction=direction, reason=reason).inc()
+                return desired, direction, reason
+            
+            return current_replicas, None, None
+        
+        def scale_deployment(self, deployment, desired_replicas):
+            """Scale a deployment to desired replicas"""
+            try:
+                # Update deployment replicas
+                deployment.spec.replicas = desired_replicas
+                
+                self.apps_v1.patch_namespaced_deployment(
+                    name=deployment.metadata.name,
+                    namespace=deployment.metadata.namespace,
+                    body=deployment
+                )
+                
+                logger.info(f"Scaled {deployment.metadata.name} to {desired_replicas} replicas")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to scale deployment: {e}")
+                return False
+        
+        def optimize_gpu_placement(self):
+            """Optimize GPU workload placement across nodes"""
+            try:
+                # Get nodes with GPUs
+                nodes = self.v1.list_node()
+                gpu_nodes = []
+                
+                for node in nodes.items:
+                    if node.status.capacity:
+                        if 'nvidia.com/gpu' in node.status.capacity or 'intel.com/gpu' in node.status.capacity:
+                            gpu_nodes.append(node)
+                
+                # Analyze workload distribution
+                for node in gpu_nodes:
+                    node_name = node.metadata.name
+                    
+                    # Get pods on this node
+                    pods = self.v1.list_pod_for_all_namespaces(
+                        field_selector=f"spec.nodeName={node_name}"
+                    )
+                    
+                    gpu_pods = []
+                    for pod in pods.items:
+                        for container in pod.spec.containers:
+                            if container.resources and container.resources.requests:
+                                if 'nvidia.com/gpu' in container.resources.requests:
+                                    gpu_pods.append(pod)
+                                    break
+                    
+                    logger.info(f"Node {node_name} has {len(gpu_pods)} GPU pods")
+                
+            except Exception as e:
+                logger.error(f"Failed to optimize GPU placement: {e}")
+        
+        def monitor_gpu_health(self):
+            """Monitor GPU health metrics"""
+            try:
+                # Query for GPU temperature
+                temp_query = 'DCGM_FI_DEV_GPU_TEMP'
+                response = requests.get(f"{self.prometheus_url}/api/v1/query",
+                                       params={'query': temp_query})
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    for result in data['data']['result']:
+                        metric = result['metric']
+                        value = float(result['value'][1])
+                        
+                        node = metric.get('kubernetes_node', 'unknown')
+                        gpu_id = metric.get('gpu', '0')
+                        
+                        GPU_TEMPERATURE.labels(node=node, gpu_id=gpu_id).set(value)
+                        
+                        # Alert if temperature is too high
+                        if value > 85:
+                            logger.warning(f"GPU {gpu_id} on node {node} is running hot: {value}°C")
+                
+                # Query for GPU power usage
+                power_query = 'DCGM_FI_DEV_POWER_USAGE'
+                response = requests.get(f"{self.prometheus_url}/api/v1/query",
+                                       params={'query': power_query})
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    for result in data['data']['result']:
+                        metric = result['metric']
+                        value = float(result['value'][1])
+                        
+                        node = metric.get('kubernetes_node', 'unknown')
+                        gpu_id = metric.get('gpu', '0')
+                        
+                        GPU_POWER_USAGE.labels(node=node, gpu_id=gpu_id).set(value)
+                
+            except Exception as e:
+                logger.error(f"Failed to monitor GPU health: {e}")
+        
+        def run(self):
+            """Main autoscaling loop"""
+            logger.info("Starting GPU Autoscaler")
+            
+            # Start metrics server
+            start_http_server(8080)
+            
+            while True:
+                try:
+                    # Get current GPU utilization
+                    gpu_utilization = self.get_gpu_metrics()
+                    logger.info(f"Current GPU utilization: {gpu_utilization}%")
+                    
+                    # Update metrics
+                    GPU_UTILIZATION.labels(node="cluster", gpu_id="avg").set(gpu_utilization)
+                    
+                    # Get GPU deployments
+                    gpu_deployments = self.get_gpu_deployments()
+                    
+                    for deployment in gpu_deployments:
+                        current_replicas = deployment.spec.replicas or 1
+                        
+                        # Calculate desired replicas
+                        desired_replicas, direction, reason = self.calculate_desired_replicas(
+                            current_replicas, gpu_utilization
+                        )
+                        
+                        # Scale if needed
+                        if desired_replicas != current_replicas:
+                            logger.info(f"Scaling {deployment.metadata.name}: {current_replicas} -> {desired_replicas} ({reason})")
+                            self.scale_deployment(deployment, desired_replicas)
+                    
+                    # Optimize placement
+                    self.optimize_gpu_placement()
+                    
+                    # Monitor health
+                    self.monitor_gpu_health()
+                    
+                except Exception as e:
+                    logger.error(f"Error in autoscaling loop: {e}")
+                
+                # Wait before next iteration
+                time.sleep(30)
+    
+    if __name__ == "__main__":
+        autoscaler = GPUAutoscaler()
+        autoscaler.run()
+
+---
+# GPU Monitoring Dashboard ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-dashboard
+  namespace: gpu-ml
+data:
+  dashboard.json: |
+    {
+      "dashboard": {
+        "title": "GPU Cluster Monitoring",
+        "panels": [
+          {
+            "title": "GPU Utilization",
+            "type": "graph",
+            "targets": [
+              {"expr": "DCGM_FI_DEV_GPU_UTIL"}
+            ]
+          },
+          {
+            "title": "GPU Memory Usage",
+            "type": "graph",
+            "targets": [
+              {"expr": "DCGM_FI_DEV_FB_USED / DCGM_FI_DEV_FB_TOTAL * 100"}
+            ]
+          },
+          {
+            "title": "GPU Temperature",
+            "type": "graph",
+            "targets": [
+              {"expr": "DCGM_FI_DEV_GPU_TEMP"}
+            ]
+          },
+          {
+            "title": "GPU Power Consumption",
+            "type": "graph",
+            "targets": [
+              {"expr": "DCGM_FI_DEV_POWER_USAGE"}
+            ]
+          },
+          {
+            "title": "ML Inference Throughput",
+            "type": "graph",
+            "targets": [
+              {"expr": "rate(tensorflow_serving_request_count[5m])"}
+            ]
+          },
+          {
+            "title": "ML Inference Latency P99",
+            "type": "graph",
+            "targets": [
+              {"expr": "histogram_quantile(0.99, rate(tensorflow_serving_request_latency_bucket[5m]))"}
+            ]
+          }
+        ]
+      }
+    }
+
+---
+# Persistent Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gpu-model-store
+  namespace: gpu-ml
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jupyter-storage
+  namespace: gpu-ml
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: longhorn-ssd
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: tensorflow-gpu-serving
+  namespace: gpu-ml
+spec:
+  selector:
+    app: tensorflow-gpu-serving
+  ports:
+  - name: grpc
+    port: 8500
+    targetPort: 8500
+  - name: rest
+    port: 8501
+    targetPort: 8501
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pytorch-gpu-serving
+  namespace: gpu-ml
+spec:
+  selector:
+    app: pytorch-gpu-serving
+  ports:
+  - name: inference
+    port: 8080
+    targetPort: 8080
+  - name: management
+    port: 8081
+    targetPort: 8081
+  - name: metrics
+    port: 8082
+    targetPort: 8082
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyter-gpu
+  namespace: gpu-ml
+spec:
+  selector:
+    app: jupyter-gpu
+  ports:
+  - port: 8888
+    targetPort: 8888
+
+---
+# HPA for GPU Workloads
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tensorflow-gpu-hpa
+  namespace: gpu-ml
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tensorflow-gpu-serving
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+  - type: Resource
+    resource:
+      name: "nvidia.com/gpu"
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Pods
+    pods:
+      metric:
+        name: gpu_memory_utilization
+      target:
+        type: AverageValue
+        averageValue: "70"
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-autoscaler
+  namespace: gpu-ml
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gpu-autoscaler
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-autoscaler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpu-autoscaler
+subjects:
+- kind: ServiceAccount
+  name: gpu-autoscaler
+  namespace: gpu-ml

@@ -1,0 +1,258 @@
+# Comprehensive backup strategy for multi-arch homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backup-system
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-config
+  namespace: backup-system
+data:
+  backup-script.sh: |
+    #!/bin/bash
+    set -e
+    
+    BACKUP_DIR="/backup"
+    DATE=$(date +%Y%m%d-%H%M%S)
+    ARCHITECTURE=$(uname -m)
+    
+    echo "Starting backup on $ARCHITECTURE architecture at $DATE"
+    
+    # Create architecture-specific backup directory
+    mkdir -p "$BACKUP_DIR/$ARCHITECTURE/$DATE"
+    
+    # Backup Kubernetes manifests
+    echo "Backing up Kubernetes resources..."
+    kubectl get all,pv,pvc,secrets,configmaps --all-namespaces -o yaml > "$BACKUP_DIR/$ARCHITECTURE/$DATE/k8s-resources.yaml"
+    
+    # Backup etcd (if running on control plane)
+    if kubectl get nodes --selector=node-role.kubernetes.io/master -o name | grep -q "$(hostname)"; then
+      echo "Backing up etcd..."
+      cp -r /var/lib/rancher/k3s/server/db "$BACKUP_DIR/$ARCHITECTURE/$DATE/etcd-backup" || echo "etcd backup failed"
+    fi
+    
+    # Backup application data based on architecture
+    if [ "$ARCHITECTURE" = "x86_64" ]; then
+      # AMD64 - backup databases
+      echo "Backing up databases (AMD64)..."
+      kubectl exec -n database postgres-0 -- pg_dumpall -U admin > "$BACKUP_DIR/$ARCHITECTURE/$DATE/postgres-backup.sql" || echo "postgres backup failed"
+    else
+      # ARM - backup lightweight services configs
+      echo "Backing up edge services (ARM)..."
+      kubectl get configmaps -n dns-system -o yaml > "$BACKUP_DIR/$ARCHITECTURE/$DATE/dns-config.yaml"
+    fi
+    
+    # Compress backup
+    cd "$BACKUP_DIR/$ARCHITECTURE"
+    tar -czf "$DATE-$ARCHITECTURE-backup.tar.gz" "$DATE/"
+    rm -rf "$DATE/"
+    
+    # Keep only last 30 backups
+    ls -t *-backup.tar.gz | tail -n +31 | xargs rm -f
+    
+    echo "Backup completed: $DATE-$ARCHITECTURE-backup.tar.gz"
+
+  restore-script.sh: |
+    #!/bin/bash
+    set -e
+    
+    BACKUP_FILE="$1"
+    ARCHITECTURE=$(uname -m)
+    
+    if [ -z "$BACKUP_FILE" ]; then
+      echo "Usage: $0 <backup-file.tar.gz>"
+      exit 1
+    fi
+    
+    echo "Restoring from $BACKUP_FILE on $ARCHITECTURE"
+    
+    TEMP_DIR="/tmp/restore-$$"
+    mkdir -p "$TEMP_DIR"
+    
+    # Extract backup
+    tar -xzf "$BACKUP_FILE" -C "$TEMP_DIR"
+    
+    # Find extracted directory
+    BACKUP_DIR=$(find "$TEMP_DIR" -maxdepth 1 -type d -name "*-*-*" | head -1)
+    
+    if [ -z "$BACKUP_DIR" ]; then
+      echo "Invalid backup file"
+      exit 1
+    fi
+    
+    # Restore Kubernetes resources
+    if [ -f "$BACKUP_DIR/k8s-resources.yaml" ]; then
+      echo "Restoring Kubernetes resources..."
+      kubectl apply -f "$BACKUP_DIR/k8s-resources.yaml"
+    fi
+    
+    # Architecture-specific restores
+    if [ "$ARCHITECTURE" = "x86_64" ] && [ -f "$BACKUP_DIR/postgres-backup.sql" ]; then
+      echo "Restoring PostgreSQL database..."
+      kubectl exec -i -n database postgres-0 -- psql -U admin < "$BACKUP_DIR/postgres-backup.sql"
+    fi
+    
+    # Clean up
+    rm -rf "$TEMP_DIR"
+    
+    echo "Restore completed!"
+
+---
+# Backup job for AMD64 nodes (databases)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: amd64-backup
+  namespace: backup-system
+  labels:
+    backup-type: amd64
+spec:
+  schedule: "0 3 * * *"  # Daily at 3 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: amd64
+            node-role/storage: "true"
+          containers:
+          - name: backup
+            image: postgres:15-alpine
+            command: ["/bin/sh"]
+            args:
+            - -c
+            - |
+              apk add --no-cache curl tar gzip
+              curl -LO https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl
+              chmod +x kubectl && mv kubectl /usr/local/bin/
+              /scripts/backup-script.sh
+            volumeMounts:
+            - name: backup-scripts
+              mountPath: /scripts
+            - name: backup-storage
+              mountPath: /backup
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "100m"
+              limits:
+                memory: "512Mi"
+                cpu: "500m"
+          volumes:
+          - name: backup-scripts
+            configMap:
+              name: backup-config
+              defaultMode: 0755
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: backup-pvc
+          restartPolicy: OnFailure
+
+---
+# Backup job for ARM64 nodes (edge services)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: arm64-backup
+  namespace: backup-system
+  labels:
+    backup-type: arm64
+spec:
+  schedule: "15 3 * * *"  # Daily at 3:15 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: arm64
+            node-role/edge: "true"
+          containers:
+          - name: backup
+            image: alpine:latest
+            command: ["/bin/sh"]
+            args:
+            - -c
+            - |
+              apk add --no-cache curl tar gzip
+              curl -LO https://dl.k8s.io/release/v1.28.0/bin/linux/arm64/kubectl
+              chmod +x kubectl && mv kubectl /usr/local/bin/
+              /scripts/backup-script.sh
+            volumeMounts:
+            - name: backup-scripts
+              mountPath: /scripts
+            - name: backup-storage
+              mountPath: /backup
+            resources:
+              requests:
+                memory: "64Mi"
+                cpu: "50m"
+              limits:
+                memory: "128Mi"
+                cpu: "100m"
+          volumes:
+          - name: backup-scripts
+            configMap:
+              name: backup-config
+              defaultMode: 0755
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: backup-pvc
+          restartPolicy: OnFailure
+
+---
+# Shared backup storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-pvc
+  namespace: backup-system
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: longhorn-efficient
+
+---
+# Backup cleanup job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-cleanup
+  namespace: backup-system
+spec:
+  schedule: "0 4 * * 0"  # Weekly on Sunday at 4 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cleanup
+            image: alpine:latest
+            command: ["/bin/sh"]
+            args:
+            - -c
+            - |
+              echo "Cleaning up old backups..."
+              find /backup -name "*-backup.tar.gz" -type f -mtime +30 -delete
+              echo "Backup cleanup completed"
+            volumeMounts:
+            - name: backup-storage
+              mountPath: /backup
+            resources:
+              requests:
+                memory: "32Mi"
+                cpu: "10m"
+              limits:
+                memory: "64Mi"
+                cpu: "50m"
+          volumes:
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: backup-pvc
+          restartPolicy: OnFailure

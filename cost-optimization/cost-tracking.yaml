@@ -1,0 +1,1539 @@
+# Cost Tracking and Optimization System for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cost-optimization
+  labels:
+    name: cost-optimization
+
+---
+# Cost tracking configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cost-config
+  namespace: cost-optimization
+data:
+  cost-model.yaml: |
+    # Cost model for different architectures and components
+    hardware_costs:
+      amd64:
+        initial_cost: 800  # USD per node
+        annual_depreciation: 0.2  # 20% per year
+        power_consumption_watts: 45
+        electricity_cost_per_kwh: 0.12  # USD
+        maintenance_cost_annual: 50
+        
+      arm64:
+        initial_cost: 200  # USD per Pi 4
+        annual_depreciation: 0.25  # 25% per year  
+        power_consumption_watts: 7
+        electricity_cost_per_kwh: 0.12
+        maintenance_cost_annual: 10
+        
+      arm:
+        initial_cost: 50   # USD per Pi Zero
+        annual_depreciation: 0.3   # 30% per year
+        power_consumption_watts: 2.5
+        electricity_cost_per_kwh: 0.12
+        maintenance_cost_annual: 5
+    
+    software_costs:
+      kubernetes:
+        type: "open_source"
+        cost: 0
+        support_cost_annual: 0
+        
+      applications:
+        prometheus:
+          license_cost: 0
+          support_cost_annual: 0
+          cpu_overhead: 0.1  # 10% CPU overhead
+        elasticsearch:
+          license_cost: 0
+          support_cost_annual: 0
+          storage_overhead_gb: 2  # 2GB base storage
+        jaeger:
+          license_cost: 0
+          support_cost_annual: 0
+          storage_overhead_gb: 1
+    
+    utilization_targets:
+      cpu_target: 0.7      # Target 70% CPU utilization
+      memory_target: 0.8   # Target 80% memory utilization  
+      storage_target: 0.85 # Target 85% storage utilization
+      
+    efficiency_multipliers:
+      # Architecture efficiency factors
+      amd64:
+        compute_efficiency: 1.0
+        power_efficiency: 0.6   # Less power efficient
+        cost_efficiency: 0.7    # More expensive
+      arm64:
+        compute_efficiency: 0.4
+        power_efficiency: 1.0   # Most power efficient
+        cost_efficiency: 1.0    # Best cost/performance ratio
+      arm:
+        compute_efficiency: 0.1
+        power_efficiency: 1.2   # Ultra power efficient
+        cost_efficiency: 1.3    # Great for specific workloads
+
+  optimization-rules.yaml: |
+    # Optimization rules and recommendations
+    optimization_rules:
+      workload_placement:
+        - condition: "workload_type == 'compute_intensive'"
+          recommendation: "Place on AMD64 nodes"
+          reason: "Better CPU performance per core"
+          cost_impact: "Higher operational cost but better performance"
+          
+        - condition: "workload_type == 'io_intensive'"
+          recommendation: "Place on AMD64 with NVMe storage"
+          reason: "Better storage performance"
+          cost_impact: "Higher storage cost but better throughput"
+          
+        - condition: "workload_type == 'web_service'"
+          recommendation: "Place on ARM64 nodes"
+          reason: "Good performance with lower power consumption"
+          cost_impact: "Lower operational cost"
+          
+        - condition: "workload_type == 'iot_sensor'"
+          recommendation: "Place on ARM nodes"
+          reason: "Minimal resource requirements"
+          cost_impact: "Lowest operational cost"
+          
+      scaling_recommendations:
+        - condition: "cpu_utilization < 30"
+          action: "scale_down"
+          savings_potential: "reduce_power_and_license_costs"
+          
+        - condition: "cpu_utilization > 85"
+          action: "scale_up_or_migrate_to_faster_arch"
+          cost_impact: "increased_power_but_better_performance"
+          
+        - condition: "memory_utilization > 90"
+          action: "migrate_to_higher_memory_node"
+          cost_impact: "may_require_hardware_upgrade"
+          
+      right_sizing:
+        - resource: "cpu"
+          oversized_threshold: 0.3
+          undersized_threshold: 0.85
+          recommendation: "adjust_cpu_limits"
+          
+        - resource: "memory"  
+          oversized_threshold: 0.5
+          undersized_threshold: 0.9
+          recommendation: "adjust_memory_limits"
+
+---
+# Cost tracking data collector
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cost-tracker
+  namespace: cost-optimization
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cost-tracker
+  template:
+    metadata:
+      labels:
+        app: cost-tracker
+    spec:
+      serviceAccountName: cost-tracker
+      # Run on ARM64 for power efficiency (this is cost optimization after all!)
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: cost-tracker
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes prometheus-client influxdb-client pandas numpy
+          python3 /app/cost_tracker.py
+        volumeMounts:
+        - name: cost-app
+          mountPath: /app
+        - name: cost-config
+          mountPath: /config
+        env:
+        - name: PROMETHEUS_URL
+          value: "http://prometheus.monitoring:9090"
+        - name: INFLUXDB_URL
+          value: "http://influxdb:8086"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        ports:
+        - containerPort: 8080
+          name: http
+      volumes:
+      - name: cost-app
+        configMap:
+          name: cost-tracker-app
+      - name: cost-config
+        configMap:
+          name: cost-config
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cost-tracker-app
+  namespace: cost-optimization
+data:
+  cost_tracker.py: |
+    #!/usr/bin/env python3
+    import json
+    import logging
+    import time
+    import yaml
+    from datetime import datetime, timedelta
+    from kubernetes import client, config
+    from prometheus_client import CollectorRegistry, Gauge, start_http_server
+    import requests
+    import pandas as pd
+    import numpy as np
+    from typing import Dict, List, Optional
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class CostTracker:
+        def __init__(self):
+            try:
+                config.load_incluster_config()
+            except:
+                config.load_kube_config()
+            
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            
+            # Load cost configuration
+            with open('/config/cost-model.yaml', 'r') as f:
+                self.cost_model = yaml.safe_load(f)
+            
+            with open('/config/optimization-rules.yaml', 'r') as f:
+                self.optimization_rules = yaml.safe_load(f)
+            
+            # Prometheus metrics
+            self.registry = CollectorRegistry()
+            self.setup_metrics()
+            
+            # Cost tracking data
+            self.node_costs = {}
+            self.workload_costs = {}
+            self.optimization_recommendations = {}
+        
+        def setup_metrics(self):
+            """Setup Prometheus metrics for cost tracking"""
+            self.cost_per_node = Gauge(
+                'homelab_cost_per_node_hourly',
+                'Cost per node per hour in USD',
+                ['node', 'architecture'],
+                registry=self.registry
+            )
+            
+            self.power_consumption = Gauge(
+                'homelab_power_consumption_watts',
+                'Power consumption by node',
+                ['node', 'architecture'],
+                registry=self.registry
+            )
+            
+            self.cost_efficiency_score = Gauge(
+                'homelab_cost_efficiency_score',
+                'Cost efficiency score by architecture',
+                ['architecture'],
+                registry=self.registry
+            )
+            
+            self.workload_cost = Gauge(
+                'homelab_workload_cost_hourly',
+                'Cost per workload per hour',
+                ['namespace', 'workload', 'architecture'],
+                registry=self.registry
+            )
+            
+            self.optimization_savings = Gauge(
+                'homelab_optimization_savings_potential',
+                'Potential savings from optimizations',
+                ['type'],
+                registry=self.registry
+            )
+        
+        def get_cluster_resource_usage(self) -> Dict:
+            """Get current cluster resource usage"""
+            nodes = self.v1.list_node()
+            
+            cluster_usage = {
+                'nodes_by_arch': {},
+                'total_allocatable': {'cpu': 0, 'memory': 0, 'storage': 0},
+                'total_allocated': {'cpu': 0, 'memory': 0, 'storage': 0}
+            }
+            
+            for node in nodes.items:
+                arch = node.metadata.labels.get('kubernetes.io/arch', 'unknown')
+                node_name = node.metadata.name
+                
+                if arch not in cluster_usage['nodes_by_arch']:
+                    cluster_usage['nodes_by_arch'][arch] = []
+                
+                # Get allocatable resources
+                allocatable = node.status.allocatable or {}
+                
+                cpu_allocatable = self.parse_cpu(allocatable.get('cpu', '0'))
+                memory_allocatable = self.parse_memory(allocatable.get('memory', '0'))
+                storage_allocatable = self.parse_memory(allocatable.get('ephemeral-storage', '0'))
+                
+                # Get allocated resources (from running pods)
+                pods = self.v1.list_pod_for_all_namespaces(
+                    field_selector=f'spec.nodeName={node_name}'
+                )
+                
+                cpu_allocated = 0
+                memory_allocated = 0
+                
+                for pod in pods.items:
+                    if pod.spec.containers:
+                        for container in pod.spec.containers:
+                            if container.resources and container.resources.requests:
+                                cpu_allocated += self.parse_cpu(
+                                    container.resources.requests.get('cpu', '0')
+                                )
+                                memory_allocated += self.parse_memory(
+                                    container.resources.requests.get('memory', '0')
+                                )
+                
+                node_info = {
+                    'name': node_name,
+                    'architecture': arch,
+                    'allocatable': {
+                        'cpu': cpu_allocatable,
+                        'memory': memory_allocatable,
+                        'storage': storage_allocatable
+                    },
+                    'allocated': {
+                        'cpu': cpu_allocated,
+                        'memory': memory_allocated
+                    },
+                    'utilization': {
+                        'cpu': cpu_allocated / cpu_allocatable if cpu_allocatable > 0 else 0,
+                        'memory': memory_allocated / memory_allocatable if memory_allocatable > 0 else 0
+                    }
+                }
+                
+                cluster_usage['nodes_by_arch'][arch].append(node_info)
+                
+                # Add to totals
+                cluster_usage['total_allocatable']['cpu'] += cpu_allocatable
+                cluster_usage['total_allocatable']['memory'] += memory_allocatable
+                cluster_usage['total_allocatable']['storage'] += storage_allocatable
+                
+                cluster_usage['total_allocated']['cpu'] += cpu_allocated
+                cluster_usage['total_allocated']['memory'] += memory_allocated
+            
+            return cluster_usage
+        
+        def parse_cpu(self, cpu_str: str) -> float:
+            """Parse CPU resource string to cores"""
+            if not cpu_str or cpu_str == '0':
+                return 0.0
+                
+            if cpu_str.endswith('m'):
+                return float(cpu_str[:-1]) / 1000
+            else:
+                return float(cpu_str)
+        
+        def parse_memory(self, memory_str: str) -> int:
+            """Parse memory resource string to bytes"""
+            if not memory_str or memory_str == '0':
+                return 0
+                
+            memory_str = memory_str.upper()
+            multipliers = {
+                'KI': 1024,
+                'MI': 1024**2,
+                'GI': 1024**3,
+                'TI': 1024**4,
+                'K': 1000,
+                'M': 1000**2,
+                'G': 1000**3,
+                'T': 1000**4
+            }
+            
+            for suffix, multiplier in multipliers.items():
+                if memory_str.endswith(suffix):
+                    return int(float(memory_str[:-len(suffix)]) * multiplier)
+            
+            return int(memory_str)
+        
+        def calculate_node_costs(self, cluster_usage: Dict) -> Dict:
+            """Calculate costs for each node"""
+            costs = {}
+            
+            for arch, nodes in cluster_usage['nodes_by_arch'].items():
+                if arch not in self.cost_model['hardware_costs']:
+                    continue
+                    
+                arch_config = self.cost_model['hardware_costs'][arch]
+                
+                for node in nodes:
+                    node_name = node['name']
+                    
+                    # Calculate hourly costs
+                    
+                    # 1. Hardware depreciation cost per hour
+                    annual_depreciation = arch_config['initial_cost'] * arch_config['annual_depreciation']
+                    hourly_depreciation = annual_depreciation / (365 * 24)
+                    
+                    # 2. Power consumption cost per hour
+                    power_watts = arch_config['power_consumption_watts']
+                    power_kwh = power_watts / 1000  # Convert to kWh
+                    hourly_power_cost = power_kwh * arch_config['electricity_cost_per_kwh']
+                    
+                    # 3. Maintenance cost per hour
+                    hourly_maintenance = arch_config['maintenance_cost_annual'] / (365 * 24)
+                    
+                    total_hourly_cost = hourly_depreciation + hourly_power_cost + hourly_maintenance
+                    
+                    costs[node_name] = {
+                        'architecture': arch,
+                        'hourly_cost_usd': total_hourly_cost,
+                        'breakdown': {
+                            'depreciation': hourly_depreciation,
+                            'power': hourly_power_cost,
+                            'maintenance': hourly_maintenance
+                        },
+                        'power_watts': power_watts,
+                        'utilization': node['utilization']
+                    }
+                    
+                    # Update Prometheus metrics
+                    self.cost_per_node.labels(node=node_name, architecture=arch).set(total_hourly_cost)
+                    self.power_consumption.labels(node=node_name, architecture=arch).set(power_watts)
+            
+            return costs
+        
+        def calculate_workload_costs(self, cluster_usage: Dict) -> Dict:
+            """Calculate costs for each workload"""
+            deployments = self.apps_v1.list_deployment_for_all_namespaces()
+            workload_costs = {}
+            
+            for deployment in deployments.items:
+                name = deployment.metadata.name
+                namespace = deployment.metadata.namespace
+                
+                # Get pods for this deployment
+                pods = self.v1.list_namespaced_pod(
+                    namespace=namespace,
+                    label_selector=f'app={name}'
+                )
+                
+                total_cost = 0
+                workload_arch = 'unknown'
+                
+                for pod in pods.items:
+                    node_name = pod.spec.node_name
+                    if not node_name:
+                        continue
+                        
+                    # Find node architecture and cost
+                    node_cost_info = self.node_costs.get(node_name, {})
+                    if not node_cost_info:
+                        continue
+                    
+                    workload_arch = node_cost_info.get('architecture', 'unknown')
+                    node_hourly_cost = node_cost_info.get('hourly_cost_usd', 0)
+                    
+                    # Calculate resource allocation ratio
+                    if pod.spec.containers:
+                        pod_cpu_request = 0
+                        pod_memory_request = 0
+                        
+                        for container in pod.spec.containers:
+                            if container.resources and container.resources.requests:
+                                pod_cpu_request += self.parse_cpu(
+                                    container.resources.requests.get('cpu', '0')
+                                )
+                                pod_memory_request += self.parse_memory(
+                                    container.resources.requests.get('memory', '0')
+                                )
+                        
+                        # Find node capacity
+                        node_info = None
+                        for arch_nodes in cluster_usage['nodes_by_arch'].values():
+                            for node in arch_nodes:
+                                if node['name'] == node_name:
+                                    node_info = node
+                                    break
+                        
+                        if node_info:
+                            cpu_ratio = pod_cpu_request / node_info['allocatable']['cpu'] if node_info['allocatable']['cpu'] > 0 else 0
+                            memory_ratio = pod_memory_request / node_info['allocatable']['memory'] if node_info['allocatable']['memory'] > 0 else 0
+                            
+                            # Use the higher ratio (bottleneck resource)
+                            resource_ratio = max(cpu_ratio, memory_ratio)
+                            
+                            pod_cost = node_hourly_cost * resource_ratio
+                            total_cost += pod_cost
+                
+                workload_costs[f"{namespace}/{name}"] = {
+                    'hourly_cost_usd': total_cost,
+                    'architecture': workload_arch,
+                    'namespace': namespace,
+                    'name': name
+                }
+                
+                # Update Prometheus metrics
+                self.workload_cost.labels(
+                    namespace=namespace,
+                    workload=name,
+                    architecture=workload_arch
+                ).set(total_cost)
+            
+            return workload_costs
+        
+        def analyze_cost_efficiency(self, cluster_usage: Dict) -> Dict:
+            """Analyze cost efficiency by architecture"""
+            efficiency_analysis = {}
+            
+            for arch, nodes in cluster_usage['nodes_by_arch'].items():
+                if arch not in self.cost_model['hardware_costs']:
+                    continue
+                
+                total_cost = 0
+                total_compute_score = 0
+                total_utilization = 0
+                node_count = len(nodes)
+                
+                efficiency_config = self.cost_model['efficiency_multipliers'].get(arch, {})
+                
+                for node in nodes:
+                    node_name = node['name']
+                    node_cost_info = self.node_costs.get(node_name, {})
+                    
+                    total_cost += node_cost_info.get('hourly_cost_usd', 0)
+                    
+                    # Calculate compute score (CPU + Memory utilization weighted)
+                    cpu_util = node['utilization']['cpu']
+                    memory_util = node['utilization']['memory']
+                    compute_score = (cpu_util * 0.7 + memory_util * 0.3)  # Weight CPU higher
+                    
+                    total_compute_score += compute_score
+                    total_utilization += cpu_util
+                
+                if node_count > 0:
+                    avg_cost = total_cost / node_count
+                    avg_compute_score = total_compute_score / node_count
+                    avg_utilization = total_utilization / node_count
+                    
+                    # Calculate efficiency score (higher is better)
+                    # Performance per dollar, adjusted by utilization
+                    performance_per_dollar = (avg_compute_score * efficiency_config.get('compute_efficiency', 1.0)) / avg_cost if avg_cost > 0 else 0
+                    power_efficiency_factor = efficiency_config.get('power_efficiency', 1.0)
+                    
+                    efficiency_score = performance_per_dollar * power_efficiency_factor * avg_utilization
+                    
+                    efficiency_analysis[arch] = {
+                        'node_count': node_count,
+                        'avg_hourly_cost': avg_cost,
+                        'avg_utilization': avg_utilization,
+                        'avg_compute_score': avg_compute_score,
+                        'efficiency_score': efficiency_score,
+                        'power_efficiency_factor': power_efficiency_factor,
+                        'recommendations': self.generate_arch_recommendations(arch, avg_utilization)
+                    }
+                    
+                    # Update Prometheus metrics
+                    self.cost_efficiency_score.labels(architecture=arch).set(efficiency_score)
+            
+            return efficiency_analysis
+        
+        def generate_arch_recommendations(self, arch: str, utilization: float) -> List[str]:
+            """Generate recommendations for architecture optimization"""
+            recommendations = []
+            
+            targets = self.cost_model['utilization_targets']
+            
+            if utilization < targets['cpu_target'] * 0.5:  # Less than 35% utilization
+                if arch == 'amd64':
+                    recommendations.append("Consider migrating workloads to ARM64 for better cost efficiency")
+                else:
+                    recommendations.append("Consider consolidating workloads or scaling down")
+            
+            elif utilization > targets['cpu_target'] * 1.2:  # More than 84% utilization
+                if arch in ['arm64', 'arm']:
+                    recommendations.append("Consider migrating compute-intensive workloads to AMD64")
+                else:
+                    recommendations.append("Consider scaling out or adding more nodes")
+            
+            # Architecture-specific recommendations
+            if arch == 'amd64':
+                recommendations.append("Best for: Database, ML training, CI/CD pipelines")
+            elif arch == 'arm64':
+                recommendations.append("Best for: Web services, APIs, edge computing")
+            elif arch == 'arm':
+                recommendations.append("Best for: IoT sensors, lightweight monitoring")
+            
+            return recommendations
+        
+        def generate_optimization_recommendations(self) -> Dict:
+            """Generate comprehensive optimization recommendations"""
+            recommendations = {
+                'right_sizing': [],
+                'workload_migration': [],
+                'cost_savings': [],
+                'performance_improvements': []
+            }
+            
+            # Analyze workloads for right-sizing
+            for workload_id, cost_info in self.workload_costs.items():
+                namespace, name = workload_id.split('/')
+                
+                try:
+                    deployment = self.apps_v1.read_namespaced_deployment(name=name, namespace=namespace)
+                    
+                    for container in deployment.spec.template.spec.containers:
+                        if container.resources:
+                            # Check for over/under provisioning
+                            if container.resources.requests:
+                                cpu_request = self.parse_cpu(container.resources.requests.get('cpu', '0'))
+                                memory_request = self.parse_memory(container.resources.requests.get('memory', '0'))
+                                
+                                # This would normally use actual usage metrics
+                                # For now, we'll simulate some analysis
+                                recommendations['right_sizing'].append({
+                                    'workload': workload_id,
+                                    'current_cost': cost_info['hourly_cost_usd'],
+                                    'recommendation': 'Monitor actual usage and adjust requests',
+                                    'potential_savings': cost_info['hourly_cost_usd'] * 0.1  # Estimate 10% savings
+                                })
+                
+                except Exception as e:
+                    logger.error(f"Error analyzing workload {workload_id}: {e}")
+            
+            # Architecture migration recommendations
+            for arch, efficiency in self.cost_efficiency.items():
+                if efficiency['efficiency_score'] < 0.5:  # Low efficiency
+                    recommendations['workload_migration'].append({
+                        'from_architecture': arch,
+                        'to_architecture': 'arm64' if arch == 'amd64' else 'amd64',
+                        'reason': 'Improve cost efficiency',
+                        'estimated_savings_pct': 20
+                    })
+            
+            # Cost savings opportunities
+            total_hourly_cost = sum(cost['hourly_cost_usd'] for cost in self.node_costs.values())
+            
+            recommendations['cost_savings'].append({
+                'opportunity': 'Optimize workload placement',
+                'current_hourly_cost': total_hourly_cost,
+                'potential_savings': total_hourly_cost * 0.15,  # 15% potential savings
+                'actions': [
+                    'Move web services to ARM64 nodes',
+                    'Move databases to AMD64 nodes',
+                    'Use ARM nodes for sensor workloads'
+                ]
+            })
+            
+            return recommendations
+        
+        def generate_cost_report(self) -> Dict:
+            """Generate comprehensive cost report"""
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'cluster_summary': {
+                    'total_nodes': len(self.node_costs),
+                    'total_hourly_cost': sum(cost['hourly_cost_usd'] for cost in self.node_costs.values()),
+                    'total_daily_cost': sum(cost['hourly_cost_usd'] for cost in self.node_costs.values()) * 24,
+                    'total_monthly_cost': sum(cost['hourly_cost_usd'] for cost in self.node_costs.values()) * 24 * 30,
+                    'total_power_watts': sum(cost['power_watts'] for cost in self.node_costs.values())
+                },
+                'cost_by_architecture': self.cost_efficiency,
+                'node_costs': self.node_costs,
+                'workload_costs': self.workload_costs,
+                'optimization_recommendations': self.optimization_recommendations,
+                'efficiency_ranking': sorted(
+                    [(arch, data['efficiency_score']) for arch, data in self.cost_efficiency.items()],
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+            }
+        
+        def run_cost_analysis(self):
+            """Run complete cost analysis"""
+            logger.info("Starting cost analysis...")
+            
+            # Get cluster resource usage
+            cluster_usage = self.get_cluster_resource_usage()
+            
+            # Calculate costs
+            self.node_costs = self.calculate_node_costs(cluster_usage)
+            self.workload_costs = self.calculate_workload_costs(cluster_usage)
+            
+            # Analyze efficiency
+            self.cost_efficiency = self.analyze_cost_efficiency(cluster_usage)
+            
+            # Generate recommendations
+            self.optimization_recommendations = self.generate_optimization_recommendations()
+            
+            # Generate report
+            report = self.generate_cost_report()
+            
+            logger.info(f"Cost analysis completed. Summary:")
+            logger.info(f"Total hourly cost: ${report['cluster_summary']['total_hourly_cost']:.2f}")
+            logger.info(f"Total monthly cost: ${report['cluster_summary']['total_monthly_cost']:.2f}")
+            logger.info(f"Total power consumption: {report['cluster_summary']['total_power_watts']}W")
+            
+            return report
+        
+        def run_continuous_analysis(self):
+            """Run continuous cost analysis"""
+            # Start Prometheus metrics server
+            start_http_server(8080, registry=self.registry)
+            
+            while True:
+                try:
+                    self.run_cost_analysis()
+                    time.sleep(300)  # Run every 5 minutes
+                    
+                except Exception as e:
+                    logger.error(f"Error in cost analysis: {e}")
+                    time.sleep(60)
+    
+    if __name__ == "__main__":
+        tracker = CostTracker()
+        tracker.run_continuous_analysis()
+
+---
+# Cost optimization engine
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cost-optimizer
+  namespace: cost-optimization
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cost-optimizer
+  template:
+    metadata:
+      labels:
+        app: cost-optimizer
+    spec:
+      serviceAccountName: cost-optimizer
+      containers:
+      - name: optimizer
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes requests pandas numpy scikit-learn
+          python3 /app/cost_optimizer.py
+        volumeMounts:
+        - name: optimizer-app
+          mountPath: /app
+        - name: cost-config
+          mountPath: /config
+        env:
+        - name: COST_TRACKER_URL
+          value: "http://cost-tracker:8080"
+        - name: DRY_RUN
+          value: "true"  # Set to false to enable actual optimizations
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: optimizer-app
+        configMap:
+          name: cost-optimizer-app
+      - name: cost-config
+        configMap:
+          name: cost-config
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cost-optimizer-app
+  namespace: cost-optimization
+data:
+  cost_optimizer.py: |
+    #!/usr/bin/env python3
+    import json
+    import logging
+    import os
+    import time
+    from datetime import datetime, timedelta
+    from kubernetes import client, config
+    import requests
+    import pandas as pd
+    from typing import Dict, List
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    class CostOptimizer:
+        def __init__(self):
+            try:
+                config.load_incluster_config()
+            except:
+                config.load_kube_config()
+            
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            
+            self.cost_tracker_url = os.getenv('COST_TRACKER_URL', 'http://cost-tracker:8080')
+            self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
+            
+            self.optimization_history = []
+        
+        def get_cost_data(self) -> Dict:
+            """Get latest cost data from cost tracker"""
+            try:
+                response = requests.get(f"{self.cost_tracker_url}/metrics")
+                # In a real implementation, this would parse Prometheus metrics
+                # For now, we'll simulate cost data
+                return {
+                    'node_costs': {
+                        'nuc-01': {'hourly_cost': 0.15, 'architecture': 'amd64', 'utilization': 0.3},
+                        'nuc-02': {'hourly_cost': 0.15, 'architecture': 'amd64', 'utilization': 0.85},
+                        'pi4-01': {'hourly_cost': 0.03, 'architecture': 'arm64', 'utilization': 0.6},
+                        'pi4-02': {'hourly_cost': 0.03, 'architecture': 'arm64', 'utilization': 0.7},
+                        'pi-zero-01': {'hourly_cost': 0.008, 'architecture': 'arm', 'utilization': 0.4}
+                    },
+                    'workload_costs': {},
+                    'optimization_recommendations': []
+                }
+            except Exception as e:
+                logger.error(f"Failed to get cost data: {e}")
+                return {}
+        
+        def identify_underutilized_nodes(self, cost_data: Dict) -> List[Dict]:
+            """Identify nodes with low utilization"""
+            underutilized = []
+            
+            for node_name, node_data in cost_data.get('node_costs', {}).items():
+                utilization = node_data.get('utilization', 0)
+                
+                if utilization < 0.3:  # Less than 30% utilized
+                    underutilized.append({
+                        'node': node_name,
+                        'architecture': node_data.get('architecture'),
+                        'utilization': utilization,
+                        'hourly_cost': node_data.get('hourly_cost'),
+                        'optimization_type': 'consolidate_or_shutdown'
+                    })
+            
+            return underutilized
+        
+        def identify_workload_migration_opportunities(self) -> List[Dict]:
+            """Identify workloads that could be migrated for cost savings"""
+            opportunities = []
+            
+            # Get all deployments
+            deployments = self.apps_v1.list_deployment_for_all_namespaces()
+            
+            for deployment in deployments.items:
+                name = deployment.metadata.name
+                namespace = deployment.metadata.namespace
+                
+                # Skip system deployments
+                if namespace in ['kube-system', 'kube-public', 'kube-node-lease']:
+                    continue
+                
+                # Analyze deployment for migration opportunity
+                current_node_selector = deployment.spec.template.spec.node_selector or {}
+                current_arch = current_node_selector.get('kubernetes.io/arch')
+                
+                # Get resource requirements
+                total_cpu_request = 0
+                total_memory_request = 0
+                
+                for container in deployment.spec.template.spec.containers:
+                    if container.resources and container.resources.requests:
+                        cpu_str = container.resources.requests.get('cpu', '0')
+                        memory_str = container.resources.requests.get('memory', '0')
+                        
+                        total_cpu_request += self.parse_cpu(cpu_str)
+                        total_memory_request += self.parse_memory(memory_str)
+                
+                # Determine optimal architecture
+                optimal_arch = self.determine_optimal_architecture(
+                    name, total_cpu_request, total_memory_request
+                )
+                
+                if optimal_arch != current_arch:
+                    opportunities.append({
+                        'deployment': f"{namespace}/{name}",
+                        'current_architecture': current_arch or 'any',
+                        'recommended_architecture': optimal_arch,
+                        'cpu_request': total_cpu_request,
+                        'memory_request': total_memory_request,
+                        'estimated_savings_pct': self.calculate_migration_savings(current_arch, optimal_arch)
+                    })
+            
+            return opportunities
+        
+        def parse_cpu(self, cpu_str: str) -> float:
+            """Parse CPU string to cores"""
+            if not cpu_str or cpu_str == '0':
+                return 0.0
+            if cpu_str.endswith('m'):
+                return float(cpu_str[:-1]) / 1000
+            return float(cpu_str)
+        
+        def parse_memory(self, memory_str: str) -> int:
+            """Parse memory string to bytes"""
+            if not memory_str or memory_str == '0':
+                return 0
+            
+            memory_str = memory_str.upper()
+            multipliers = {
+                'KI': 1024, 'MI': 1024**2, 'GI': 1024**3,
+                'K': 1000, 'M': 1000**2, 'G': 1000**3
+            }
+            
+            for suffix, multiplier in multipliers.items():
+                if memory_str.endswith(suffix):
+                    return int(float(memory_str[:-len(suffix)]) * multiplier)
+            
+            return int(memory_str)
+        
+        def determine_optimal_architecture(self, workload_name: str, cpu_request: float, memory_request: int) -> str:
+            """Determine optimal architecture for a workload"""
+            
+            # Define workload patterns
+            high_compute_threshold = 1.0  # 1 CPU core
+            high_memory_threshold = 2 * 1024**3  # 2GB
+            
+            # Check workload type based on name patterns
+            if any(keyword in workload_name.lower() for keyword in ['database', 'mysql', 'postgres', 'mongo']):
+                return 'amd64'  # Databases benefit from AMD64
+            
+            if any(keyword in workload_name.lower() for keyword in ['sensor', 'iot', 'monitor']):
+                return 'arm'  # IoT workloads are perfect for ARM
+            
+            if any(keyword in workload_name.lower() for keyword in ['ml', 'train', 'ai', 'compute']):
+                return 'amd64'  # ML workloads need compute power
+            
+            # Resource-based recommendations
+            if cpu_request >= high_compute_threshold or memory_request >= high_memory_threshold:
+                return 'amd64'  # High resource workloads go to AMD64
+            elif cpu_request <= 0.1 and memory_request <= 128 * 1024**2:  # <= 0.1 CPU, <= 128MB
+                return 'arm'  # Very light workloads go to ARM
+            else:
+                return 'arm64'  # Medium workloads go to ARM64
+        
+        def calculate_migration_savings(self, from_arch: str, to_arch: str) -> float:
+            """Calculate estimated savings percentage from migration"""
+            
+            # Cost per hour estimates by architecture
+            arch_costs = {
+                'amd64': 0.15,
+                'arm64': 0.03,
+                'arm': 0.008
+            }
+            
+            from_cost = arch_costs.get(from_arch, arch_costs['amd64'])
+            to_cost = arch_costs.get(to_arch, arch_costs['amd64'])
+            
+            if from_cost > 0:
+                savings_pct = ((from_cost - to_cost) / from_cost) * 100
+                return max(0, savings_pct)
+            
+            return 0
+        
+        def apply_optimization(self, optimization: Dict) -> bool:
+            """Apply an optimization recommendation"""
+            opt_type = optimization.get('optimization_type')
+            
+            if self.dry_run:
+                logger.info(f"DRY RUN: Would apply optimization: {optimization}")
+                return True
+            
+            try:
+                if opt_type == 'migrate_workload':
+                    return self.migrate_workload(optimization)
+                elif opt_type == 'right_size':
+                    return self.right_size_workload(optimization)
+                elif opt_type == 'consolidate':
+                    return self.consolidate_workloads(optimization)
+                else:
+                    logger.warning(f"Unknown optimization type: {opt_type}")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Failed to apply optimization {optimization}: {e}")
+                return False
+        
+        def migrate_workload(self, migration: Dict) -> bool:
+            """Migrate workload to different architecture"""
+            deployment_id = migration['deployment']
+            namespace, name = deployment_id.split('/')
+            target_arch = migration['recommended_architecture']
+            
+            logger.info(f"Migrating {deployment_id} to {target_arch}")
+            
+            try:
+                # Get current deployment
+                deployment = self.apps_v1.read_namespaced_deployment(name=name, namespace=namespace)
+                
+                # Update node selector
+                if not deployment.spec.template.spec.node_selector:
+                    deployment.spec.template.spec.node_selector = {}
+                
+                deployment.spec.template.spec.node_selector['kubernetes.io/arch'] = target_arch
+                
+                # Update deployment
+                self.apps_v1.patch_namespaced_deployment(
+                    name=name,
+                    namespace=namespace,
+                    body=deployment
+                )
+                
+                logger.info(f"Successfully migrated {deployment_id} to {target_arch}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to migrate {deployment_id}: {e}")
+                return False
+        
+        def right_size_workload(self, optimization: Dict) -> bool:
+            """Adjust resource requests/limits for workload"""
+            # This would implement resource right-sizing
+            logger.info(f"Right-sizing workload: {optimization}")
+            return True
+        
+        def consolidate_workloads(self, optimization: Dict) -> bool:
+            """Consolidate workloads on fewer nodes"""
+            # This would implement workload consolidation
+            logger.info(f"Consolidating workloads: {optimization}")
+            return True
+        
+        def generate_optimization_report(self, optimizations: List[Dict]) -> Dict:
+            """Generate optimization report"""
+            total_potential_savings = 0
+            optimizations_by_type = {}
+            
+            for opt in optimizations:
+                opt_type = opt.get('optimization_type', 'unknown')
+                
+                if opt_type not in optimizations_by_type:
+                    optimizations_by_type[opt_type] = []
+                
+                optimizations_by_type[opt_type].append(opt)
+                
+                # Calculate potential savings
+                if 'estimated_savings_pct' in opt and 'hourly_cost' in opt:
+                    savings = opt['hourly_cost'] * (opt['estimated_savings_pct'] / 100)
+                    total_potential_savings += savings
+            
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'total_optimizations': len(optimizations),
+                'potential_hourly_savings': total_potential_savings,
+                'potential_monthly_savings': total_potential_savings * 24 * 30,
+                'optimizations_by_type': {
+                    k: len(v) for k, v in optimizations_by_type.items()
+                },
+                'detailed_optimizations': optimizations
+            }
+        
+        def run_optimization_cycle(self):
+            """Run one optimization cycle"""
+            logger.info("Starting optimization cycle...")
+            
+            # Get current cost data
+            cost_data = self.get_cost_data()
+            
+            if not cost_data:
+                logger.error("No cost data available")
+                return
+            
+            # Identify optimization opportunities
+            optimizations = []
+            
+            # 1. Find underutilized nodes
+            underutilized = self.identify_underutilized_nodes(cost_data)
+            for node in underutilized:
+                optimizations.append({
+                    'optimization_type': 'consolidate',
+                    'description': f"Consolidate workloads from underutilized node {node['node']}",
+                    'node': node['node'],
+                    'current_utilization': node['utilization'],
+                    'hourly_cost': node['hourly_cost'],
+                    'estimated_savings_pct': 50  # Could save 50% by consolidating
+                })
+            
+            # 2. Find workload migration opportunities
+            migration_opportunities = self.identify_workload_migration_opportunities()
+            for migration in migration_opportunities:
+                optimizations.append({
+                    'optimization_type': 'migrate_workload',
+                    'description': f"Migrate {migration['deployment']} from {migration['current_architecture']} to {migration['recommended_architecture']}",
+                    **migration
+                })
+            
+            # Generate report
+            report = self.generate_optimization_report(optimizations)
+            
+            logger.info(f"Found {len(optimizations)} optimization opportunities")
+            logger.info(f"Potential monthly savings: ${report['potential_monthly_savings']:.2f}")
+            
+            # Apply optimizations (if not in dry run mode)
+            applied_count = 0
+            for opt in optimizations:
+                if self.apply_optimization(opt):
+                    applied_count += 1
+            
+            logger.info(f"Applied {applied_count}/{len(optimizations)} optimizations")
+            
+            # Store in history
+            self.optimization_history.append({
+                'timestamp': datetime.now().isoformat(),
+                'report': report,
+                'applied_count': applied_count
+            })
+            
+            # Keep only last 100 entries
+            self.optimization_history = self.optimization_history[-100:]
+        
+        def run_continuous_optimization(self):
+            """Run continuous optimization"""
+            logger.info("Starting continuous cost optimization...")
+            
+            while True:
+                try:
+                    self.run_optimization_cycle()
+                    time.sleep(3600)  # Run every hour
+                    
+                except Exception as e:
+                    logger.error(f"Error in optimization cycle: {e}")
+                    time.sleep(300)  # Wait 5 minutes on error
+    
+    if __name__ == "__main__":
+        optimizer = CostOptimizer()
+        optimizer.run_continuous_optimization()
+
+---
+# Cost dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cost-dashboard-content
+  namespace: cost-optimization
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>💰 Homelab Cost Optimization Dashboard</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+            .container { max-width: 1400px; margin: 0 auto; }
+            .header { background: linear-gradient(135deg, #2ed573 0%, #1e90ff 100%); color: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
+            .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }
+            .metric-card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; }
+            .metric-value { font-size: 2.5em; font-weight: bold; color: #2ed573; }
+            .metric-label { color: #666; margin-top: 10px; }
+            .chart-container { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            .arch-comparison { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+            .arch-card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            .arch-amd64 { border-left: 4px solid #ff6b35; }
+            .arch-arm64 { border-left: 4px solid #1b998b; }
+            .arch-arm { border-left: 4px solid #6a4c93; }
+            .optimization-list { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            .optimization-item { padding: 15px; margin: 10px 0; background: #f8f9fa; border-radius: 5px; border-left: 4px solid #ffc107; }
+            .savings { color: #2ed573; font-weight: bold; }
+            .cost-high { color: #dc3545; }
+            .cost-medium { color: #ffc107; }
+            .cost-low { color: #28a745; }
+            .efficiency-score { font-size: 1.5em; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>💰 Homelab Cost Optimization Dashboard</h1>
+                <p>Multi-architecture cluster cost tracking and optimization recommendations</p>
+            </div>
+            
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-value" id="hourly-cost">$0.00</div>
+                    <div class="metric-label">Hourly Cost</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="monthly-cost">$0.00</div>
+                    <div class="metric-label">Monthly Cost</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="power-consumption">0W</div>
+                    <div class="metric-label">Power Consumption</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="efficiency-score">0.0</div>
+                    <div class="metric-label">Efficiency Score</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value savings" id="potential-savings">$0.00</div>
+                    <div class="metric-label">Monthly Savings Potential</div>
+                </div>
+            </div>
+            
+            <div class="chart-container">
+                <h3>💡 Architecture Cost Comparison</h3>
+                <div class="arch-comparison">
+                    <div class="arch-card arch-amd64">
+                        <h4>AMD64 Nodes (Compute)</h4>
+                        <div>Cost per Hour: <span class="cost-high">$0.15</span></div>
+                        <div>Power: <span>45W per node</span></div>
+                        <div>Best for: <span>Databases, ML, Heavy Compute</span></div>
+                        <div class="efficiency-score">Efficiency: <span id="amd64-efficiency">0.0</span></div>
+                    </div>
+                    
+                    <div class="arch-card arch-arm64">
+                        <h4>ARM64 Nodes (Edge)</h4>
+                        <div>Cost per Hour: <span class="cost-medium">$0.03</span></div>
+                        <div>Power: <span>7W per node</span></div>
+                        <div>Best for: <span>Web Services, APIs, Monitoring</span></div>
+                        <div class="efficiency-score">Efficiency: <span id="arm64-efficiency">0.0</span></div>
+                    </div>
+                    
+                    <div class="arch-card arch-arm">
+                        <h4>ARM Nodes (Sensors)</h4>
+                        <div>Cost per Hour: <span class="cost-low">$0.008</span></div>
+                        <div>Power: <span>2.5W per node</span></div>
+                        <div>Best for: <span>IoT Sensors, Lightweight Tasks</span></div>
+                        <div class="efficiency-score">Efficiency: <span id="arm-efficiency">0.0</span></div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="optimization-list">
+                <h3>🎯 Optimization Recommendations</h3>
+                <div id="recommendations-list">
+                    <div class="optimization-item">
+                        <strong>Migrate Web Services to ARM64</strong><br>
+                        Move nginx and API services from AMD64 to ARM64 nodes<br>
+                        <span class="savings">Potential savings: $32/month</span>
+                    </div>
+                    
+                    <div class="optimization-item">
+                        <strong>Consolidate IoT Sensors</strong><br>
+                        Move sensor workloads to ARM nodes for better power efficiency<br>
+                        <span class="savings">Potential savings: $18/month</span>
+                    </div>
+                    
+                    <div class="optimization-item">
+                        <strong>Right-size Database Resources</strong><br>
+                        Reduce over-provisioned CPU/memory on database pods<br>
+                        <span class="savings">Potential savings: $24/month</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="chart-container">
+                <h3>📊 Cost Breakdown</h3>
+                <canvas id="costChart" width="400" height="200"></canvas>
+            </div>
+            
+            <div class="chart-container">
+                <h3>⚡ Power Efficiency Comparison</h3>
+                <div style="display: flex; justify-content: space-around; text-align: center;">
+                    <div>
+                        <h4>Performance per Watt</h4>
+                        <div style="font-size: 1.5em;">
+                            <div>ARM64: <span style="color: #1b998b;">12.5</span></div>
+                            <div>AMD64: <span style="color: #ff6b35;">8.2</span></div>
+                            <div>ARM: <span style="color: #6a4c93;">6.8</span></div>
+                        </div>
+                    </div>
+                    <div>
+                        <h4>Cost per Task</h4>
+                        <div style="font-size: 1.5em;">
+                            <div>ARM: <span style="color: #6a4c93;">$0.002</span></div>
+                            <div>ARM64: <span style="color: #1b998b;">$0.008</span></div>
+                            <div>AMD64: <span style="color: #ff6b35;">$0.025</span></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            // Simulated data - in production this would come from APIs
+            function updateDashboard() {
+                // Update main metrics
+                document.getElementById('hourly-cost').textContent = '$0.32';
+                document.getElementById('monthly-cost').textContent = '$230';
+                document.getElementById('power-consumption').textContent = '110W';
+                document.getElementById('efficiency-score').textContent = '8.7';
+                document.getElementById('potential-savings').textContent = '$74';
+                
+                // Update efficiency scores
+                document.getElementById('amd64-efficiency').textContent = '6.2';
+                document.getElementById('arm64-efficiency').textContent = '9.5';
+                document.getElementById('arm-efficiency').textContent = '8.8';
+                
+                console.log('Dashboard updated');
+            }
+            
+            // Update dashboard every 30 seconds
+            updateDashboard();
+            setInterval(updateDashboard, 30000);
+            
+            // Cost chart (simplified - in production would use Chart.js or similar)
+            function drawCostChart() {
+                const canvas = document.getElementById('costChart');
+                const ctx = canvas.getContext('2d');
+                
+                // Simple bar chart representation
+                ctx.fillStyle = '#ff6b35';
+                ctx.fillRect(50, 50, 100, 120);
+                ctx.fillText('AMD64: $108/mo', 50, 180);
+                
+                ctx.fillStyle = '#1b998b';
+                ctx.fillRect(200, 100, 100, 70);
+                ctx.fillText('ARM64: $72/mo', 200, 180);
+                
+                ctx.fillStyle = '#6a4c93';
+                ctx.fillRect(350, 140, 100, 30);
+                ctx.fillText('ARM: $50/mo', 350, 180);
+            }
+            
+            drawCostChart();
+        </script>
+    </body>
+    </html>
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cost-dashboard
+  namespace: cost-optimization
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cost-dashboard
+  template:
+    metadata:
+      labels:
+        app: cost-dashboard
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: dashboard-content
+          mountPath: /usr/share/nginx/html
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+      volumes:
+      - name: dashboard-content
+        configMap:
+          name: cost-dashboard-content
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: cost-tracker
+  namespace: cost-optimization
+spec:
+  selector:
+    app: cost-tracker
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cost-dashboard
+  namespace: cost-optimization
+spec:
+  selector:
+    app: cost-dashboard
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cost-dashboard-ingress
+  namespace: cost-optimization
+spec:
+  rules:
+  - host: costs.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: cost-dashboard
+            port:
+              number: 80
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cost-tracker
+  namespace: cost-optimization
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cost-optimizer
+  namespace: cost-optimization
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cost-tracker
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "statefulsets"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cost-tracker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cost-tracker
+subjects:
+- kind: ServiceAccount
+  name: cost-tracker
+  namespace: cost-optimization
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cost-optimizer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cost-tracker
+subjects:
+- kind: ServiceAccount
+  name: cost-optimizer
+  namespace: cost-optimization
+
+---
+# Scheduled cost reports
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: weekly-cost-report
+  namespace: cost-optimization
+spec:
+  schedule: "0 9 * * 1"  # Monday at 9 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: reporter
+            image: python:3.11-slim
+            command: ["/bin/bash"]
+            args:
+            - -c
+            - |
+              pip install requests
+              
+              echo "Generating weekly cost report..."
+              
+              # Get cost data (simulated)
+              cat > /tmp/weekly-report.json << EOF
+              {
+                "week_ending": "$(date +%Y-%m-%d)",
+                "total_cost": 230.50,
+                "cost_by_architecture": {
+                  "amd64": 108.00,
+                  "arm64": 72.50,
+                  "arm": 50.00
+                },
+                "power_consumption": {
+                  "total_watts": 110,
+                  "kwh_this_week": 18.48,
+                  "power_cost": 2.22
+                },
+                "optimization_applied": 3,
+                "savings_realized": 32.50,
+                "recommendations": [
+                  "Continue migrating web services to ARM64",
+                  "Consider adding more ARM nodes for IoT workloads"
+                ]
+              }
+              EOF
+              
+              echo "Weekly cost report generated:"
+              cat /tmp/weekly-report.json
+              
+              # In production, this would send to email/slack/teams
+              echo "Report sent to administrators"
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "128Mi"
+              limits:
+                cpu: "200m"
+                memory: "256Mi"

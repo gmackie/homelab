@@ -1,0 +1,1213 @@
+# Automated Documentation Generation System for Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: documentation
+  labels:
+    name: documentation
+
+---
+# Documentation Generator Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docs-generator
+  namespace: documentation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: docs-generator
+  template:
+    metadata:
+      labels:
+        app: docs-generator
+    spec:
+      serviceAccountName: docs-generator
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: generator
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes pyyaml jinja2 markdown2 prometheus-client pygments graphviz plantuml
+          python3 /app/docs_generator.py
+        volumeMounts:
+        - name: generator-app
+          mountPath: /app
+        - name: templates
+          mountPath: /templates
+        - name: docs-output
+          mountPath: /docs
+        env:
+        - name: PROMETHEUS_URL
+          value: "http://prometheus.monitoring:9090"
+        - name: GRAFANA_URL
+          value: "http://grafana.monitoring:3000"
+        - name: GENERATION_INTERVAL
+          value: "3600"  # Generate docs every hour
+        ports:
+        - containerPort: 8080
+          name: http
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+      volumes:
+      - name: generator-app
+        configMap:
+          name: docs-generator-app
+      - name: templates
+        configMap:
+          name: docs-templates
+      - name: docs-output
+        persistentVolumeClaim:
+          claimName: generated-docs
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: docs-generator-app
+  namespace: documentation
+data:
+  docs_generator.py: |
+    #!/usr/bin/env python3
+    import os
+    import json
+    import yaml
+    import time
+    import logging
+    import requests
+    from datetime import datetime, timedelta
+    from kubernetes import client, config
+    from jinja2 import Environment, FileSystemLoader
+    import markdown2
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    from flask import Flask, send_from_directory, render_template_string
+    import threading
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Metrics
+    DOCS_GENERATED = Counter('docs_generated_total', 'Total documentation pages generated', ['doc_type'])
+    DOCS_GENERATION_TIME = Histogram('docs_generation_seconds', 'Time to generate documentation')
+    DOCS_SIZE_BYTES = Gauge('docs_size_bytes', 'Size of generated documentation', ['doc_type'])
+    
+    app = Flask(__name__)
+    
+    class DocumentationGenerator:
+        def __init__(self):
+            config.load_incluster_config()
+            self.v1 = client.CoreV1Api()
+            self.apps_v1 = client.AppsV1Api()
+            self.networking_v1 = client.NetworkingV1Api()
+            self.custom_api = client.CustomObjectsApi()
+            
+            self.prometheus_url = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
+            self.grafana_url = os.getenv("GRAFANA_URL", "http://grafana:3000")
+            self.generation_interval = int(os.getenv("GENERATION_INTERVAL", "3600"))
+            
+            # Jinja2 environment for templates
+            self.jinja_env = Environment(loader=FileSystemLoader('/templates'))
+            
+            # Documentation output directory
+            self.docs_dir = "/docs"
+            os.makedirs(self.docs_dir, exist_ok=True)
+            
+        def collect_cluster_info(self):
+            """Collect comprehensive cluster information"""
+            try:
+                info = {
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'nodes': [],
+                    'namespaces': [],
+                    'deployments': [],
+                    'services': [],
+                    'ingresses': [],
+                    'pods': [],
+                    'pvcs': [],
+                    'configmaps': [],
+                    'secrets': [],
+                    'metrics': {}
+                }
+                
+                # Collect node information
+                nodes = self.v1.list_node()
+                for node in nodes.items:
+                    node_info = {
+                        'name': node.metadata.name,
+                        'architecture': node.metadata.labels.get('kubernetes.io/arch', 'unknown'),
+                        'os': node.metadata.labels.get('kubernetes.io/os', 'unknown'),
+                        'kernel_version': node.status.node_info.kernel_version,
+                        'container_runtime': node.status.node_info.container_runtime_version,
+                        'kubelet_version': node.status.node_info.kubelet_version,
+                        'capacity': {
+                            'cpu': node.status.capacity.get('cpu', '0'),
+                            'memory': node.status.capacity.get('memory', '0'),
+                            'storage': node.status.capacity.get('storage', '0'),
+                            'pods': node.status.capacity.get('pods', '0')
+                        },
+                        'conditions': []
+                    }
+                    
+                    for condition in node.status.conditions:
+                        node_info['conditions'].append({
+                            'type': condition.type,
+                            'status': condition.status,
+                            'message': condition.message
+                        })
+                    
+                    info['nodes'].append(node_info)
+                
+                # Collect namespace information
+                namespaces = self.v1.list_namespace()
+                for ns in namespaces.items:
+                    ns_info = {
+                        'name': ns.metadata.name,
+                        'status': ns.status.phase,
+                        'labels': ns.metadata.labels or {},
+                        'created': ns.metadata.creation_timestamp.isoformat() if ns.metadata.creation_timestamp else None
+                    }
+                    info['namespaces'].append(ns_info)
+                
+                # Collect deployment information
+                deployments = self.apps_v1.list_deployment_for_all_namespaces()
+                for deployment in deployments.items:
+                    deploy_info = {
+                        'name': deployment.metadata.name,
+                        'namespace': deployment.metadata.namespace,
+                        'replicas': deployment.spec.replicas,
+                        'ready_replicas': deployment.status.ready_replicas or 0,
+                        'images': [],
+                        'labels': deployment.metadata.labels or {},
+                        'architecture_affinity': self.extract_architecture_affinity(deployment)
+                    }
+                    
+                    for container in deployment.spec.template.spec.containers:
+                        deploy_info['images'].append(container.image)
+                    
+                    info['deployments'].append(deploy_info)
+                
+                # Collect service information
+                services = self.v1.list_service_for_all_namespaces()
+                for service in services.items:
+                    svc_info = {
+                        'name': service.metadata.name,
+                        'namespace': service.metadata.namespace,
+                        'type': service.spec.type,
+                        'cluster_ip': service.spec.cluster_ip,
+                        'ports': []
+                    }
+                    
+                    if service.spec.ports:
+                        for port in service.spec.ports:
+                            svc_info['ports'].append({
+                                'name': port.name,
+                                'port': port.port,
+                                'target_port': port.target_port,
+                                'protocol': port.protocol
+                            })
+                    
+                    info['services'].append(svc_info)
+                
+                # Collect ingress information
+                ingresses = self.networking_v1.list_ingress_for_all_namespaces()
+                for ingress in ingresses.items:
+                    ing_info = {
+                        'name': ingress.metadata.name,
+                        'namespace': ingress.metadata.namespace,
+                        'hosts': [],
+                        'tls': bool(ingress.spec.tls) if ingress.spec else False
+                    }
+                    
+                    if ingress.spec and ingress.spec.rules:
+                        for rule in ingress.spec.rules:
+                            if rule.host:
+                                ing_info['hosts'].append(rule.host)
+                    
+                    info['ingresses'].append(ing_info)
+                
+                # Collect metrics from Prometheus
+                info['metrics'] = self.collect_prometheus_metrics()
+                
+                return info
+                
+            except Exception as e:
+                logger.error(f"Failed to collect cluster info: {e}")
+                return None
+        
+        def extract_architecture_affinity(self, deployment):
+            """Extract architecture affinity from deployment spec"""
+            try:
+                if deployment.spec.template.spec.affinity:
+                    if deployment.spec.template.spec.affinity.node_affinity:
+                        preferred = deployment.spec.template.spec.affinity.node_affinity.preferred_during_scheduling_ignored_during_execution
+                        if preferred:
+                            for pref in preferred:
+                                for expr in pref.preference.match_expressions:
+                                    if expr.key == "kubernetes.io/arch":
+                                        return expr.values
+                
+                if deployment.spec.template.spec.node_selector:
+                    arch = deployment.spec.template.spec.node_selector.get("kubernetes.io/arch")
+                    if arch:
+                        return [arch]
+                
+                return []
+                
+            except Exception:
+                return []
+        
+        def collect_prometheus_metrics(self):
+            """Collect key metrics from Prometheus"""
+            try:
+                metrics = {}
+                
+                # Cluster-wide metrics
+                queries = {
+                    'cpu_usage': 'avg(100 - (irate(node_cpu_seconds_total{mode="idle"}[5m]) * 100))',
+                    'memory_usage': 'avg((1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100)',
+                    'pod_count': 'count(kube_pod_info)',
+                    'node_count': 'count(kube_node_info)',
+                    'power_consumption': 'sum(node_power_consumption_watts)',
+                    'gpu_utilization': 'avg(DCGM_FI_DEV_GPU_UTIL)',
+                    'ml_inference_rate': 'sum(rate(ml_inference_requests_total[5m]))',
+                    'backup_success_rate': 'sum(rate(velero_backup_success_total[24h])) / sum(rate(velero_backup_attempt_total[24h])) * 100'
+                }
+                
+                for metric_name, query in queries.items():
+                    try:
+                        response = requests.get(f"{self.prometheus_url}/api/v1/query",
+                                               params={'query': query})
+                        if response.status_code == 200:
+                            data = response.json()
+                            if data['data']['result']:
+                                value = float(data['data']['result'][0]['value'][1])
+                                metrics[metric_name] = round(value, 2)
+                            else:
+                                metrics[metric_name] = 0
+                    except Exception as e:
+                        logger.error(f"Failed to query metric {metric_name}: {e}")
+                        metrics[metric_name] = 0
+                
+                return metrics
+                
+            except Exception as e:
+                logger.error(f"Failed to collect Prometheus metrics: {e}")
+                return {}
+        
+        def generate_architecture_diagram(self, cluster_info):
+            """Generate architecture diagram using PlantUML"""
+            try:
+                diagram = """
+                @startuml
+                !theme plain
+                title Multi-Architecture Homelab System
+                
+                package "Homelab Cluster" {
+                """
+                
+                # Add nodes by architecture
+                architectures = {}
+                for node in cluster_info['nodes']:
+                    arch = node['architecture']
+                    if arch not in architectures:
+                        architectures[arch] = []
+                    architectures[arch].append(node['name'])
+                
+                for arch, nodes in architectures.items():
+                    diagram += f"""
+                    package "{arch.upper()} Nodes" {{
+                    """
+                    for node_name in nodes:
+                        diagram += f"""
+                        node "{node_name}"
+                        """
+                    diagram += """
+                    }
+                    """
+                
+                # Add key services
+                diagram += """
+                package "Core Services" {
+                    component "Dashboard" as dashboard
+                    component "ML Serving" as ml
+                    component "Monitoring" as monitoring
+                    component "GitOps" as gitops
+                }
+                
+                package "Edge Computing" {
+                    component "IoT Devices" as iot
+                    component "Edge Gateway" as edge
+                }
+                """
+                
+                # Add relationships
+                diagram += """
+                dashboard --> monitoring : metrics
+                ml --> monitoring : telemetry
+                gitops --> dashboard : deploy
+                edge --> iot : collect
+                edge --> ml : inference
+                """
+                
+                diagram += """
+                }
+                @enduml
+                """
+                
+                # Save diagram
+                diagram_file = os.path.join(self.docs_dir, "architecture.puml")
+                with open(diagram_file, 'w') as f:
+                    f.write(diagram)
+                
+                logger.info("Generated architecture diagram")
+                return diagram_file
+                
+            except Exception as e:
+                logger.error(f"Failed to generate architecture diagram: {e}")
+                return None
+        
+        def generate_readme(self, cluster_info):
+            """Generate main README documentation"""
+            try:
+                template = self.jinja_env.get_template('README.md.j2')
+                
+                # Calculate summary statistics
+                total_nodes = len(cluster_info['nodes'])
+                total_pods = sum(1 for d in cluster_info['deployments'] for _ in range(d['ready_replicas']))
+                total_services = len(cluster_info['services'])
+                
+                # Architecture distribution
+                arch_distribution = {}
+                for node in cluster_info['nodes']:
+                    arch = node['architecture']
+                    arch_distribution[arch] = arch_distribution.get(arch, 0) + 1
+                
+                content = template.render(
+                    cluster_info=cluster_info,
+                    total_nodes=total_nodes,
+                    total_pods=total_pods,
+                    total_services=total_services,
+                    arch_distribution=arch_distribution,
+                    generation_time=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                )
+                
+                readme_file = os.path.join(self.docs_dir, "README.md")
+                with open(readme_file, 'w') as f:
+                    f.write(content)
+                
+                DOCS_GENERATED.labels(doc_type='readme').inc()
+                DOCS_SIZE_BYTES.labels(doc_type='readme').set(len(content))
+                
+                logger.info("Generated README.md")
+                return readme_file
+                
+            except Exception as e:
+                logger.error(f"Failed to generate README: {e}")
+                return None
+        
+        def generate_service_docs(self, cluster_info):
+            """Generate documentation for each service"""
+            try:
+                template = self.jinja_env.get_template('service.md.j2')
+                service_docs_dir = os.path.join(self.docs_dir, "services")
+                os.makedirs(service_docs_dir, exist_ok=True)
+                
+                for service in cluster_info['services']:
+                    # Find associated deployment
+                    deployment = None
+                    for deploy in cluster_info['deployments']:
+                        if deploy['name'] == service['name'] and deploy['namespace'] == service['namespace']:
+                            deployment = deploy
+                            break
+                    
+                    # Find associated ingress
+                    ingress = None
+                    for ing in cluster_info['ingresses']:
+                        if ing['namespace'] == service['namespace']:
+                            ingress = ing
+                            break
+                    
+                    content = template.render(
+                        service=service,
+                        deployment=deployment,
+                        ingress=ingress
+                    )
+                    
+                    filename = f"{service['namespace']}_{service['name']}.md"
+                    filepath = os.path.join(service_docs_dir, filename)
+                    
+                    with open(filepath, 'w') as f:
+                        f.write(content)
+                    
+                    DOCS_GENERATED.labels(doc_type='service').inc()
+                
+                logger.info(f"Generated documentation for {len(cluster_info['services'])} services")
+                
+            except Exception as e:
+                logger.error(f"Failed to generate service docs: {e}")
+        
+        def generate_operations_runbook(self, cluster_info):
+            """Generate operations runbook"""
+            try:
+                template = self.jinja_env.get_template('runbook.md.j2')
+                
+                # Define common operations procedures
+                procedures = {
+                    'scaling': {
+                        'title': 'Scaling Applications',
+                        'steps': [
+                            'Check current resource utilization',
+                            'Identify target deployment',
+                            'Update replica count or resource requests',
+                            'Monitor rollout status',
+                            'Verify application health'
+                        ]
+                    },
+                    'backup': {
+                        'title': 'Backup and Restore',
+                        'steps': [
+                            'Trigger Velero backup',
+                            'Verify backup completion',
+                            'Test restore in staging',
+                            'Document backup location',
+                            'Update disaster recovery plan'
+                        ]
+                    },
+                    'troubleshooting': {
+                        'title': 'Troubleshooting',
+                        'steps': [
+                            'Check pod status and logs',
+                            'Verify node health',
+                            'Review recent events',
+                            'Check resource quotas',
+                            'Analyze metrics and alerts'
+                        ]
+                    },
+                    'upgrade': {
+                        'title': 'System Upgrade',
+                        'steps': [
+                            'Review release notes',
+                            'Create full backup',
+                            'Test in staging environment',
+                            'Schedule maintenance window',
+                            'Execute rolling upgrade',
+                            'Verify system functionality'
+                        ]
+                    }
+                }
+                
+                content = template.render(
+                    procedures=procedures,
+                    cluster_info=cluster_info
+                )
+                
+                runbook_file = os.path.join(self.docs_dir, "RUNBOOK.md")
+                with open(runbook_file, 'w') as f:
+                    f.write(content)
+                
+                DOCS_GENERATED.labels(doc_type='runbook').inc()
+                DOCS_SIZE_BYTES.labels(doc_type='runbook').set(len(content))
+                
+                logger.info("Generated operations runbook")
+                return runbook_file
+                
+            except Exception as e:
+                logger.error(f"Failed to generate runbook: {e}")
+                return None
+        
+        def generate_api_docs(self, cluster_info):
+            """Generate API documentation"""
+            try:
+                template = self.jinja_env.get_template('api.md.j2')
+                
+                # Extract API endpoints from services
+                api_endpoints = []
+                for service in cluster_info['services']:
+                    if 'api' in service['name'].lower() or service['namespace'] in ['ml-serving', 'monitoring']:
+                        endpoint = {
+                            'name': service['name'],
+                            'namespace': service['namespace'],
+                            'url': f"http://{service['name']}.{service['namespace']}.svc.cluster.local",
+                            'ports': service['ports']
+                        }
+                        api_endpoints.append(endpoint)
+                
+                content = template.render(
+                    api_endpoints=api_endpoints,
+                    cluster_info=cluster_info
+                )
+                
+                api_file = os.path.join(self.docs_dir, "API.md")
+                with open(api_file, 'w') as f:
+                    f.write(content)
+                
+                DOCS_GENERATED.labels(doc_type='api').inc()
+                DOCS_SIZE_BYTES.labels(doc_type='api').set(len(content))
+                
+                logger.info("Generated API documentation")
+                return api_file
+                
+            except Exception as e:
+                logger.error(f"Failed to generate API docs: {e}")
+                return None
+        
+        def generate_metrics_dashboard(self, cluster_info):
+            """Generate metrics dashboard HTML"""
+            try:
+                template = self.jinja_env.get_template('dashboard.html.j2')
+                
+                content = template.render(
+                    cluster_info=cluster_info,
+                    metrics=cluster_info.get('metrics', {}),
+                    timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                )
+                
+                dashboard_file = os.path.join(self.docs_dir, "dashboard.html")
+                with open(dashboard_file, 'w') as f:
+                    f.write(content)
+                
+                DOCS_GENERATED.labels(doc_type='dashboard').inc()
+                DOCS_SIZE_BYTES.labels(doc_type='dashboard').set(len(content))
+                
+                logger.info("Generated metrics dashboard")
+                return dashboard_file
+                
+            except Exception as e:
+                logger.error(f"Failed to generate metrics dashboard: {e}")
+                return None
+        
+        def generate_all_documentation(self):
+            """Generate all documentation"""
+            with DOCS_GENERATION_TIME.time():
+                logger.info("Starting documentation generation")
+                
+                # Collect cluster information
+                cluster_info = self.collect_cluster_info()
+                if not cluster_info:
+                    logger.error("Failed to collect cluster information")
+                    return
+                
+                # Generate different documentation types
+                self.generate_readme(cluster_info)
+                self.generate_service_docs(cluster_info)
+                self.generate_operations_runbook(cluster_info)
+                self.generate_api_docs(cluster_info)
+                self.generate_architecture_diagram(cluster_info)
+                self.generate_metrics_dashboard(cluster_info)
+                
+                # Generate index file
+                self.generate_index()
+                
+                logger.info("Documentation generation completed")
+        
+        def generate_index(self):
+            """Generate index HTML file"""
+            try:
+                index_content = """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Homelab Documentation</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 20px; }
+                        h1 { color: #333; }
+                        ul { list-style-type: none; padding: 0; }
+                        li { margin: 10px 0; }
+                        a { color: #0066cc; text-decoration: none; }
+                        a:hover { text-decoration: underline; }
+                    </style>
+                </head>
+                <body>
+                    <h1>Homelab Documentation</h1>
+                    <p>Generated: """ + datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC") + """</p>
+                    <ul>
+                        <li><a href="README.md">System Overview (README)</a></li>
+                        <li><a href="RUNBOOK.md">Operations Runbook</a></li>
+                        <li><a href="API.md">API Documentation</a></li>
+                        <li><a href="dashboard.html">Metrics Dashboard</a></li>
+                        <li><a href="architecture.puml">Architecture Diagram (PlantUML)</a></li>
+                        <li><a href="services/">Service Documentation</a></li>
+                    </ul>
+                </body>
+                </html>
+                """
+                
+                index_file = os.path.join(self.docs_dir, "index.html")
+                with open(index_file, 'w') as f:
+                    f.write(index_content)
+                
+                logger.info("Generated documentation index")
+                
+            except Exception as e:
+                logger.error(f"Failed to generate index: {e}")
+        
+        def run_generation_loop(self):
+            """Run documentation generation in a loop"""
+            while True:
+                try:
+                    self.generate_all_documentation()
+                except Exception as e:
+                    logger.error(f"Error in documentation generation: {e}")
+                
+                time.sleep(self.generation_interval)
+        
+        def run(self):
+            """Start the documentation generator"""
+            logger.info("Starting Documentation Generator")
+            
+            # Start metrics server
+            start_http_server(8081)
+            
+            # Start generation loop in background
+            generation_thread = threading.Thread(target=self.run_generation_loop)
+            generation_thread.daemon = True
+            generation_thread.start()
+            
+            # Start Flask web server
+            @app.route('/')
+            def index():
+                return send_from_directory(self.docs_dir, 'index.html')
+            
+            @app.route('/<path:path>')
+            def serve_docs(path):
+                return send_from_directory(self.docs_dir, path)
+            
+            app.run(host='0.0.0.0', port=8080)
+    
+    if __name__ == "__main__":
+        generator = DocumentationGenerator()
+        generator.run()
+
+---
+# Documentation Templates
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: docs-templates
+  namespace: documentation
+data:
+  README.md.j2: |
+    # Multi-Architecture Homelab System
+    
+    > Auto-generated documentation for the homelab Kubernetes cluster
+    > Generated: {{ generation_time }}
+    
+    ## System Overview
+    
+    The homelab system is a production-grade, multi-architecture Kubernetes cluster optimized for power efficiency and performance.
+    
+    ### Key Statistics
+    
+    - **Total Nodes**: {{ total_nodes }}
+    - **Total Pods**: {{ total_pods }}
+    - **Total Services**: {{ total_services }}
+    - **Namespaces**: {{ cluster_info.namespaces|length }}
+    
+    ### Architecture Distribution
+    
+    {% for arch, count in arch_distribution.items() %}
+    - **{{ arch }}**: {{ count }} nodes
+    {% endfor %}
+    
+    ### Current Metrics
+    
+    {% if cluster_info.metrics %}
+    - **CPU Usage**: {{ cluster_info.metrics.cpu_usage }}%
+    - **Memory Usage**: {{ cluster_info.metrics.memory_usage }}%
+    - **Power Consumption**: {{ cluster_info.metrics.power_consumption }}W
+    - **GPU Utilization**: {{ cluster_info.metrics.gpu_utilization }}%
+    - **ML Inference Rate**: {{ cluster_info.metrics.ml_inference_rate }} req/s
+    - **Backup Success Rate**: {{ cluster_info.metrics.backup_success_rate }}%
+    {% endif %}
+    
+    ## Nodes
+    
+    | Name | Architecture | OS | Capacity |
+    |------|--------------|----|---------:|
+    {% for node in cluster_info.nodes %}
+    | {{ node.name }} | {{ node.architecture }} | {{ node.os }} | {{ node.capacity.cpu }} CPU, {{ node.capacity.memory }} |
+    {% endfor %}
+    
+    ## Key Services
+    
+    ### Core Infrastructure
+    
+    | Service | Namespace | Type | Ports |
+    |---------|-----------|------|-------|
+    {% for service in cluster_info.services %}
+    {% if service.namespace in ['default', 'monitoring', 'ml-serving'] %}
+    | {{ service.name }} | {{ service.namespace }} | {{ service.type }} | {{ service.ports|length }} |
+    {% endif %}
+    {% endfor %}
+    
+    ## Deployments
+    
+    | Name | Namespace | Replicas | Architecture |
+    |------|-----------|----------|--------------|
+    {% for deployment in cluster_info.deployments %}
+    | {{ deployment.name }} | {{ deployment.namespace }} | {{ deployment.ready_replicas }}/{{ deployment.replicas }} | {{ deployment.architecture_affinity|join(', ') or 'any' }} |
+    {% endfor %}
+    
+    ## Quick Links
+    
+    - [Operations Runbook](RUNBOOK.md)
+    - [API Documentation](API.md)
+    - [Service Documentation](services/)
+    - [Architecture Diagram](architecture.puml)
+    - [Metrics Dashboard](dashboard.html)
+  
+  service.md.j2: |
+    # Service: {{ service.name }}
+    
+    **Namespace**: {{ service.namespace }}  
+    **Type**: {{ service.type }}  
+    **Cluster IP**: {{ service.cluster_ip }}
+    
+    ## Ports
+    
+    {% if service.ports %}
+    | Name | Port | Target Port | Protocol |
+    |------|------|-------------|----------|
+    {% for port in service.ports %}
+    | {{ port.name or 'unnamed' }} | {{ port.port }} | {{ port.target_port }} | {{ port.protocol }} |
+    {% endfor %}
+    {% else %}
+    No ports configured.
+    {% endif %}
+    
+    {% if deployment %}
+    ## Associated Deployment
+    
+    **Name**: {{ deployment.name }}  
+    **Replicas**: {{ deployment.ready_replicas }}/{{ deployment.replicas }}  
+    **Images**: {{ deployment.images|join(', ') }}  
+    **Architecture**: {{ deployment.architecture_affinity|join(', ') or 'any' }}
+    {% endif %}
+    
+    {% if ingress %}
+    ## Ingress Configuration
+    
+    **Hosts**: {{ ingress.hosts|join(', ') or 'none' }}  
+    **TLS**: {{ 'Enabled' if ingress.tls else 'Disabled' }}
+    {% endif %}
+    
+    ## Access
+    
+    ### Internal Access
+    ```bash
+    # From within the cluster
+    curl http://{{ service.name }}.{{ service.namespace }}.svc.cluster.local{% if service.ports %}:{{ service.ports[0].port }}{% endif %}
+    ```
+    
+    ### Port Forward Access
+    ```bash
+    # From outside the cluster
+    kubectl port-forward -n {{ service.namespace }} svc/{{ service.name }} {% if service.ports %}{{ service.ports[0].port }}:{{ service.ports[0].port }}{% else %}8080:8080{% endif %}
+    ```
+  
+  runbook.md.j2: |
+    # Operations Runbook
+    
+    > Standard operating procedures for the homelab system
+    
+    ## Table of Contents
+    
+    {% for key, procedure in procedures.items() %}
+    - [{{ procedure.title }}](#{{ key }})
+    {% endfor %}
+    
+    {% for key, procedure in procedures.items() %}
+    ## {{ procedure.title }} {#{{ key }}}
+    
+    ### Steps
+    
+    {% for step in procedure.steps %}
+    {{ loop.index }}. {{ step }}
+    {% endfor %}
+    
+    ### Commands
+    
+    ```bash
+    # Relevant kubectl commands for {{ procedure.title|lower }}
+    {% if key == 'scaling' %}
+    kubectl scale deployment <name> --replicas=<count> -n <namespace>
+    kubectl autoscale deployment <name> --min=2 --max=10 --cpu-percent=80
+    {% elif key == 'backup' %}
+    velero backup create <backup-name> --include-namespaces <namespace>
+    velero backup describe <backup-name>
+    velero restore create --from-backup <backup-name>
+    {% elif key == 'troubleshooting' %}
+    kubectl get pods --all-namespaces | grep -v Running
+    kubectl logs <pod-name> -n <namespace> --tail=100
+    kubectl describe pod <pod-name> -n <namespace>
+    kubectl get events --sort-by='.lastTimestamp' --all-namespaces
+    {% elif key == 'upgrade' %}
+    kubectl apply -f <new-manifest.yaml>
+    kubectl rollout status deployment/<name> -n <namespace>
+    kubectl rollout history deployment/<name> -n <namespace>
+    kubectl rollout undo deployment/<name> -n <namespace>
+    {% endif %}
+    ```
+    
+    ---
+    
+    {% endfor %}
+    
+    ## Emergency Contacts
+    
+    - **On-Call**: Check PagerDuty rotation
+    - **Escalation**: Team lead → Platform team → SRE
+    
+    ## Monitoring Dashboards
+    
+    - Grafana: http://grafana.monitoring:3000
+    - Prometheus: http://prometheus.monitoring:9090
+    - Jaeger: http://jaeger-query.tracing:16686
+  
+  api.md.j2: |
+    # API Documentation
+    
+    ## Available API Endpoints
+    
+    {% for endpoint in api_endpoints %}
+    ### {{ endpoint.name }}
+    
+    **Namespace**: {{ endpoint.namespace }}  
+    **Base URL**: `{{ endpoint.url }}`
+    
+    #### Ports
+    {% if endpoint.ports %}
+    {% for port in endpoint.ports %}
+    - **{{ port.name or 'unnamed' }}**: {{ port.port }} ({{ port.protocol }})
+    {% endfor %}
+    {% endif %}
+    
+    #### Example Usage
+    
+    ```bash
+    # Health check
+    curl {{ endpoint.url }}{% if endpoint.ports %}:{{ endpoint.ports[0].port }}{% endif %}/health
+    
+    # Metrics
+    curl {{ endpoint.url }}{% if endpoint.ports %}:{{ endpoint.ports[0].port }}{% endif %}/metrics
+    ```
+    
+    ---
+    
+    {% endfor %}
+    
+    ## Authentication
+    
+    Most internal APIs do not require authentication. For external access, use port-forwarding or ingress with appropriate authentication.
+    
+    ## Rate Limiting
+    
+    No rate limiting is configured for internal API calls. Be mindful of resource consumption.
+  
+  dashboard.html.j2: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Homelab Metrics Dashboard</title>
+        <style>
+            body { 
+                font-family: Arial, sans-serif; 
+                margin: 0; 
+                padding: 20px;
+                background: #f5f5f5;
+            }
+            h1 { color: #333; }
+            .metrics-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 20px;
+                margin: 20px 0;
+            }
+            .metric-card {
+                background: white;
+                border-radius: 8px;
+                padding: 20px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            .metric-value {
+                font-size: 32px;
+                font-weight: bold;
+                color: #0066cc;
+            }
+            .metric-label {
+                color: #666;
+                margin-top: 5px;
+            }
+            .status-good { color: #28a745; }
+            .status-warning { color: #ffc107; }
+            .status-critical { color: #dc3545; }
+        </style>
+    </head>
+    <body>
+        <h1>Homelab System Dashboard</h1>
+        <p>Last updated: {{ timestamp }}</p>
+        
+        <div class="metrics-grid">
+            {% if metrics %}
+            <div class="metric-card">
+                <div class="metric-value {% if metrics.cpu_usage < 70 %}status-good{% elif metrics.cpu_usage < 85 %}status-warning{% else %}status-critical{% endif %}">
+                    {{ metrics.cpu_usage }}%
+                </div>
+                <div class="metric-label">CPU Usage</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value {% if metrics.memory_usage < 70 %}status-good{% elif metrics.memory_usage < 85 %}status-warning{% else %}status-critical{% endif %}">
+                    {{ metrics.memory_usage }}%
+                </div>
+                <div class="metric-label">Memory Usage</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value {% if metrics.power_consumption < 80 %}status-good{% elif metrics.power_consumption < 100 %}status-warning{% else %}status-critical{% endif %}">
+                    {{ metrics.power_consumption }}W
+                </div>
+                <div class="metric-label">Power Consumption</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value">{{ metrics.gpu_utilization }}%</div>
+                <div class="metric-label">GPU Utilization</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value">{{ metrics.ml_inference_rate }}</div>
+                <div class="metric-label">ML Inferences/sec</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value {% if metrics.backup_success_rate > 95 %}status-good{% elif metrics.backup_success_rate > 80 %}status-warning{% else %}status-critical{% endif %}">
+                    {{ metrics.backup_success_rate }}%
+                </div>
+                <div class="metric-label">Backup Success Rate</div>
+            </div>
+            {% endif %}
+        </div>
+        
+        <h2>Cluster Status</h2>
+        <ul>
+            <li>Nodes: {{ cluster_info.nodes|length }}</li>
+            <li>Namespaces: {{ cluster_info.namespaces|length }}</li>
+            <li>Services: {{ cluster_info.services|length }}</li>
+            <li>Deployments: {{ cluster_info.deployments|length }}</li>
+        </ul>
+    </body>
+    </html>
+
+---
+# Documentation Web Server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docs-server
+  namespace: documentation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: docs-server
+  template:
+    metadata:
+      labels:
+        app: docs-server
+    spec:
+      # Run on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+          name: http
+        volumeMounts:
+        - name: docs
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: docs
+        persistentVolumeClaim:
+          claimName: generated-docs
+      - name: nginx-config
+        configMap:
+          name: nginx-config
+
+---
+# Nginx Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: documentation
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+        
+        root /usr/share/nginx/html;
+        index index.html README.md;
+        
+        # Enable directory listing for services folder
+        location /services/ {
+            autoindex on;
+            autoindex_exact_size off;
+            autoindex_localtime on;
+        }
+        
+        # Serve markdown files as plain text
+        location ~ \.md$ {
+            add_header Content-Type text/plain;
+        }
+        
+        # Serve PlantUML files as plain text
+        location ~ \.puml$ {
+            add_header Content-Type text/plain;
+        }
+    }
+
+---
+# Persistent Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: generated-docs
+  namespace: documentation
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: longhorn-ssd
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: docs-generator
+  namespace: documentation
+spec:
+  selector:
+    app: docs-generator
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  - name: metrics
+    port: 8081
+    targetPort: 8081
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: docs-server
+  namespace: documentation
+spec:
+  selector:
+    app: docs-server
+  ports:
+  - port: 80
+    targetPort: 80
+
+---
+# Ingress for Documentation
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: documentation-ingress
+  namespace: documentation
+spec:
+  rules:
+  - host: docs.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: docs-server
+            port:
+              number: 80
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: docs-generator
+  namespace: documentation
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: docs-generator
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "services", "endpoints", "namespaces", "configmaps", "secrets", "persistentvolumeclaims"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: docs-generator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: docs-generator
+subjects:
+- kind: ServiceAccount
+  name: docs-generator
+  namespace: documentation

@@ -1,0 +1,1172 @@
+# Multi-Cluster Federation for Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: federation
+  labels:
+    name: federation
+
+---
+# Admiral for Multi-Cluster Service Discovery and Routing
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: admiral-config
+  namespace: federation
+data:
+  config.yaml: |
+    # Admiral configuration for multi-cluster homelab federation
+    admiral:
+      clusters:
+        homelab-primary:
+          endpoint: "https://homelab-primary.local:6443"
+          locality: "region-1/zone-a"
+          weight: 100
+          architectures: ["amd64", "arm64", "arm"]
+          
+        homelab-edge:
+          endpoint: "https://homelab-edge.local:6443"
+          locality: "region-1/zone-b"  
+          weight: 50
+          architectures: ["arm64", "arm"]
+          
+        homelab-gpu:
+          endpoint: "https://homelab-gpu.local:6443"
+          locality: "region-1/zone-c"
+          weight: 80
+          architectures: ["amd64"]
+          capabilities: ["gpu", "high-memory"]
+      
+      # Service mesh federation
+      meshFederation:
+        enabled: true
+        trustDomain: "homelab.cluster.local"
+        
+      # Cross-cluster service discovery
+      serviceDiscovery:
+        enabled: true
+        syncNamespaces: ["ml-serving", "event-driven", "monitoring"]
+        
+      # Traffic routing policies
+      trafficRouting:
+        failover:
+          enabled: true
+          maxRetries: 3
+          
+        loadBalancing:
+          algorithm: "weighted-round-robin"
+          localityPreference: true
+          
+        # Architecture-aware routing
+        architectureRouting:
+          enabled: true
+          preferences:
+            heavy-workloads: ["amd64"]
+            ml-inference: ["amd64", "arm64"]
+            edge-processing: ["arm64", "arm"]
+            monitoring: ["arm64"]
+
+---
+# Admiral Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admiral
+  namespace: federation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: admiral
+  template:
+    metadata:
+      labels:
+        app: admiral
+    spec:
+      serviceAccountName: admiral
+      # Run on AMD64 for performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: admiral
+        image: admiralproj/admiral:v1.7.0
+        args:
+        - --config-path=/etc/admiral/config.yaml
+        - --log-level=info
+        - --metrics-port=8080
+        ports:
+        - containerPort: 8080
+          name: metrics
+        - containerPort: 8090
+          name: webhook
+        env:
+        - name: CLUSTER_NAME
+          value: "homelab-primary"
+        - name: SECRET_RESOLVER
+          value: "k8s"
+        - name: ADMIRAL_PARAMS
+          value: "admiralParams=true"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/admiral
+        - name: clusters
+          mountPath: /etc/admiral/clusters
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+      volumes:
+      - name: config
+        configMap:
+          name: admiral-config
+      - name: clusters
+        secret:
+          secretName: cluster-credentials
+
+---
+# Cluster API Management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-manager
+  namespace: federation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cluster-manager
+  template:
+    metadata:
+      labels:
+        app: cluster-manager
+    spec:
+      serviceAccountName: cluster-manager
+      containers:
+      - name: manager
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install kubernetes pyyaml requests prometheus-client
+          python3 /app/cluster_manager.py
+        volumeMounts:
+        - name: manager-app
+          mountPath: /app
+        - name: cluster-configs
+          mountPath: /etc/clusters
+        env:
+        - name: PRIMARY_CLUSTER
+          value: "homelab-primary"
+        - name: PROMETHEUS_URL
+          value: "http://prometheus.monitoring:9090"
+        ports:
+        - containerPort: 8080
+          name: metrics
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: manager-app
+        configMap:
+          name: cluster-manager-app
+      - name: cluster-configs
+        secret:
+          secretName: cluster-credentials
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-manager-app
+  namespace: federation
+data:
+  cluster_manager.py: |
+    #!/usr/bin/env python3
+    import os
+    import time
+    import yaml
+    import json
+    import logging
+    import requests
+    from datetime import datetime, timedelta
+    from kubernetes import client, config
+    from prometheus_client import Gauge, Counter, Histogram, start_http_server
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Metrics
+    CLUSTER_STATUS = Gauge('cluster_status', 'Cluster health status', ['cluster', 'region'])
+    CLUSTER_NODES = Gauge('cluster_nodes_total', 'Total nodes per cluster', ['cluster', 'architecture'])
+    CLUSTER_PODS = Gauge('cluster_pods_total', 'Total pods per cluster', ['cluster', 'namespace'])
+    CLUSTER_RESOURCES = Gauge('cluster_resources_available', 'Available resources', ['cluster', 'resource', 'architecture'])
+    CROSS_CLUSTER_REQUESTS = Counter('cross_cluster_requests_total', 'Cross-cluster requests', ['source', 'target', 'service'])
+    FAILOVER_EVENTS = Counter('cluster_failover_events_total', 'Cluster failover events', ['source', 'target', 'reason'])
+    
+    class ClusterManager:
+        def __init__(self):
+            self.primary_cluster = os.getenv("PRIMARY_CLUSTER", "homelab-primary")
+            self.prometheus_url = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
+            
+            # Load cluster configurations
+            self.clusters = self.load_cluster_configs()
+            
+            # Initialize Kubernetes clients for each cluster
+            self.cluster_clients = {}
+            self.initialize_cluster_clients()
+            
+        def load_cluster_configs(self):
+            """Load cluster configurations from mounted secrets"""
+            clusters = {}
+            
+            try:
+                config_path = "/etc/clusters"
+                if os.path.exists(config_path):
+                    for file in os.listdir(config_path):
+                        if file.endswith('.yaml'):
+                            with open(os.path.join(config_path, file), 'r') as f:
+                                cluster_config = yaml.safe_load(f)
+                                cluster_name = cluster_config['name']
+                                clusters[cluster_name] = cluster_config
+                else:
+                    # Default configuration if no configs mounted
+                    clusters = {
+                        'homelab-primary': {
+                            'name': 'homelab-primary',
+                            'endpoint': 'https://kubernetes.default.svc',
+                            'region': 'region-1',
+                            'zone': 'zone-a',
+                            'architectures': ['amd64', 'arm64', 'arm'],
+                            'capabilities': ['standard']
+                        }
+                    }
+                
+                logger.info(f"Loaded {len(clusters)} cluster configurations")
+                return clusters
+                
+            except Exception as e:
+                logger.error(f"Failed to load cluster configs: {e}")
+                return {}
+        
+        def initialize_cluster_clients(self):
+            """Initialize Kubernetes clients for each cluster"""
+            try:
+                for cluster_name, cluster_config in self.clusters.items():
+                    if cluster_name == self.primary_cluster:
+                        # Use in-cluster config for primary cluster
+                        config.load_incluster_config()
+                        self.cluster_clients[cluster_name] = {
+                            'v1': client.CoreV1Api(),
+                            'apps_v1': client.AppsV1Api(),
+                            'custom': client.CustomObjectsApi()
+                        }
+                    else:
+                        # Load external cluster config
+                        cluster_config_path = f"/etc/clusters/{cluster_name}-kubeconfig"
+                        if os.path.exists(cluster_config_path):
+                            config.load_kube_config(config_file=cluster_config_path)
+                            self.cluster_clients[cluster_name] = {
+                                'v1': client.CoreV1Api(),
+                                'apps_v1': client.AppsV1Api(),
+                                'custom': client.CustomObjectsApi()
+                            }
+                        else:
+                            logger.warning(f"No kubeconfig found for cluster {cluster_name}")
+                
+                logger.info(f"Initialized clients for {len(self.cluster_clients)} clusters")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize cluster clients: {e}")
+        
+        def check_cluster_health(self):
+            """Check health status of all clusters"""
+            for cluster_name, clients in self.cluster_clients.items():
+                try:
+                    # Check API server connectivity
+                    nodes = clients['v1'].list_node()
+                    
+                    # Count nodes by architecture
+                    arch_counts = {}
+                    healthy_nodes = 0
+                    
+                    for node in nodes.items:
+                        arch = node.metadata.labels.get('kubernetes.io/arch', 'unknown')
+                        arch_counts[arch] = arch_counts.get(arch, 0) + 1
+                        
+                        # Check node conditions
+                        for condition in node.status.conditions:
+                            if condition.type == "Ready" and condition.status == "True":
+                                healthy_nodes += 1
+                                break
+                    
+                    # Update metrics
+                    cluster_config = self.clusters.get(cluster_name, {})
+                    region = cluster_config.get('region', 'unknown')
+                    
+                    health_status = 1 if healthy_nodes > 0 else 0
+                    CLUSTER_STATUS.labels(cluster=cluster_name, region=region).set(health_status)
+                    
+                    for arch, count in arch_counts.items():
+                        CLUSTER_NODES.labels(cluster=cluster_name, architecture=arch).set(count)
+                    
+                    # Check pod counts by namespace
+                    pods = clients['v1'].list_pod_for_all_namespaces()
+                    namespace_counts = {}
+                    
+                    for pod in pods.items:
+                        namespace = pod.metadata.namespace
+                        namespace_counts[namespace] = namespace_counts.get(namespace, 0) + 1
+                    
+                    for namespace, count in namespace_counts.items():
+                        CLUSTER_PODS.labels(cluster=cluster_name, namespace=namespace).set(count)
+                    
+                    logger.info(f"Cluster {cluster_name}: {healthy_nodes} healthy nodes, {len(pods.items)} pods")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to check health for cluster {cluster_name}: {e}")
+                    CLUSTER_STATUS.labels(cluster=cluster_name, region='unknown').set(0)
+        
+        def calculate_cluster_capacity(self):
+            """Calculate available capacity across clusters"""
+            for cluster_name, clients in self.cluster_clients.items():
+                try:
+                    nodes = clients['v1'].list_node()
+                    
+                    for node in nodes.items:
+                        arch = node.metadata.labels.get('kubernetes.io/arch', 'unknown')
+                        
+                        # Get node capacity
+                        capacity = node.status.capacity
+                        allocatable = node.status.allocatable
+                        
+                        if capacity and allocatable:
+                            # CPU capacity
+                            cpu_capacity = self.parse_resource(allocatable.get('cpu', '0'))
+                            CLUSTER_RESOURCES.labels(
+                                cluster=cluster_name,
+                                resource='cpu',
+                                architecture=arch
+                            ).set(cpu_capacity)
+                            
+                            # Memory capacity
+                            memory_capacity = self.parse_resource(allocatable.get('memory', '0'))
+                            CLUSTER_RESOURCES.labels(
+                                cluster=cluster_name,
+                                resource='memory',
+                                architecture=arch
+                            ).set(memory_capacity)
+                            
+                            # GPU capacity (if available)
+                            gpu_capacity = self.parse_resource(allocatable.get('nvidia.com/gpu', '0'))
+                            if gpu_capacity > 0:
+                                CLUSTER_RESOURCES.labels(
+                                    cluster=cluster_name,
+                                    resource='gpu',
+                                    architecture=arch
+                                ).set(gpu_capacity)
+                
+                except Exception as e:
+                    logger.error(f"Failed to calculate capacity for cluster {cluster_name}: {e}")
+        
+        def parse_resource(self, resource_str):
+            """Parse Kubernetes resource string to numeric value"""
+            try:
+                if isinstance(resource_str, (int, float)):
+                    return float(resource_str)
+                
+                if resource_str.endswith('m'):
+                    return float(resource_str[:-1]) / 1000
+                elif resource_str.endswith('Ki'):
+                    return float(resource_str[:-2]) * 1024
+                elif resource_str.endswith('Mi'):
+                    return float(resource_str[:-2]) * 1024 * 1024
+                elif resource_str.endswith('Gi'):
+                    return float(resource_str[:-2]) * 1024 * 1024 * 1024
+                else:
+                    return float(resource_str)
+            except:
+                return 0.0
+        
+        def manage_workload_distribution(self):
+            """Manage workload distribution across clusters"""
+            try:
+                # Get workload requirements from Prometheus
+                workload_metrics = self.get_workload_metrics()
+                
+                # Analyze resource utilization per cluster
+                for cluster_name in self.cluster_clients.keys():
+                    cluster_utilization = self.get_cluster_utilization(cluster_name)
+                    
+                    # Check if redistribution is needed
+                    if cluster_utilization.get('cpu', 0) > 85:  # High CPU utilization
+                        logger.info(f"Cluster {cluster_name} has high CPU utilization: {cluster_utilization['cpu']}%")
+                        self.suggest_workload_migration(cluster_name, 'cpu')
+                    
+                    if cluster_utilization.get('memory', 0) > 85:  # High memory utilization
+                        logger.info(f"Cluster {cluster_name} has high memory utilization: {cluster_utilization['memory']}%")
+                        self.suggest_workload_migration(cluster_name, 'memory')
+                
+            except Exception as e:
+                logger.error(f"Failed to manage workload distribution: {e}")
+        
+        def get_workload_metrics(self):
+            """Get workload metrics from Prometheus"""
+            try:
+                # Query for resource utilization
+                cpu_query = 'avg by (cluster) (100 - (irate(node_cpu_seconds_total{mode="idle"}[5m]) * 100))'
+                response = requests.get(f"{self.prometheus_url}/api/v1/query", 
+                                       params={'query': cpu_query})
+                
+                workload_metrics = {}
+                if response.status_code == 200:
+                    data = response.json()
+                    for result in data['data']['result']:
+                        cluster = result['metric'].get('cluster', 'unknown')
+                        cpu_util = float(result['value'][1])
+                        workload_metrics[cluster] = {'cpu': cpu_util}
+                
+                return workload_metrics
+                
+            except Exception as e:
+                logger.error(f"Failed to get workload metrics: {e}")
+                return {}
+        
+        def get_cluster_utilization(self, cluster_name):
+            """Get current resource utilization for a cluster"""
+            try:
+                # Query Prometheus for cluster-specific metrics
+                queries = {
+                    'cpu': f'avg(100 - (irate(node_cpu_seconds_total{{cluster="{cluster_name}", mode="idle"}}[5m]) * 100))',
+                    'memory': f'avg((1 - (node_memory_MemAvailable_bytes{{cluster="{cluster_name}"}} / node_memory_MemTotal_bytes{{cluster="{cluster_name}"}})) * 100)'
+                }
+                
+                utilization = {}
+                for resource, query in queries.items():
+                    response = requests.get(f"{self.prometheus_url}/api/v1/query",
+                                           params={'query': query})
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data['data']['result']:
+                            utilization[resource] = float(data['data']['result'][0]['value'][1])
+                        else:
+                            utilization[resource] = 0
+                
+                return utilization
+                
+            except Exception as e:
+                logger.error(f"Failed to get utilization for cluster {cluster_name}: {e}")
+                return {}
+        
+        def suggest_workload_migration(self, overloaded_cluster, resource_type):
+            """Suggest workload migration to less loaded clusters"""
+            try:
+                # Find target clusters with available capacity
+                target_clusters = []
+                
+                for cluster_name in self.cluster_clients.keys():
+                    if cluster_name != overloaded_cluster:
+                        utilization = self.get_cluster_utilization(cluster_name)
+                        if utilization.get(resource_type, 100) < 70:  # Less than 70% utilization
+                            target_clusters.append({
+                                'name': cluster_name,
+                                'utilization': utilization.get(resource_type, 0)
+                            })
+                
+                # Sort by utilization (prefer less loaded clusters)
+                target_clusters.sort(key=lambda x: x['utilization'])
+                
+                if target_clusters:
+                    target_cluster = target_clusters[0]['name']
+                    logger.info(f"Suggesting migration from {overloaded_cluster} to {target_cluster} for {resource_type}")
+                    
+                    # Here you would implement actual workload migration logic
+                    # For now, just log the suggestion
+                    migration_suggestion = {
+                        'source_cluster': overloaded_cluster,
+                        'target_cluster': target_cluster,
+                        'resource_type': resource_type,
+                        'timestamp': datetime.utcnow().isoformat()
+                    }
+                    
+                    # Could send to NATS for processing by other components
+                    logger.info(f"Migration suggestion: {migration_suggestion}")
+                
+            except Exception as e:
+                logger.error(f"Failed to suggest workload migration: {e}")
+        
+        def handle_cluster_failover(self):
+            """Handle cluster failover scenarios"""
+            try:
+                for cluster_name, cluster_config in self.clusters.items():
+                    if cluster_name not in self.cluster_clients:
+                        continue
+                    
+                    # Check if cluster is responsive
+                    try:
+                        self.cluster_clients[cluster_name]['v1'].list_node(timeout_seconds=10)
+                        # Cluster is healthy
+                        continue
+                    except Exception:
+                        # Cluster is unreachable, initiate failover
+                        logger.warning(f"Cluster {cluster_name} is unreachable, initiating failover")
+                        
+                        # Find suitable failover targets
+                        failover_targets = self.find_failover_targets(cluster_name)
+                        
+                        if failover_targets:
+                            target_cluster = failover_targets[0]
+                            logger.info(f"Failing over from {cluster_name} to {target_cluster}")
+                            
+                            FAILOVER_EVENTS.labels(
+                                source=cluster_name,
+                                target=target_cluster,
+                                reason='cluster_unreachable'
+                            ).inc()
+                            
+                            # Implement failover logic here
+                            self.execute_failover(cluster_name, target_cluster)
+                        else:
+                            logger.error(f"No suitable failover targets found for cluster {cluster_name}")
+                
+            except Exception as e:
+                logger.error(f"Failed to handle cluster failover: {e}")
+        
+        def find_failover_targets(self, failed_cluster):
+            """Find suitable clusters for failover"""
+            targets = []
+            
+            failed_cluster_config = self.clusters.get(failed_cluster, {})
+            failed_architectures = set(failed_cluster_config.get('architectures', []))
+            
+            for cluster_name, cluster_config in self.clusters.items():
+                if cluster_name == failed_cluster:
+                    continue
+                
+                if cluster_name not in self.cluster_clients:
+                    continue
+                
+                # Check if target cluster supports required architectures
+                target_architectures = set(cluster_config.get('architectures', []))
+                if failed_architectures.intersection(target_architectures):
+                    # Check cluster health and capacity
+                    utilization = self.get_cluster_utilization(cluster_name)
+                    if utilization.get('cpu', 100) < 80 and utilization.get('memory', 100) < 80:
+                        targets.append(cluster_name)
+            
+            return targets
+        
+        def execute_failover(self, source_cluster, target_cluster):
+            """Execute failover from source to target cluster"""
+            try:
+                # This is a simplified failover implementation
+                # In a real scenario, you would:
+                # 1. Update service mesh routing
+                # 2. Migrate critical workloads
+                # 3. Update DNS entries
+                # 4. Notify monitoring systems
+                
+                logger.info(f"Executing failover: {source_cluster} -> {target_cluster}")
+                
+                # Update routing configuration (placeholder)
+                failover_config = {
+                    'source': source_cluster,
+                    'target': target_cluster,
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'services_affected': ['ml-serving', 'event-driven', 'monitoring']
+                }
+                
+                # Log failover details
+                logger.info(f"Failover configuration: {failover_config}")
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to execute failover: {e}")
+                return False
+        
+        def run(self):
+            """Main cluster management loop"""
+            logger.info("Starting Multi-Cluster Manager")
+            
+            # Start metrics server
+            start_http_server(8080)
+            
+            while True:
+                try:
+                    # Check cluster health
+                    self.check_cluster_health()
+                    
+                    # Calculate cluster capacity
+                    self.calculate_cluster_capacity()
+                    
+                    # Manage workload distribution
+                    self.manage_workload_distribution()
+                    
+                    # Handle failover scenarios
+                    self.handle_cluster_failover()
+                    
+                    logger.info("Cluster management cycle completed")
+                    
+                except Exception as e:
+                    logger.error(f"Error in cluster management cycle: {e}")
+                
+                # Wait before next cycle
+                time.sleep(60)  # Check every minute
+    
+    if __name__ == "__main__":
+        manager = ClusterManager()
+        manager.run()
+
+---
+# Multi-Cluster Ingress Gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multi-cluster-gateway
+  namespace: federation
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: multi-cluster-gateway
+  template:
+    metadata:
+      labels:
+        app: multi-cluster-gateway
+    spec:
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: gateway
+        image: envoyproxy/envoy:v1.27.0
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 8443
+          name: https
+        - containerPort: 9901
+          name: admin
+        volumeMounts:
+        - name: envoy-config
+          mountPath: /etc/envoy
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: 9901
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9901
+      volumes:
+      - name: envoy-config
+        configMap:
+          name: multi-cluster-gateway-config
+
+---
+# Envoy Gateway Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multi-cluster-gateway-config
+  namespace: federation
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 9901 }
+    
+    static_resources:
+      listeners:
+      - name: http_listener
+        address:
+          socket_address: { address: 0.0.0.0, port_value: 8080 }
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: ingress_http
+              codec_type: AUTO
+              route_config:
+                name: local_route
+                virtual_hosts:
+                - name: homelab_services
+                  domains: ["*"]
+                  routes:
+                  # Dashboard routing
+                  - match:
+                      prefix: "/dashboard"
+                    route:
+                      weighted_clusters:
+                        clusters:
+                        - name: homelab-primary-dashboard
+                          weight: 80
+                        - name: homelab-edge-dashboard
+                          weight: 20
+                  
+                  # ML serving routing (prefer GPU cluster)
+                  - match:
+                      prefix: "/ml"
+                    route:
+                      weighted_clusters:
+                        clusters:
+                        - name: homelab-gpu-ml
+                          weight: 70
+                        - name: homelab-primary-ml
+                          weight: 30
+                  
+                  # Monitoring routing
+                  - match:
+                      prefix: "/monitoring"
+                    route:
+                      cluster: homelab-primary-monitoring
+                  
+                  # Default routing
+                  - match:
+                      prefix: "/"
+                    route:
+                      cluster: homelab-primary-default
+              
+              http_filters:
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      
+      clusters:
+      # Primary cluster services
+      - name: homelab-primary-dashboard
+        connect_timeout: 0.25s
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: homelab-primary-dashboard
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: dashboard-ui.default.svc.cluster.local
+                    port_value: 3000
+      
+      - name: homelab-primary-ml
+        connect_timeout: 0.25s
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: homelab-primary-ml
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: tensorflow-serving-amd64.ml-serving.svc.cluster.local
+                    port_value: 8501
+      
+      - name: homelab-primary-monitoring
+        connect_timeout: 0.25s
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: homelab-primary-monitoring
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: grafana.monitoring.svc.cluster.local
+                    port_value: 3000
+      
+      - name: homelab-primary-default
+        connect_timeout: 0.25s
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: homelab-primary-default
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: dashboard-ui.default.svc.cluster.local
+                    port_value: 3000
+
+---
+# Cross-Cluster Service Mesh
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: linkerd-multicluster-config
+  namespace: federation
+data:
+  multicluster.yaml: |
+    # Linkerd multi-cluster configuration
+    multicluster:
+      # Trust configuration
+      trust:
+        domain: homelab.cluster.local
+        issuer:
+          clockSkewAllowance: 20s
+          issuanceLifetime: 24h0m0s
+      
+      # Gateway configuration  
+      gateway:
+        name: linkerd-gateway
+        namespace: linkerd-multicluster
+        port: 4143
+        
+      # Remote cluster configuration
+      remoteClusters:
+        homelab-edge:
+          gatewayAddress: homelab-edge.local
+          gatewayPort: 4143
+          
+        homelab-gpu:
+          gatewayAddress: homelab-gpu.local
+          gatewayPort: 4143
+      
+      # Service mirroring
+      serviceMirror:
+        enabled: true
+        watchedServices:
+          ml-serving:
+          - tensorflow-serving
+          - pytorch-serving
+          - model-registry
+          
+          event-driven:
+          - nats
+          - event-producer
+          
+          monitoring:
+          - prometheus
+          - grafana
+
+---
+# Federation Metrics Aggregator
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: federation-metrics
+  namespace: federation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: federation-metrics
+  template:
+    metadata:
+      labels:
+        app: federation-metrics
+    spec:
+      containers:
+      - name: prometheus-federation
+        image: prom/prometheus:v2.45.0
+        args:
+        - '--config.file=/etc/prometheus/prometheus.yml'
+        - '--storage.tsdb.path=/prometheus'
+        - '--storage.tsdb.retention.time=90d'
+        - '--web.enable-lifecycle'
+        - '--web.enable-admin-api'
+        ports:
+        - containerPort: 9090
+          name: web
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: storage
+          mountPath: /prometheus
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2000m"
+            memory: "8Gi"
+      volumes:
+      - name: config
+        configMap:
+          name: federation-prometheus-config
+      - name: storage
+        persistentVolumeClaim:
+          claimName: federation-metrics-storage
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: federation-prometheus-config
+  namespace: federation
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+      external_labels:
+        cluster: 'federation'
+        region: 'homelab'
+    
+    # Federation configuration - scrape from other clusters
+    scrape_configs:
+    - job_name: 'federate-primary'
+      scrape_interval: 15s
+      honor_labels: true
+      metrics_path: '/federate'
+      params:
+        'match[]':
+          - '{job=~"kubernetes-.*"}'
+          - '{job=~"node-.*"}'
+          - '{__name__=~"cluster:.*"}'
+          - '{__name__=~"ml_.*"}'
+          - '{__name__=~"gpu_.*"}'
+      static_configs:
+        - targets:
+          - 'prometheus.homelab-primary.local:9090'
+    
+    - job_name: 'federate-edge'
+      scrape_interval: 15s
+      honor_labels: true
+      metrics_path: '/federate'
+      params:
+        'match[]':
+          - '{job=~"kubernetes-.*"}'
+          - '{job=~"node-.*"}'
+          - '{__name__=~"cluster:.*"}'
+      static_configs:
+        - targets:
+          - 'prometheus.homelab-edge.local:9090'
+    
+    - job_name: 'federate-gpu'
+      scrape_interval: 15s
+      honor_labels: true
+      metrics_path: '/federate'
+      params:
+        'match[]':
+          - '{job=~"kubernetes-.*"}'
+          - '{job=~"node-.*"}'
+          - '{job=~"gpu-.*"}'
+          - '{__name__=~"cluster:.*"}'
+          - '{__name__=~"ml_.*"}'
+          - '{__name__=~"DCGM_.*"}'
+      static_configs:
+        - targets:
+          - 'prometheus.homelab-gpu.local:9090'
+    
+    # Local metrics
+    - job_name: 'federation-metrics'
+      static_configs:
+        - targets: ['localhost:9090']
+    
+    - job_name: 'cluster-manager'
+      static_configs:
+        - targets: ['cluster-manager:8080']
+    
+    - job_name: 'multi-cluster-gateway'
+      static_configs:
+        - targets: ['multi-cluster-gateway:9901']
+
+---
+# Persistent Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: federation-metrics-storage
+  namespace: federation
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: longhorn-ssd
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: admiral
+  namespace: federation
+spec:
+  selector:
+    app: admiral
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: 8080
+  - name: webhook
+    port: 8090
+    targetPort: 8090
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cluster-manager
+  namespace: federation
+spec:
+  selector:
+    app: cluster-manager
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: multi-cluster-gateway
+  namespace: federation
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: gateway.homelab.local
+spec:
+  type: LoadBalancer
+  selector:
+    app: multi-cluster-gateway
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: https
+    port: 443
+    targetPort: 8443
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: federation-metrics
+  namespace: federation
+spec:
+  selector:
+    app: federation-metrics
+  ports:
+  - port: 9090
+    targetPort: 9090
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admiral
+  namespace: federation
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-manager
+  namespace: federation
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: admiral
+rules:
+- apiGroups: [""]
+  resources: ["services", "endpoints", "namespaces", "secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-manager
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "services", "namespaces"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admiral
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: admiral
+subjects:
+- kind: ServiceAccount
+  name: admiral
+  namespace: federation
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-manager
+subjects:
+- kind: ServiceAccount
+  name: cluster-manager
+  namespace: federation
+
+---
+# Cluster Credentials Secret Template (to be populated with actual credentials)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cluster-credentials
+  namespace: federation
+type: Opaque
+data:
+  # Base64 encoded cluster configurations
+  homelab-edge.yaml: LS0tCiMgRXhhbXBsZSBjbHVzdGVyIGNvbmZpZ3VyYXRpb24KbmFtZTogaG9tZWxhYi1lZGdlCmVuZHBvaW50OiBodHRwczovL2hvbWVsYWItZWRnZS5sb2NhbDo2NDQzCnJlZ2lvbjogcmVnaW9uLTEKem9uZTogem9uZS1iCmFyY2hpdGVjdHVyZXM6IFsiYXJtNjQiLCAiYXJtIl0KY2FwYWJpbGl0aWVzOiBbImVkZ2UiXQ==
+  homelab-gpu.yaml: LS0tCiMgRXhhbXBsZSBHUFUgY2x1c3RlciBjb25maWd1cmF0aW9uCm5hbWU6IGhvbWVsYWItZ3B1CmVuZHBvaW50OiBodHRwczovL2hvbWVsYWItZ3B1LmxvY2FsOjY0NDMKcmVnaW9uOiByZWdpb24tMQp6b25lOiB6b25lLWMKYXJjaGl0ZWN0dXJlczogWyJhbWQ2NCJdCmNhcGFiaWxpdGllczogWyJncHUiLCAiaGlnaC1tZW1vcnkiXQ==

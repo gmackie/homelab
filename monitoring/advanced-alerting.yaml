@@ -1,0 +1,1150 @@
+# Advanced Monitoring and Alerting System for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    name: monitoring
+
+---
+# Prometheus Stack with Multi-Architecture Support
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: 'homelab-multiarch'
+        environment: 'production'
+    
+    # Alerting configuration
+    alerting:
+      alertmanagers:
+      - static_configs:
+        - targets:
+          - alertmanager:9093
+    
+    # Rule files
+    rule_files:
+      - '/etc/prometheus/rules/*.yml'
+    
+    # Scrape configurations
+    scrape_configs:
+      # Node exporter for each architecture
+      - job_name: 'node-amd64'
+        kubernetes_sd_configs:
+        - role: node
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+          regex: amd64
+          action: keep
+        - source_labels: [__address__]
+          regex: '(.*):10250'
+          replacement: '${1}:9100'
+          target_label: __address__
+        - source_labels: [__meta_kubernetes_node_name]
+          target_label: node
+        - target_label: architecture
+          replacement: amd64
+      
+      - job_name: 'node-arm64'
+        kubernetes_sd_configs:
+        - role: node
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+          regex: arm64
+          action: keep
+        - source_labels: [__address__]
+          regex: '(.*):10250'
+          replacement: '${1}:9100'
+          target_label: __address__
+        - source_labels: [__meta_kubernetes_node_name]
+          target_label: node
+        - target_label: architecture
+          replacement: arm64
+      
+      - job_name: 'node-arm'
+        kubernetes_sd_configs:
+        - role: node
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_node_label_kubernetes_io_arch]
+          regex: arm
+          action: keep
+        - source_labels: [__address__]
+          regex: '(.*):10250'
+          replacement: '${1}:9100'
+          target_label: __address__
+        - source_labels: [__meta_kubernetes_node_name]
+          target_label: node
+        - target_label: architecture
+          replacement: arm
+      
+      # Kubernetes metrics
+      - job_name: 'kubernetes-apiservers'
+        kubernetes_sd_configs:
+        - role: endpoints
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+          action: keep
+          regex: default;kubernetes;https
+      
+      # Pod metrics with architecture labels
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+        - role: pod
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+          action: replace
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+          target_label: __address__
+        - action: labelmap
+          regex: __meta_kubernetes_pod_label_(.+)
+        - source_labels: [__meta_kubernetes_namespace]
+          action: replace
+          target_label: kubernetes_namespace
+        - source_labels: [__meta_kubernetes_pod_name]
+          action: replace
+          target_label: kubernetes_pod_name
+        - source_labels: [__meta_kubernetes_pod_node_name]
+          target_label: node
+      
+      # Service endpoints
+      - job_name: 'kubernetes-service-endpoints'
+        kubernetes_sd_configs:
+        - role: endpoints
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+          action: replace
+          target_label: __scheme__
+          regex: (https?)
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+          action: replace
+          target_label: __address__
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+        - action: labelmap
+          regex: __meta_kubernetes_service_label_(.+)
+        - source_labels: [__meta_kubernetes_namespace]
+          action: replace
+          target_label: kubernetes_namespace
+        - source_labels: [__meta_kubernetes_service_name]
+          action: replace
+          target_label: kubernetes_name
+      
+      # Custom application metrics
+      - job_name: 'dashboard-metrics'
+        static_configs:
+        - targets: ['dashboard-api.default:8080']
+      
+      - job_name: 'ml-serving-metrics'
+        static_configs:
+        - targets: ['model-registry.ml-serving:8000']
+      
+      - job_name: 'nats-metrics'
+        static_configs:
+        - targets: ['nats.event-driven:8222']
+      
+      - job_name: 'velero-metrics'
+        static_configs:
+        - targets: ['velero.velero:8085']
+
+---
+# Alert Rules ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+data:
+  alerts.yml: |
+    groups:
+    - name: architecture_alerts
+      interval: 30s
+      rules:
+      # Node-level alerts
+      - alert: NodeDown
+        expr: up{job=~"node-.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: infrastructure
+        annotations:
+          summary: "Node {{ $labels.node }} ({{ $labels.architecture }}) is down"
+          description: "{{ $labels.node }} has been down for more than 2 minutes"
+      
+      - alert: HighCPUUsage
+        expr: (100 - (avg by(node, architecture) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 85
+        for: 5m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "High CPU usage on {{ $labels.node }} ({{ $labels.architecture }})"
+          description: "CPU usage is above 85% (current: {{ $value }}%)"
+      
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "High memory usage on {{ $labels.node }} ({{ $labels.architecture }})"
+          description: "Memory usage is above 85% (current: {{ $value }}%)"
+      
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Low disk space on {{ $labels.node }}"
+          description: "Disk space is below 15% (current: {{ $value }}%)"
+      
+      # Architecture-specific alerts
+      - alert: AMD64WorkloadMisplaced
+        expr: |
+          count by(pod) (
+            kube_pod_labels{label_workload_type="heavy"} 
+            * on(pod) group_left(node) kube_pod_info
+            * on(node) group_left(architecture) kube_node_labels{label_kubernetes_io_arch!="amd64"}
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: scheduling
+        annotations:
+          summary: "Heavy workload running on non-AMD64 node"
+          description: "Pod {{ $labels.pod }} requires AMD64 but is running on different architecture"
+      
+      - alert: PowerConsumptionHigh
+        expr: |
+          sum(
+            rate(node_cpu_seconds_total[5m]) * 45 * on(node) group_left() kube_node_labels{label_kubernetes_io_arch="amd64"} +
+            rate(node_cpu_seconds_total[5m]) * 7 * on(node) group_left() kube_node_labels{label_kubernetes_io_arch="arm64"} +
+            rate(node_cpu_seconds_total[5m]) * 3 * on(node) group_left() kube_node_labels{label_kubernetes_io_arch="arm"}
+          ) > 100
+        for: 10m
+        labels:
+          severity: warning
+          component: power
+        annotations:
+          summary: "Cluster power consumption exceeds 100W"
+          description: "Estimated power consumption: {{ $value }}W"
+      
+      # Service-level alerts
+      - alert: DashboardDown
+        expr: up{job="dashboard-metrics"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: dashboard
+        annotations:
+          summary: "Dashboard is down"
+          description: "Dashboard has been unavailable for more than 2 minutes"
+      
+      - alert: MLServingLatencyHigh
+        expr: histogram_quantile(0.99, rate(ml_inference_duration_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: ml
+        annotations:
+          summary: "ML inference latency is high"
+          description: "99th percentile latency is {{ $value }}s (threshold: 0.5s)"
+      
+      - alert: EventBacklogHigh
+        expr: nats_consumer_pending_messages > 10000
+        for: 5m
+        labels:
+          severity: warning
+          component: events
+        annotations:
+          summary: "NATS event backlog is high"
+          description: "{{ $value }} messages pending in queue"
+      
+      - alert: BackupFailed
+        expr: increase(velero_backup_failure_total[1h]) > 0
+        labels:
+          severity: critical
+          component: backup
+        annotations:
+          summary: "Backup failed"
+          description: "{{ $value }} backup failures in the last hour"
+      
+      # Cross-architecture communication
+      - alert: CrossArchLatencyHigh
+        expr: |
+          histogram_quantile(0.95, 
+            rate(http_request_duration_seconds_bucket{source_arch!="",target_arch!="",source_arch!=target_arch}[5m])
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: networking
+        annotations:
+          summary: "High latency between architectures"
+          description: "Cross-architecture latency: {{ $value }}s (threshold: 50ms)"
+
+---
+# Prometheus Deployment
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  serviceName: prometheus
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: prometheus
+      # Run on AMD64 for performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.45.0
+        args:
+          - '--config.file=/etc/prometheus/prometheus.yml'
+          - '--storage.tsdb.path=/prometheus'
+          - '--storage.tsdb.retention.time=30d'
+          - '--storage.tsdb.retention.size=10GB'
+          - '--web.enable-lifecycle'
+        ports:
+        - containerPort: 9090
+          name: web
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: rules
+          mountPath: /etc/prometheus/rules
+        - name: prometheus-storage
+          mountPath: /prometheus
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+      - name: rules
+        configMap:
+          name: prometheus-rules
+  volumeClaimTemplates:
+  - metadata:
+      name: prometheus-storage
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ssd
+      resources:
+        requests:
+          storage: 50Gi
+
+---
+# AlertManager Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: alertmanager
+        image: prom/alertmanager:v0.26.0
+        ports:
+        - containerPort: 9093
+          name: web
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/alertmanager
+        - name: alertmanager-storage
+          mountPath: /alertmanager
+      volumes:
+      - name: config
+        configMap:
+          name: alertmanager-config
+      - name: alertmanager-storage
+        emptyDir: {}
+
+---
+# AlertManager Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+    
+    route:
+      group_by: ['alertname', 'cluster', 'service', 'architecture']
+      group_wait: 10s
+      group_interval: 10s
+      repeat_interval: 12h
+      receiver: 'homelab-alerts'
+      
+      routes:
+      - match:
+          severity: critical
+        receiver: 'critical-alerts'
+        continue: true
+      
+      - match:
+          component: backup
+        receiver: 'backup-alerts'
+        continue: true
+      
+      - match:
+          component: power
+        receiver: 'power-alerts'
+        continue: true
+    
+    receivers:
+    - name: 'homelab-alerts'
+      webhook_configs:
+      - url: 'http://alert-webhook.monitoring:8080/alerts'
+        send_resolved: true
+    
+    - name: 'critical-alerts'
+      webhook_configs:
+      - url: 'http://alert-webhook.monitoring:8080/critical'
+        send_resolved: true
+    
+    - name: 'backup-alerts'
+      webhook_configs:
+      - url: 'http://alert-webhook.monitoring:8080/backup'
+        send_resolved: true
+    
+    - name: 'power-alerts'
+      webhook_configs:
+      - url: 'http://alert-webhook.monitoring:8080/power'
+        send_resolved: true
+
+---
+# Grafana Deployment with Multi-Arch Dashboards
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: grafana
+        image: grafana/grafana:10.0.0
+        ports:
+        - containerPort: 3000
+          name: web
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: "admin123"
+        - name: GF_INSTALL_PLUGINS
+          value: "grafana-piechart-panel,grafana-worldmap-panel"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        volumeMounts:
+        - name: grafana-storage
+          mountPath: /var/lib/grafana
+        - name: grafana-datasources
+          mountPath: /etc/grafana/provisioning/datasources
+        - name: grafana-dashboards
+          mountPath: /etc/grafana/provisioning/dashboards
+        - name: dashboard-definitions
+          mountPath: /var/lib/grafana/dashboards
+      volumes:
+      - name: grafana-storage
+        persistentVolumeClaim:
+          claimName: grafana-pvc
+      - name: grafana-datasources
+        configMap:
+          name: grafana-datasources
+      - name: grafana-dashboards
+        configMap:
+          name: grafana-dashboards
+      - name: dashboard-definitions
+        configMap:
+          name: dashboard-definitions
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-pvc
+  namespace: monitoring
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: longhorn-ssd
+
+---
+# Grafana Datasources
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      url: http://prometheus:9090
+      isDefault: true
+      editable: false
+    
+    - name: Elasticsearch-Tracing
+      type: elasticsearch
+      access: proxy
+      url: http://elasticsearch.tracing:9200
+      database: "jaeger-*"
+      editable: false
+      jsonData:
+        esVersion: "7.10.0"
+        timeField: "@timestamp"
+    
+    - name: Elasticsearch-Logging
+      type: elasticsearch
+      access: proxy
+      url: http://elasticsearch.logging:9200
+      database: "logstash-*"
+      editable: false
+      jsonData:
+        esVersion: "7.10.0"
+        timeField: "@timestamp"
+
+---
+# Grafana Dashboard Provisioning
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+data:
+  dashboards.yml: |
+    apiVersion: 1
+    providers:
+    - name: 'default'
+      orgId: 1
+      folder: ''
+      type: file
+      disableDeletion: false
+      updateIntervalSeconds: 10
+      allowUiUpdates: true
+      options:
+        path: /var/lib/grafana/dashboards
+
+---
+# Dashboard Definitions
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dashboard-definitions
+  namespace: monitoring
+data:
+  multi-arch-overview.json: |
+    {
+      "dashboard": {
+        "title": "Multi-Architecture Homelab Overview",
+        "uid": "multi-arch-overview",
+        "panels": [
+          {
+            "title": "Architecture Distribution",
+            "type": "piechart",
+            "targets": [
+              {
+                "expr": "count(up{job=~\"node-.*\"}) by (architecture)"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0}
+          },
+          {
+            "title": "Power Consumption by Architecture",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum(rate(node_cpu_seconds_total[5m]) * 45) by (architecture)",
+                "legendFormat": "AMD64"
+              },
+              {
+                "expr": "sum(rate(node_cpu_seconds_total[5m]) * 7) by (architecture)",
+                "legendFormat": "ARM64"
+              },
+              {
+                "expr": "sum(rate(node_cpu_seconds_total[5m]) * 3) by (architecture)",
+                "legendFormat": "ARM"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0}
+          },
+          {
+            "title": "Total Estimated Power",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "sum(rate(node_cpu_seconds_total[5m]) * 45 * on(node) group_left() kube_node_labels{label_kubernetes_io_arch=\"amd64\"}) + sum(rate(node_cpu_seconds_total[5m]) * 7 * on(node) group_left() kube_node_labels{label_kubernetes_io_arch=\"arm64\"}) + sum(rate(node_cpu_seconds_total[5m]) * 3 * on(node) group_left() kube_node_labels{label_kubernetes_io_arch=\"arm\"})"
+              }
+            ],
+            "gridPos": {"h": 4, "w": 8, "x": 16, "y": 0}
+          },
+          {
+            "title": "CPU Usage by Architecture",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "avg(100 - (irate(node_cpu_seconds_total{mode=\"idle\"}[5m]) * 100)) by (architecture)"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+          },
+          {
+            "title": "Memory Usage by Architecture",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "avg((1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100) by (architecture)"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+          },
+          {
+            "title": "Pod Distribution",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "count(kube_pod_info) by (node, namespace)"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+          }
+        ]
+      }
+    }
+
+  ml-serving-dashboard.json: |
+    {
+      "dashboard": {
+        "title": "ML Serving Performance",
+        "uid": "ml-serving",
+        "panels": [
+          {
+            "title": "Inference Requests/sec by Model",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "rate(ml_inference_requests_total[5m])"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+          {
+            "title": "Inference Latency P99",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.99, rate(ml_inference_duration_seconds_bucket[5m]))"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+          {
+            "title": "Model Memory Usage",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "ml_model_memory_bytes"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+          },
+          {
+            "title": "GPU Utilization",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "gpu_utilization_percent"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+          }
+        ]
+      }
+    }
+
+---
+# Alert Webhook Receiver
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-webhook
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alert-webhook
+  template:
+    metadata:
+      labels:
+        app: alert-webhook
+    spec:
+      containers:
+      - name: webhook
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install flask requests prometheus-client nats-py
+          python3 /app/webhook.py
+        ports:
+        - containerPort: 8080
+        env:
+        - name: NATS_URL
+          value: "nats://nats.event-driven:4222"
+        - name: DASHBOARD_URL
+          value: "http://dashboard-api.default:8080"
+        volumeMounts:
+        - name: webhook-app
+          mountPath: /app
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+      volumes:
+      - name: webhook-app
+        configMap:
+          name: webhook-app
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-app
+  namespace: monitoring
+data:
+  webhook.py: |
+    #!/usr/bin/env python3
+    import json
+    import logging
+    import os
+    import asyncio
+    from datetime import datetime
+    from flask import Flask, request, jsonify
+    import requests
+    import nats
+    from prometheus_client import Counter, Histogram, generate_latest
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    app = Flask(__name__)
+    
+    # Metrics
+    ALERTS_RECEIVED = Counter('alerts_received_total', 'Total alerts received', ['severity', 'component'])
+    ALERTS_PROCESSED = Counter('alerts_processed_total', 'Total alerts processed', ['severity', 'status'])
+    ALERT_PROCESSING_TIME = Histogram('alert_processing_seconds', 'Alert processing time')
+    
+    class AlertProcessor:
+        def __init__(self):
+            self.nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
+            self.dashboard_url = os.getenv("DASHBOARD_URL", "http://localhost:8080")
+            
+        async def send_to_nats(self, alert_data):
+            """Send alert to NATS event stream"""
+            try:
+                nc = await nats.connect(self.nats_url)
+                
+                event = {
+                    "specversion": "1.0",
+                    "type": "io.homelab.alert",
+                    "source": "alertmanager",
+                    "id": alert_data.get("groupKey", "unknown"),
+                    "time": datetime.utcnow().isoformat(),
+                    "data": alert_data
+                }
+                
+                await nc.publish("events.alerts", json.dumps(event).encode())
+                await nc.close()
+                
+                logger.info(f"Alert sent to NATS: {alert_data.get('groupLabels', {})}")
+                
+            except Exception as e:
+                logger.error(f"Failed to send alert to NATS: {e}")
+        
+        def update_dashboard(self, alert_data):
+            """Update dashboard with alert status"""
+            try:
+                # Extract alert information
+                alerts = alert_data.get("alerts", [])
+                
+                for alert in alerts:
+                    dashboard_update = {
+                        "type": "alert",
+                        "status": alert.get("status"),
+                        "labels": alert.get("labels", {}),
+                        "annotations": alert.get("annotations", {}),
+                        "startsAt": alert.get("startsAt"),
+                        "endsAt": alert.get("endsAt")
+                    }
+                    
+                    # Send to dashboard API
+                    response = requests.post(
+                        f"{self.dashboard_url}/api/alerts",
+                        json=dashboard_update,
+                        timeout=5
+                    )
+                    
+                    if response.status_code == 200:
+                        logger.info(f"Dashboard updated with alert: {alert.get('labels', {}).get('alertname')}")
+                    else:
+                        logger.warning(f"Failed to update dashboard: {response.status_code}")
+                        
+            except Exception as e:
+                logger.error(f"Failed to update dashboard: {e}")
+        
+        def process_critical_alert(self, alert_data):
+            """Special handling for critical alerts"""
+            logger.warning(f"CRITICAL ALERT: {alert_data}")
+            
+            # Trigger immediate remediation if applicable
+            alerts = alert_data.get("alerts", [])
+            for alert in alerts:
+                alert_name = alert.get("labels", {}).get("alertname")
+                
+                if alert_name == "NodeDown":
+                    # Attempt node recovery
+                    logger.info("Attempting node recovery procedures...")
+                    # Add node recovery logic here
+                    
+                elif alert_name == "BackupFailed":
+                    # Trigger immediate backup retry
+                    logger.info("Triggering backup retry...")
+                    # Add backup retry logic here
+                    
+                elif alert_name == "DashboardDown":
+                    # Attempt dashboard restart
+                    logger.info("Attempting dashboard restart...")
+                    # Add dashboard restart logic here
+        
+        def analyze_power_consumption(self, alert_data):
+            """Analyze and optimize power consumption"""
+            alerts = alert_data.get("alerts", [])
+            
+            for alert in alerts:
+                if alert.get("labels", {}).get("component") == "power":
+                    # Get current power metrics
+                    annotations = alert.get("annotations", {})
+                    description = annotations.get("description", "")
+                    
+                    # Extract power value if present
+                    if "W" in description:
+                        try:
+                            power_str = description.split(":")[1].strip()
+                            power_value = float(power_str.replace("W", ""))
+                            
+                            if power_value > 100:
+                                logger.warning(f"High power consumption detected: {power_value}W")
+                                # Suggest optimizations
+                                self.suggest_power_optimizations(power_value)
+                        except:
+                            pass
+        
+        def suggest_power_optimizations(self, current_power):
+            """Suggest power optimization strategies"""
+            suggestions = []
+            
+            if current_power > 150:
+                suggestions.append("Consider migrating heavy workloads to time-based scheduling")
+                suggestions.append("Review AMD64 node utilization for consolidation opportunities")
+            elif current_power > 100:
+                suggestions.append("Consider shifting non-critical workloads to ARM64 nodes")
+                suggestions.append("Review resource requests and limits for over-provisioning")
+            
+            for suggestion in suggestions:
+                logger.info(f"Power optimization suggestion: {suggestion}")
+    
+    processor = AlertProcessor()
+    
+    @app.route('/alerts', methods=['POST'])
+    @ALERT_PROCESSING_TIME.time()
+    def handle_alerts():
+        """Generic alert handler"""
+        try:
+            alert_data = request.json
+            
+            # Extract alert metadata
+            status = alert_data.get("status", "unknown")
+            alerts = alert_data.get("alerts", [])
+            
+            for alert in alerts:
+                severity = alert.get("labels", {}).get("severity", "unknown")
+                component = alert.get("labels", {}).get("component", "unknown")
+                
+                ALERTS_RECEIVED.labels(severity=severity, component=component).inc()
+                
+                # Process alert
+                asyncio.run(processor.send_to_nats(alert_data))
+                processor.update_dashboard(alert_data)
+                
+                ALERTS_PROCESSED.labels(severity=severity, status="success").inc()
+            
+            return jsonify({"status": "processed", "alerts": len(alerts)}), 200
+            
+        except Exception as e:
+            logger.error(f"Failed to process alert: {e}")
+            ALERTS_PROCESSED.labels(severity="unknown", status="error").inc()
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/critical', methods=['POST'])
+    def handle_critical():
+        """Critical alert handler with immediate action"""
+        try:
+            alert_data = request.json
+            processor.process_critical_alert(alert_data)
+            return handle_alerts()
+        except Exception as e:
+            logger.error(f"Failed to process critical alert: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/power', methods=['POST'])
+    def handle_power():
+        """Power alert handler with optimization suggestions"""
+        try:
+            alert_data = request.json
+            processor.analyze_power_consumption(alert_data)
+            return handle_alerts()
+        except Exception as e:
+            logger.error(f"Failed to process power alert: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/backup', methods=['POST'])
+    def handle_backup():
+        """Backup alert handler"""
+        try:
+            alert_data = request.json
+            
+            # Special handling for backup alerts
+            alerts = alert_data.get("alerts", [])
+            for alert in alerts:
+                if alert.get("status") == "firing":
+                    logger.error(f"BACKUP FAILURE: {alert.get('annotations', {}).get('description')}")
+                    # Could trigger immediate backup retry here
+            
+            return handle_alerts()
+        except Exception as e:
+            logger.error(f"Failed to process backup alert: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/metrics', methods=['GET'])
+    def metrics():
+        """Prometheus metrics endpoint"""
+        return generate_latest()
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        """Health check endpoint"""
+        return jsonify({"status": "healthy"}), 200
+    
+    if __name__ == "__main__":
+        logger.info("Starting Alert Webhook Receiver")
+        app.run(host='0.0.0.0', port=8080)
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - port: 9090
+    targetPort: 9090
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  selector:
+    app: alertmanager
+  ports:
+  - port: 9093
+    targetPort: 9093
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  selector:
+    app: grafana
+  ports:
+  - port: 3000
+    targetPort: 3000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-webhook
+  namespace: monitoring
+spec:
+  selector:
+    app: alert-webhook
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/proxy
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions"]
+  resources:
+  - ingresses
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: monitoring

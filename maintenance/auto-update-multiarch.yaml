@@ -1,0 +1,420 @@
+# Automatic updates and maintenance for multi-architecture cluster
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: system-maintenance
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: update-scripts
+  namespace: system-maintenance
+data:
+  update-amd64.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Starting AMD64 node updates..."
+    
+    # Update package lists
+    apt-get update
+    
+    # Security updates only (non-interactive)
+    DEBIAN_FRONTEND=noninteractive apt-get -y upgrade \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      $(apt list --upgradable 2>/dev/null | grep -E "(security|stable)" | cut -d'/' -f1)
+    
+    # Update k3s if needed
+    if [ -f /usr/local/bin/k3s ]; then
+      CURRENT_VERSION=$(k3s --version | head -1 | awk '{print $3}')
+      LATEST_VERSION=$(curl -s https://api.github.com/repos/k3s-io/k3s/releases/latest | grep tag_name | cut -d '"' -f 4)
+      
+      if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
+        echo "Updating k3s from $CURRENT_VERSION to $LATEST_VERSION"
+        curl -sfL https://get.k3s.io | sh -
+        systemctl restart k3s
+      fi
+    fi
+    
+    # Clean up
+    apt-get autoremove -y
+    apt-get autoclean
+    
+    echo "AMD64 node update completed"
+
+  update-arm.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Starting ARM node updates..."
+    
+    # ARM-specific optimizations
+    if [ -f /boot/config.txt ]; then
+      echo "Detected Raspberry Pi"
+      
+      # Update firmware (Pi-specific)
+      if command -v rpi-update >/dev/null 2>&1; then
+        echo "Updating Raspberry Pi firmware..."
+        SKIP_BACKUP=1 rpi-update
+      fi
+    fi
+    
+    # Update packages (conservative approach for ARM)
+    apt-get update
+    
+    # Only security updates for ARM to maintain stability
+    DEBIAN_FRONTEND=noninteractive apt-get -y upgrade \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      $(apt list --upgradable 2>/dev/null | grep security | cut -d'/' -f1)
+    
+    # Update k3s agent if needed
+    if [ -f /usr/local/bin/k3s ]; then
+      CURRENT_VERSION=$(k3s --version | head -1 | awk '{print $3}')
+      LATEST_VERSION=$(curl -s https://api.github.com/repos/k3s-io/k3s/releases/latest | grep tag_name | cut -d '"' -f 4)
+      
+      if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
+        echo "Updating k3s agent from $CURRENT_VERSION to $LATEST_VERSION"
+        curl -sfL https://get.k3s.io | K3S_URL=$K3S_URL K3S_TOKEN=$K3S_TOKEN sh -
+        systemctl restart k3s-agent
+      fi
+    fi
+    
+    # Clean up
+    apt-get autoremove -y
+    apt-get autoclean
+    
+    echo "ARM node update completed"
+
+  health-check.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Performing post-update health checks..."
+    
+    # Check system resources
+    echo "=== System Resources ==="
+    df -h
+    free -h
+    uptime
+    
+    # Check k3s status
+    echo "=== k3s Status ==="
+    if systemctl is-active --quiet k3s; then
+      echo "k3s server is running"
+    elif systemctl is-active --quiet k3s-agent; then
+      echo "k3s agent is running"
+    else
+      echo "WARNING: k3s is not running!"
+      exit 1
+    fi
+    
+    # Check critical services
+    echo "=== Critical Services ==="
+    for service in docker containerd; do
+      if systemctl is-active --quiet $service; then
+        echo "$service: OK"
+      else
+        echo "WARNING: $service is not running!"
+      fi
+    done
+    
+    # Architecture-specific checks
+    ARCH=$(uname -m)
+    echo "=== Architecture: $ARCH ==="
+    
+    if [ "$ARCH" = "x86_64" ]; then
+      # AMD64 specific checks
+      echo "Checking NVMe storage..."
+      nvme list 2>/dev/null || echo "No NVMe devices found"
+    else
+      # ARM specific checks
+      echo "Checking temperature..."
+      if [ -f /sys/class/thermal/thermal_zone0/temp ]; then
+        temp=$(cat /sys/class/thermal/thermal_zone0/temp)
+        temp_c=$((temp / 1000))
+        echo "CPU temperature: ${temp_c}°C"
+        
+        if [ $temp_c -gt 80 ]; then
+          echo "WARNING: CPU temperature is high!"
+        fi
+      fi
+    fi
+    
+    echo "Health check completed"
+
+---
+# AMD64 node update job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: amd64-updates
+  namespace: system-maintenance
+spec:
+  schedule: "0 2 * * 0"  # Weekly on Sunday at 2 AM
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          hostNetwork: true
+          hostPID: true
+          nodeSelector:
+            kubernetes.io/arch: amd64
+          tolerations:
+          - operator: Exists
+          containers:
+          - name: updater
+            image: ubuntu:22.04
+            securityContext:
+              privileged: true
+            command: ["/bin/bash"]
+            args:
+            - -c
+            - |
+              # Mount host filesystem
+              chroot /host /bin/bash -c "
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                cd /tmp
+                $(cat /scripts/update-amd64.sh)
+                $(cat /scripts/health-check.sh)
+              "
+            volumeMounts:
+            - name: host
+              mountPath: /host
+            - name: update-scripts
+              mountPath: /scripts
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "100m"
+              limits:
+                memory: "512Mi"
+                cpu: "500m"
+          volumes:
+          - name: host
+            hostPath:
+              path: /
+          - name: update-scripts
+            configMap:
+              name: update-scripts
+              defaultMode: 0755
+          restartPolicy: OnFailure
+
+---
+# ARM node update job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: arm-updates
+  namespace: system-maintenance
+spec:
+  schedule: "0 3 * * 0"  # Weekly on Sunday at 3 AM (after AMD64)
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          hostNetwork: true
+          hostPID: true
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          tolerations:
+          - operator: Exists
+          containers:
+          - name: updater
+            image: ubuntu:22.04
+            securityContext:
+              privileged: true
+            command: ["/bin/bash"]
+            args:
+            - -c
+            - |
+              # Mount host filesystem  
+              chroot /host /bin/bash -c "
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                export K3S_URL=${K3S_URL}
+                export K3S_TOKEN=${K3S_TOKEN}
+                cd /tmp
+                $(cat /scripts/update-arm.sh)
+                $(cat /scripts/health-check.sh)
+              "
+            env:
+            - name: K3S_URL
+              value: "https://192.168.1.100:6443"
+            - name: K3S_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k3s-token
+                  key: token
+            volumeMounts:
+            - name: host
+              mountPath: /host
+            - name: update-scripts
+              mountPath: /scripts
+            resources:
+              requests:
+                memory: "128Mi"
+                cpu: "50m"
+              limits:
+                memory: "256Mi"
+                cpu: "200m"
+          volumes:
+          - name: host
+            hostPath:
+              path: /
+          - name: update-scripts
+            configMap:
+              name: update-scripts
+              defaultMode: 0755
+          restartPolicy: OnFailure
+
+---
+# Container image update job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: container-updates
+  namespace: system-maintenance
+spec:
+  schedule: "0 1 * * 1"  # Weekly on Monday at 1 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: amd64  # Run on powerful node
+          containers:
+          - name: image-updater
+            image: argoproj/argocd-cli:latest
+            command: ["/bin/sh"]
+            args:
+            - -c
+            - |
+              echo "Checking for container image updates..."
+              
+              # Install kubectl
+              curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+              chmod +x kubectl
+              mv kubectl /usr/local/bin/
+              
+              # Check for deployments with outdated images
+              kubectl get deployments --all-namespaces -o json | \
+                jq -r '.items[] | select(.spec.template.spec.containers[].image | contains(":latest") | not) | 
+                "\(.metadata.namespace)/\(.metadata.name): \(.spec.template.spec.containers[].image)"'
+              
+              # Update images (careful approach)
+              DEPLOYMENTS=$(kubectl get deployments --all-namespaces -o json | \
+                jq -r '.items[] | select(.metadata.labels.auto_update == "true") | 
+                "\(.metadata.namespace) \(.metadata.name)"')
+              
+              for deployment in $DEPLOYMENTS; do
+                namespace=$(echo $deployment | awk '{print $1}')
+                name=$(echo $deployment | awk '{print $2}')
+                
+                echo "Updating deployment $namespace/$name"
+                kubectl rollout restart deployment/$name -n $namespace
+              done
+              
+              echo "Container update check completed"
+            resources:
+              requests:
+                memory: "128Mi"
+                cpu: "50m"
+              limits:
+                memory: "256Mi"
+                cpu: "200m"
+          restartPolicy: OnFailure
+
+---
+# Cluster maintenance job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cluster-maintenance
+  namespace: system-maintenance
+spec:
+  schedule: "0 4 * * 0"  # Weekly on Sunday at 4 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: amd64
+          containers:
+          - name: maintenance
+            image: bitnami/kubectl:latest
+            command: ["/bin/bash"]
+            args:
+            - -c
+            - |
+              echo "Starting cluster maintenance..."
+              
+              # Clean up completed jobs
+              kubectl delete jobs --field-selector status.successful=1 --all-namespaces
+              
+              # Clean up old replicasets
+              kubectl get replicasets --all-namespaces -o json | \
+                jq '.items[] | select(.status.replicas==0) | "\(.metadata.namespace) \(.metadata.name)"' -r | \
+                while read ns name; do
+                  kubectl delete replicaset $name -n $ns
+                done
+              
+              # Clean up unused ConfigMaps and Secrets (be careful!)
+              kubectl get configmaps --all-namespaces -o json | \
+                jq '.items[] | select(.metadata.labels.cleanup == "true") | "\(.metadata.namespace) \(.metadata.name)"' -r | \
+                while read ns name; do
+                  kubectl delete configmap $name -n $ns
+                done
+              
+              # Prune unused images on all nodes
+              kubectl get nodes -o json | jq -r '.items[].metadata.name' | \
+                while read node; do
+                  echo "Pruning images on $node"
+                  kubectl debug node/$node -it --image=alpine -- chroot /host docker image prune -f
+                done
+              
+              # Generate cluster health report
+              echo "=== Cluster Health Report ===" > /tmp/health-report.txt
+              echo "Date: $(date)" >> /tmp/health-report.txt
+              echo "" >> /tmp/health-report.txt
+              
+              echo "Nodes:" >> /tmp/health-report.txt
+              kubectl get nodes -o wide >> /tmp/health-report.txt
+              
+              echo "" >> /tmp/health-report.txt
+              echo "Resource Usage by Architecture:" >> /tmp/health-report.txt
+              kubectl top nodes --sort-by=cpu >> /tmp/health-report.txt
+              
+              echo "" >> /tmp/health-report.txt
+              echo "Pod Distribution:" >> /tmp/health-report.txt
+              kubectl get pods --all-namespaces -o wide | \
+                awk '{print $7}' | sort | uniq -c >> /tmp/health-report.txt
+              
+              cat /tmp/health-report.txt
+              echo "Cluster maintenance completed"
+            resources:
+              requests:
+                memory: "128Mi" 
+                cpu: "50m"
+              limits:
+                memory: "256Mi"
+                cpu: "200m"
+          restartPolicy: OnFailure
+
+---
+# Secret for k3s token (create this manually)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k3s-token
+  namespace: system-maintenance
+type: Opaque
+data:
+  # Replace with actual k3s token (base64 encoded)
+  token: <BASE64_ENCODED_K3S_TOKEN>

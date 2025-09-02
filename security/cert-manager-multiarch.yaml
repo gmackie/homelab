@@ -1,0 +1,353 @@
+# Certificate management for multi-architecture homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager
+
+---
+# Cert-manager CRDs and deployment (use official manifests)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-manager-install
+  namespace: cert-manager
+data:
+  install.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Installing cert-manager..."
+    
+    # Install cert-manager CRDs
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.1/cert-manager.crds.yaml
+    
+    # Install cert-manager (supports multi-arch)
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.1/cert-manager.yaml
+    
+    # Wait for cert-manager to be ready
+    kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=cert-manager -n cert-manager --timeout=300s
+    kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=cainjector -n cert-manager --timeout=300s
+    kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=webhook -n cert-manager --timeout=300s
+    
+    echo "cert-manager installation complete"
+
+---
+# Self-signed ClusterIssuer for internal certificates
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-issuer
+spec:
+  selfSigned: {}
+
+---
+# Internal CA Certificate
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: homelab-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: "Homelab Root CA"
+  secretName: homelab-ca-secret
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+  subject:
+    organizationalUnits:
+    - "Homelab"
+    organizations:
+    - "Homelab Infrastructure"
+    countries:
+    - "US"
+
+---
+# Internal CA ClusterIssuer
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: homelab-ca-issuer
+spec:
+  ca:
+    secretName: homelab-ca-secret
+
+---
+# Let's Encrypt ClusterIssuer (for external domains)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@homelab.local  # Change this to your email
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          class: traefik
+      selector:
+        dnsZones:
+        - "your-domain.com"  # Change to your actual domain
+
+---
+# Let's Encrypt Staging (for testing)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: admin@homelab.local
+    privateKeySecretRef:
+      name: letsencrypt-staging
+    solvers:
+    - http01:
+        ingress:
+          class: traefik
+
+---
+# Internal service certificates
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dashboard-tls
+  namespace: dashboard
+spec:
+  secretName: dashboard-tls
+  issuerRef:
+    name: homelab-ca-issuer
+    kind: ClusterIssuer
+  dnsNames:
+  - dashboard.homelab.local
+  - dashboard.internal
+  - localhost
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: traefik-tls
+  namespace: traefik-system
+spec:
+  secretName: traefik-tls
+  issuerRef:
+    name: homelab-ca-issuer
+    kind: ClusterIssuer
+  dnsNames:
+  - traefik.homelab.local
+  - traefik-dashboard.homelab.local
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: prometheus-tls
+  namespace: monitoring
+spec:
+  secretName: prometheus-tls
+  issuerRef:
+    name: homelab-ca-issuer
+    kind: ClusterIssuer
+  dnsNames:
+  - prometheus.homelab.local
+  - monitoring.homelab.local
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pihole-tls
+  namespace: dns-system
+spec:
+  secretName: pihole-tls
+  issuerRef:
+    name: homelab-ca-issuer
+    kind: ClusterIssuer
+  dnsNames:
+  - pihole.homelab.local
+  - dns.homelab.local
+
+---
+# Certificate monitoring and rotation
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cert-monitor
+  namespace: cert-manager
+spec:
+  schedule: "0 6 * * *"  # Daily at 6 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/arch: amd64  # Run on powerful nodes
+          containers:
+          - name: cert-monitor
+            image: bitnami/kubectl:latest
+            command: ["/bin/bash"]
+            args:
+            - -c
+            - |
+              echo "Monitoring certificate health..."
+              
+              # Check certificate status
+              kubectl get certificates --all-namespaces -o wide
+              
+              # Check for certificates expiring soon (30 days)
+              echo "Checking certificates expiring within 30 days..."
+              kubectl get certificates --all-namespaces -o json | \
+                jq -r '.items[] | select(.status.notAfter != null) |
+                select(((.status.notAfter | fromdate) - now) < (30 * 24 * 3600)) |
+                "\(.metadata.namespace)/\(.metadata.name): expires \(.status.notAfter)"'
+              
+              # Check for failed certificates
+              echo "Checking for failed certificates..."
+              kubectl get certificates --all-namespaces -o json | \
+                jq -r '.items[] | select(.status.conditions[]?.type == "Ready" and .status.conditions[]?.status == "False") |
+                "\(.metadata.namespace)/\(.metadata.name): \(.status.conditions[]?.message)"'
+              
+              # Force renewal of certificates expiring within 7 days
+              echo "Force renewing certificates expiring within 7 days..."
+              kubectl get certificates --all-namespaces -o json | \
+                jq -r '.items[] | select(.status.notAfter != null) |
+                select(((.status.notAfter | fromdate) - now) < (7 * 24 * 3600)) |
+                "\(.metadata.namespace) \(.metadata.name)"' | \
+                while read ns name; do
+                  echo "Renewing certificate $ns/$name"
+                  kubectl annotate certificate $name -n $ns cert-manager.io/issue-temporary-certificate="true" --overwrite
+                done
+              
+              echo "Certificate monitoring completed"
+            resources:
+              requests:
+                memory: "64Mi"
+                cpu: "50m"
+              limits:
+                memory: "128Mi"
+                cpu: "100m"
+          restartPolicy: OnFailure
+
+---
+# Webhook configuration for automatic certificate injection
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionWebhook
+metadata:
+  name: cert-injector
+  annotations:
+    cert-manager.io/inject-ca-from: cert-manager/homelab-ca
+rules:
+- operations: [ "CREATE" ]
+  apiGroups: ["networking.k8s.io"]
+  apiVersions: ["v1"]
+  resources: ["ingresses"]
+webhooks:
+- name: cert-injector.homelab.local
+  clientConfig:
+    service:
+      name: cert-injector
+      namespace: cert-manager
+      path: "/mutate"
+  rules:
+  - operations: [ "CREATE" ]
+    apiGroups: ["networking.k8s.io"]
+    apiVersions: ["v1"]
+    resources: ["ingresses"]
+  admissionReviewVersions: ["v1", "v1beta1"]
+  sideEffects: None
+  failurePolicy: Ignore
+
+---
+# Trust bundle for internal CA
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ca-bundle
+  namespace: kube-system
+data:
+  ca-bundle.crt: |
+    # This will be populated by cert-manager with the CA certificate
+    # Use: kubectl get secret homelab-ca-secret -n cert-manager -o jsonpath='{.data.tls\.crt}' | base64 -d
+
+---
+# Architecture-aware certificate distribution
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ca-cert-distributor
+  namespace: cert-manager
+spec:
+  selector:
+    matchLabels:
+      app: ca-cert-distributor
+  template:
+    metadata:
+      labels:
+        app: ca-cert-distributor
+    spec:
+      hostNetwork: true
+      containers:
+      - name: distributor
+        image: alpine:latest
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          echo "Distributing CA certificates..."
+          
+          # Copy CA cert to host
+          if [ -f /ca-certs/tls.crt ]; then
+            cp /ca-certs/tls.crt /host-ca-certs/homelab-ca.crt
+            
+            # Update CA certificates on host
+            if [ -d /host-ca-certs/certs ]; then
+              # Debian/Ubuntu
+              cp /ca-certs/tls.crt /host-ca-certs/certs/homelab-ca.crt
+              chroot /host update-ca-certificates
+            elif [ -d /host-ca-certs/anchors ]; then
+              # SUSE
+              cp /ca-certs/tls.crt /host-ca-certs/anchors/homelab-ca.crt
+              chroot /host update-ca-certificates
+            fi
+            
+            echo "CA certificate distributed to $(uname -m) node"
+          fi
+          
+          # Keep container running
+          sleep 3600
+        volumeMounts:
+        - name: ca-certs
+          mountPath: /ca-certs
+          readOnly: true
+        - name: host-ca-certs
+          mountPath: /host-ca-certs
+        - name: host-root
+          mountPath: /host
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "10m"
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+      volumes:
+      - name: ca-certs
+        secret:
+          secretName: homelab-ca-secret
+      - name: host-ca-certs
+        hostPath:
+          path: /usr/local/share/ca-certificates
+      - name: host-root
+        hostPath:
+          path: /

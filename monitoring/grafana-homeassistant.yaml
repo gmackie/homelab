@@ -1,0 +1,786 @@
+# Grafana Dashboards for Home Assistant Integration
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: homeassistant-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  homeassistant-overview.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "title": "Home Assistant - Smart Home Overview",
+        "tags": ["homeassistant", "smart-home"],
+        "style": "dark",
+        "timezone": "browser",
+        "refresh": "30s",
+        "time": {
+          "from": "now-6h",
+          "to": "now"
+        },
+        "panels": [
+          {
+            "id": 1,
+            "title": "Room Temperatures",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "homeassistant_sensor_temperature_celsius{entity=~\"sensor\\..*_temperature\"}",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "celsius",
+                "min": 10,
+                "max": 30,
+                "thresholds": {
+                  "steps": [
+                    {"color": "blue", "value": null},
+                    {"color": "green", "value": 18},
+                    {"color": "yellow", "value": 25},
+                    {"color": "red", "value": 28}
+                  ]
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+          {
+            "id": 2,
+            "title": "HVAC System Status",
+            "type": "state-timeline",
+            "targets": [
+              {
+                "expr": "homeassistant_climate_hvac_mode{entity=~\"climate\\..*\"}",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "mappings": [
+                  {"options": {"0": {"text": "Off", "color": "gray"}}, "type": "value"},
+                  {"options": {"1": {"text": "Heat", "color": "red"}}, "type": "value"},
+                  {"options": {"2": {"text": "Cool", "color": "blue"}}, "type": "value"},
+                  {"options": {"3": {"text": "Auto", "color": "green"}}, "type": "value"}
+                ]
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+          {
+            "id": 3,
+            "title": "Temperature History",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "homeassistant_sensor_temperature_celsius{entity=~\"sensor\\..*_temperature\"}",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "celsius",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "smooth"
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+          },
+          {
+            "id": 4,
+            "title": "HVAC Runtime Today",
+            "type": "piechart",
+            "targets": [
+              {
+                "expr": "increase(homeassistant_climate_runtime_minutes[1d])",
+                "legendFormat": "{{friendly_name}} - {{hvac_mode}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "m",
+                "custom": {
+                  "displayMode": "table"
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+          },
+          {
+            "id": 5,
+            "title": "Energy Consumption",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "homeassistant_sensor_power_w{entity=~\"sensor\\..*_power\"}",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "watt",
+                "thresholds": {
+                  "steps": [
+                    {"color": "green", "value": null},
+                    {"color": "yellow", "value": 1000},
+                    {"color": "red", "value": 2000}
+                  ]
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+          },
+          {
+            "id": 6,
+            "title": "Humidity Levels",
+            "type": "gauge",
+            "targets": [
+              {
+                "expr": "homeassistant_sensor_humidity_percent{entity=~\"sensor\\..*_humidity\"}",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percent",
+                "min": 0,
+                "max": 100,
+                "thresholds": {
+                  "steps": [
+                    {"color": "red", "value": null},
+                    {"color": "yellow", "value": 30},
+                    {"color": "green", "value": 40},
+                    {"color": "yellow", "value": 60},
+                    {"color": "red", "value": 70}
+                  ]
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24}
+          }
+        ]
+      }
+    }
+
+  homeassistant-climate.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "title": "Home Assistant - Climate Control",
+        "tags": ["homeassistant", "climate", "hvac"],
+        "style": "dark",
+        "timezone": "browser",
+        "refresh": "10s",
+        "time": {
+          "from": "now-24h",
+          "to": "now"
+        },
+        "panels": [
+          {
+            "id": 1,
+            "title": "Current Thermostat Settings",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "homeassistant_climate_target_temperature_celsius",
+                "legendFormat": "{{friendly_name}} Target",
+                "refId": "A"
+              },
+              {
+                "expr": "homeassistant_sensor_temperature_celsius{entity=~\"sensor\\..*_temperature\"}",
+                "legendFormat": "{{friendly_name}} Current",
+                "refId": "B"
+              }
+            ],
+            "transformations": [
+              {
+                "id": "merge",
+                "options": {}
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "celsius",
+                "custom": {
+                  "displayMode": "color-background"
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
+          },
+          {
+            "id": 2,
+            "title": "Temperature vs Target",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "homeassistant_sensor_temperature_celsius{entity=\"sensor.living_room_temperature\"}",
+                "legendFormat": "Living Room Current",
+                "refId": "A"
+              },
+              {
+                "expr": "homeassistant_climate_target_temperature_celsius{entity=\"climate.living_room\"}",
+                "legendFormat": "Living Room Target",
+                "refId": "B"
+              },
+              {
+                "expr": "homeassistant_sensor_temperature_celsius{entity=\"sensor.bedroom_temperature\"}",
+                "legendFormat": "Bedroom Current",
+                "refId": "C"
+              },
+              {
+                "expr": "homeassistant_climate_target_temperature_celsius{entity=\"climate.bedroom\"}",
+                "legendFormat": "Bedroom Target",
+                "refId": "D"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "celsius",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "smooth",
+                  "fillOpacity": 10
+                }
+              },
+              "overrides": [
+                {
+                  "matcher": {"id": "byRegexp", "options": ".*Target.*"},
+                  "properties": [
+                    {"id": "custom.drawStyle", "value": "line"},
+                    {"id": "custom.lineStyle", "value": {"dash": [10, 10]}}
+                  ]
+                }
+              ]
+            },
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+          },
+          {
+            "id": 3,
+            "title": "HVAC Operation Timeline",
+            "type": "state-timeline",
+            "targets": [
+              {
+                "expr": "homeassistant_climate_hvac_action{entity=~\"climate\\..*\"}",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "mappings": [
+                  {"options": {"0": {"text": "Idle", "color": "gray"}}, "type": "value"},
+                  {"options": {"1": {"text": "Heating", "color": "red"}}, "type": "value"},
+                  {"options": {"2": {"text": "Cooling", "color": "blue"}}, "type": "value"},
+                  {"options": {"3": {"text": "Fan", "color": "green"}}, "type": "value"}
+                ]
+              }
+            },
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+          },
+          {
+            "id": 4,
+            "title": "Energy Usage Breakdown",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "homeassistant_sensor_power_w{entity=~\"sensor\\..*_hvac_power\"}",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "watt",
+                "custom": {
+                  "drawStyle": "line",
+                  "lineInterpolation": "smooth",
+                  "fillOpacity": 20,
+                  "stacking": {"mode": "normal"}
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24}
+          },
+          {
+            "id": 5,
+            "title": "Daily Energy Cost",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "increase(homeassistant_sensor_energy_kwh{entity=~\"sensor\\..*_hvac_energy\"}[1d]) * 0.12",
+                "legendFormat": "{{friendly_name}} Cost",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "currencyUSD",
+                "decimals": 2
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24}
+          }
+        ]
+      }
+    }
+
+  homeassistant-devices.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "title": "Home Assistant - Device Status",
+        "tags": ["homeassistant", "devices", "status"],
+        "style": "dark",
+        "timezone": "browser",
+        "refresh": "30s",
+        "time": {
+          "from": "now-1h",
+          "to": "now"
+        },
+        "panels": [
+          {
+            "id": 1,
+            "title": "Device Connectivity",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "homeassistant_device_tracker_state{state=\"home\"}",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "mappings": [
+                  {"options": {"0": {"text": "Away", "color": "red"}}, "type": "value"},
+                  {"options": {"1": {"text": "Home", "color": "green"}}, "type": "value"}
+                ]
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+          {
+            "id": 2,
+            "title": "Smart Switch Status",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "homeassistant_switch_state",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "mappings": [
+                  {"options": {"0": {"text": "Off", "color": "red"}}, "type": "value"},
+                  {"options": {"1": {"text": "On", "color": "green"}}, "type": "value"}
+                ]
+              }
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+          {
+            "id": 3,
+            "title": "Light Status",
+            "type": "heatmap",
+            "targets": [
+              {
+                "expr": "homeassistant_light_brightness_percent",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percent",
+                "min": 0,
+                "max": 100
+              }
+            },
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+          },
+          {
+            "id": 4,
+            "title": "Sensor Battery Levels",
+            "type": "gauge",
+            "targets": [
+              {
+                "expr": "homeassistant_sensor_battery_percent{entity=~\"sensor\\..*_battery\"}",
+                "legendFormat": "{{friendly_name}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percent",
+                "min": 0,
+                "max": 100,
+                "thresholds": {
+                  "steps": [
+                    {"color": "red", "value": null},
+                    {"color": "yellow", "value": 20},
+                    {"color": "green", "value": 50}
+                  ]
+                }
+              }
+            },
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+          }
+        ]
+      }
+    }
+
+---
+# Prometheus Configuration for Home Assistant
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-homeassistant-config
+  namespace: monitoring
+data:
+  homeassistant.yml: |
+    # Home Assistant Prometheus Integration
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - "homeassistant_rules.yml"
+
+    scrape_configs:
+      - job_name: 'home-assistant'
+        static_configs:
+          - targets: ['home-assistant.smart-home:8123']
+        metrics_path: /api/prometheus
+        bearer_token: 'homeassistant_prometheus_token'
+        scrape_interval: 30s
+        scrape_timeout: 10s
+
+      - job_name: 'node-red'
+        static_configs:
+          - targets: ['node-red.smart-home:1880']
+        metrics_path: /metrics
+        scrape_interval: 60s
+
+      - job_name: 'esphome-devices'
+        static_configs:
+          - targets: ['esphome.smart-home:6052']
+        metrics_path: /metrics
+        scrape_interval: 30s
+
+  homeassistant_rules.yml: |
+    groups:
+      - name: homeassistant.rules
+        rules:
+          - alert: HighTemperature
+            expr: homeassistant_sensor_temperature_celsius > 28
+            for: 5m
+            labels:
+              severity: warning
+              service: home-assistant
+            annotations:
+              summary: "High temperature detected"
+              description: "Temperature in {{ $labels.friendly_name }} is {{ $value }}°C"
+
+          - alert: LowTemperature
+            expr: homeassistant_sensor_temperature_celsius < 15
+            for: 5m
+            labels:
+              severity: warning
+              service: home-assistant
+            annotations:
+              summary: "Low temperature detected"
+              description: "Temperature in {{ $labels.friendly_name }} is {{ $value }}°C"
+
+          - alert: HVACHighRuntime
+            expr: increase(homeassistant_climate_runtime_minutes[1h]) > 45
+            for: 0m
+            labels:
+              severity: info
+              service: home-assistant
+            annotations:
+              summary: "HVAC high runtime"
+              description: "{{ $labels.friendly_name }} has been running for {{ $value }} minutes in the last hour"
+
+          - alert: DeviceOffline
+            expr: homeassistant_device_tracker_state == 0
+            for: 10m
+            labels:
+              severity: warning
+              service: home-assistant
+            annotations:
+              summary: "Device offline"
+              description: "{{ $labels.friendly_name }} has been offline for 10 minutes"
+
+          - alert: LowBattery
+            expr: homeassistant_sensor_battery_percent < 20
+            for: 1h
+            labels:
+              severity: warning
+              service: home-assistant
+            annotations:
+              summary: "Low battery level"
+              description: "{{ $labels.friendly_name }} battery is at {{ $value }}%"
+
+          - alert: HighEnergyUsage
+            expr: homeassistant_sensor_power_w > 3000
+            for: 15m
+            labels:
+              severity: critical
+              service: home-assistant
+            annotations:
+              summary: "High energy usage detected"
+              description: "{{ $labels.friendly_name }} is consuming {{ $value }}W"
+
+---
+# AlertManager Configuration for Home Assistant
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-homeassistant-config
+  namespace: monitoring
+data:
+  homeassistant.yml: |
+    route:
+      group_by: ['alertname', 'service']
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 12h
+      receiver: 'home-assistant-webhook'
+      routes:
+        - match:
+            service: home-assistant
+          receiver: 'home-assistant-webhook'
+
+    receivers:
+      - name: 'home-assistant-webhook'
+        webhook_configs:
+          - url: 'http://home-assistant.smart-home:8123/api/webhook/prometheus-alerts'
+            send_resolved: true
+            http_config:
+              bearer_token: 'homeassistant_webhook_token'
+
+---
+# Home Assistant Integration Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ha-prometheus-bridge
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ha-prometheus-bridge
+  template:
+    metadata:
+      labels:
+        app: ha-prometheus-bridge
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: ha-prometheus-bridge
+        image: python:3.11-alpine
+        command: ["/bin/sh"]
+        args:
+          - -c
+          - |
+            pip install requests prometheus_client pyyaml &&
+            python /app/bridge.py
+        ports:
+        - containerPort: 8000
+          name: metrics
+        env:
+        - name: HOME_ASSISTANT_URL
+          value: "http://home-assistant.smart-home:8123"
+        - name: HOME_ASSISTANT_TOKEN
+          value: "homeassistant_bridge_token"
+        volumeMounts:
+        - name: bridge-script
+          mountPath: /app
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: bridge-script
+        configMap:
+          name: ha-prometheus-bridge-script
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ha-prometheus-bridge-script
+  namespace: monitoring
+data:
+  bridge.py: |
+    #!/usr/bin/env python3
+    import os
+    import time
+    import requests
+    from prometheus_client import start_http_server, Gauge, Counter, Histogram
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    # Prometheus metrics
+    temperature_gauge = Gauge('homeassistant_sensor_temperature_celsius', 'Temperature sensors', ['entity', 'friendly_name', 'room'])
+    humidity_gauge = Gauge('homeassistant_sensor_humidity_percent', 'Humidity sensors', ['entity', 'friendly_name', 'room'])
+    battery_gauge = Gauge('homeassistant_sensor_battery_percent', 'Battery levels', ['entity', 'friendly_name'])
+    power_gauge = Gauge('homeassistant_sensor_power_w', 'Power consumption', ['entity', 'friendly_name'])
+    energy_counter = Counter('homeassistant_sensor_energy_kwh_total', 'Energy consumption', ['entity', 'friendly_name'])
+    climate_target_gauge = Gauge('homeassistant_climate_target_temperature_celsius', 'Thermostat targets', ['entity', 'friendly_name'])
+    climate_mode_gauge = Gauge('homeassistant_climate_hvac_mode', 'HVAC mode', ['entity', 'friendly_name'])
+    climate_action_gauge = Gauge('homeassistant_climate_hvac_action', 'HVAC action', ['entity', 'friendly_name'])
+    climate_runtime_counter = Counter('homeassistant_climate_runtime_minutes_total', 'HVAC runtime', ['entity', 'friendly_name', 'hvac_mode'])
+    device_tracker_gauge = Gauge('homeassistant_device_tracker_state', 'Device presence', ['entity', 'friendly_name'])
+    switch_gauge = Gauge('homeassistant_switch_state', 'Switch states', ['entity', 'friendly_name'])
+    light_brightness_gauge = Gauge('homeassistant_light_brightness_percent', 'Light brightness', ['entity', 'friendly_name'])
+
+    class HomeAssistantBridge:
+        def __init__(self):
+            self.ha_url = os.getenv('HOME_ASSISTANT_URL', 'http://home-assistant.smart-home:8123')
+            self.ha_token = os.getenv('HOME_ASSISTANT_TOKEN', '')
+            self.headers = {
+                'Authorization': f'Bearer {self.ha_token}',
+                'Content-Type': 'application/json'
+            }
+
+        def get_states(self):
+            try:
+                response = requests.get(f'{self.ha_url}/api/states', headers=self.headers, timeout=10)
+                response.raise_for_status()
+                return response.json()
+            except Exception as e:
+                logger.error(f"Error fetching states: {e}")
+                return []
+
+        def extract_room_from_entity(self, entity_id):
+            # Extract room name from entity ID (e.g., sensor.living_room_temperature -> living_room)
+            parts = entity_id.split('.')
+            if len(parts) > 1:
+                name_parts = parts[1].split('_')
+                if len(name_parts) >= 2:
+                    return '_'.join(name_parts[:-1])  # Everything except the last part
+            return 'unknown'
+
+        def update_metrics(self):
+            states = self.get_states()
+            
+            for state in states:
+                entity_id = state['entity_id']
+                friendly_name = state['attributes'].get('friendly_name', entity_id)
+                value_str = state['state']
+                
+                # Skip unavailable or unknown states
+                if value_str in ['unavailable', 'unknown', None]:
+                    continue
+                
+                try:
+                    domain = entity_id.split('.')[0]
+                    
+                    if domain == 'sensor':
+                        unit = state['attributes'].get('unit_of_measurement', '')
+                        room = self.extract_room_from_entity(entity_id)
+                        
+                        if unit == '°C' or 'temperature' in entity_id:
+                            temperature_gauge.labels(entity=entity_id, friendly_name=friendly_name, room=room).set(float(value_str))
+                        elif unit == '%' and 'humidity' in entity_id:
+                            humidity_gauge.labels(entity=entity_id, friendly_name=friendly_name, room=room).set(float(value_str))
+                        elif unit == '%' and 'battery' in entity_id:
+                            battery_gauge.labels(entity=entity_id, friendly_name=friendly_name).set(float(value_str))
+                        elif unit == 'W' or 'power' in entity_id:
+                            power_gauge.labels(entity=entity_id, friendly_name=friendly_name).set(float(value_str))
+                        elif unit == 'kWh' or 'energy' in entity_id:
+                            energy_counter.labels(entity=entity_id, friendly_name=friendly_name)._value._value = float(value_str)
+                    
+                    elif domain == 'climate':
+                        target_temp = state['attributes'].get('temperature')
+                        hvac_mode = state['attributes'].get('hvac_mode', 'unknown')
+                        hvac_action = state['attributes'].get('hvac_action', 'idle')
+                        
+                        if target_temp is not None:
+                            climate_target_gauge.labels(entity=entity_id, friendly_name=friendly_name).set(float(target_temp))
+                        
+                        # Map HVAC modes to numbers
+                        mode_map = {'off': 0, 'heat': 1, 'cool': 2, 'auto': 3, 'fan_only': 4}
+                        action_map = {'idle': 0, 'heating': 1, 'cooling': 2, 'fan': 3}
+                        
+                        climate_mode_gauge.labels(entity=entity_id, friendly_name=friendly_name).set(mode_map.get(hvac_mode, 0))
+                        climate_action_gauge.labels(entity=entity_id, friendly_name=friendly_name).set(action_map.get(hvac_action, 0))
+                    
+                    elif domain == 'device_tracker':
+                        device_tracker_gauge.labels(entity=entity_id, friendly_name=friendly_name).set(1 if value_str == 'home' else 0)
+                    
+                    elif domain == 'switch':
+                        switch_gauge.labels(entity=entity_id, friendly_name=friendly_name).set(1 if value_str == 'on' else 0)
+                    
+                    elif domain == 'light':
+                        brightness = state['attributes'].get('brightness', 0)
+                        if value_str == 'on' and brightness is not None:
+                            # Convert brightness from 0-255 to 0-100 percent
+                            brightness_percent = (brightness / 255) * 100
+                            light_brightness_gauge.labels(entity=entity_id, friendly_name=friendly_name).set(brightness_percent)
+                        else:
+                            light_brightness_gauge.labels(entity=entity_id, friendly_name=friendly_name).set(0)
+                
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"Skipping entity {entity_id}: {e}")
+                    continue
+
+        def run(self):
+            logger.info("Starting Home Assistant Prometheus Bridge")
+            start_http_server(8000)
+            
+            while True:
+                try:
+                    self.update_metrics()
+                    time.sleep(30)  # Update every 30 seconds
+                except Exception as e:
+                    logger.error(f"Error in main loop: {e}")
+                    time.sleep(60)  # Wait longer on error
+
+    if __name__ == '__main__':
+        bridge = HomeAssistantBridge()
+        bridge.run()
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ha-prometheus-bridge
+  namespace: monitoring
+spec:
+  selector:
+    app: ha-prometheus-bridge
+  ports:
+  - port: 8000
+    targetPort: 8000
+    name: metrics
