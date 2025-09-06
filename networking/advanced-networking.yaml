@@ -1,0 +1,799 @@
+# Advanced Networking Configuration for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: networking
+  labels:
+    name: networking
+
+---
+# Traefik Ingress Controller (Alternative to nginx-ingress)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traefik-ingress
+  namespace: networking
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: traefik-ingress
+  template:
+    metadata:
+      labels:
+        app: traefik-ingress
+    spec:
+      # Prefer ARM64 for efficient ingress handling
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64", "amd64"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["traefik-ingress"]
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: traefik
+        image: traefik:v3.0
+        args:
+          - --api.dashboard=true
+          - --api.insecure=true
+          - --entrypoints.web.address=:80
+          - --entrypoints.websecure.address=:443
+          - --providers.kubernetes=true
+          - --providers.kubernetes.ingressclass=traefik
+          - --certificatesresolvers.letsencrypt.acme.email=admin@homelab.local
+          - --certificatesresolvers.letsencrypt.acme.storage=/data/acme.json
+          - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+          - --metrics.prometheus=true
+          - --metrics.prometheus.buckets=0.1,0.3,1.2,5.0
+          - --log.level=INFO
+          - --accesslog=true
+        ports:
+        - name: web
+          containerPort: 80
+        - name: websecure
+          containerPort: 443
+        - name: dashboard
+          containerPort: 8080
+        - name: metrics
+          containerPort: 8082
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /ping
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ping
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: traefik-data
+      serviceAccountName: traefik-ingress
+
+---
+# Traefik Data PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traefik-data
+  namespace: networking
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: local-path
+
+---
+# Traefik Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traefik-ingress
+  namespace: networking
+
+---
+# Traefik RBAC
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: traefik-ingress
+rules:
+- apiGroups: [""]
+  resources: ["services", "endpoints", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions", "networking.k8s.io"]
+  resources: ["ingresses", "ingressclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions", "networking.k8s.io"]
+  resources: ["ingresses/status"]
+  verbs: ["update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: traefik-ingress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: traefik-ingress
+subjects:
+- kind: ServiceAccount
+  name: traefik-ingress
+  namespace: networking
+
+---
+# Traefik Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik-ingress
+  namespace: networking
+  labels:
+    app: traefik-ingress
+spec:
+  type: LoadBalancer
+  selector:
+    app: traefik-ingress
+  ports:
+  - name: web
+    port: 80
+    targetPort: 80
+  - name: websecure
+    port: 443
+    targetPort: 443
+
+---
+# Traefik Dashboard Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik-dashboard
+  namespace: networking
+spec:
+  selector:
+    app: traefik-ingress
+  ports:
+  - name: dashboard
+    port: 8080
+    targetPort: 8080
+
+---
+# Traefik Dashboard Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: traefik-dashboard
+  namespace: networking
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+  - host: traefik.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: traefik-dashboard
+            port:
+              number: 8080
+
+---
+# MetalLB Load Balancer Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metallb-config
+  namespace: metallb-system
+data:
+  config: |
+    address-pools:
+    - name: homelab-pool
+      protocol: layer2
+      addresses:
+      - 192.168.1.100-192.168.1.150  # Change this to your network range!
+
+---
+# Cloudflared Tunnel for External Access
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared-tunnel
+  namespace: networking
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudflared-tunnel
+  template:
+    metadata:
+      labels:
+        app: cloudflared-tunnel
+    spec:
+      # Run on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      containers:
+      - name: cloudflared
+        image: cloudflare/cloudflared:latest
+        args:
+          - tunnel
+          - --config
+          - /etc/cloudflared/config.yaml
+          - run
+        volumeMounts:
+        - name: config
+          mountPath: /etc/cloudflared
+        - name: credentials
+          mountPath: /etc/cloudflared/credentials
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+      volumes:
+      - name: config
+        configMap:
+          name: cloudflared-config
+      - name: credentials
+        secret:
+          secretName: cloudflared-credentials
+
+---
+# Cloudflared Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+  namespace: networking
+data:
+  config.yaml: |
+    tunnel: your-tunnel-id  # Change this!
+    credentials-file: /etc/cloudflared/credentials/credentials.json
+    
+    ingress:
+      # Homelab main dashboard
+      - hostname: homelab.yourdomain.com
+        service: http://homer.homelab-services.svc.cluster.local:8080
+      
+      # Home Assistant
+      - hostname: home.yourdomain.com
+        service: http://home-assistant.smart-home.svc.cluster.local:8123
+      
+      # Media services
+      - hostname: media.yourdomain.com
+        service: http://jellyfin.media.svc.cluster.local:8096
+      
+      # Monitoring
+      - hostname: metrics.yourdomain.com
+        service: http://grafana.monitoring.svc.cluster.local:3000
+      
+      # Catch-all
+      - service: http_status:404
+
+---
+# Cloudflared Credentials Secret Template
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudflared-credentials
+  namespace: networking
+type: Opaque
+data:
+  credentials.json: |
+    # Base64 encode your Cloudflare tunnel credentials JSON
+    # Get from: cloudflared tunnel create homelab
+    # Then: base64 -w 0 < ~/.cloudflared/your-tunnel-id.json
+    ewogICJBY2NvdW50VGFnIjogInlvdXItYWNjb3VudC10YWciLAogICJUdW5uZWxTZWNyZXQiOiAieW91ci10dW5uZWwtc2VjcmV0IiwKICAiVHVubmVsSUQiOiAieW91ci10dW5uZWwtaWQiCn0K  # Change this!
+
+---
+# Network Policies for Security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: homelab-services
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-traffic
+  namespace: homelab-services
+spec:
+  podSelector:
+    matchLabels:
+      network-policy: "web-accessible"
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: networking
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 80
+    - protocol: TCP
+      port: 443
+
+---
+# DNS Configuration for Internal Services
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  homelab.server: |
+    homelab.local {
+        errors
+        health {
+          lameduck 5s
+        }
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+          pods insecure
+          fallthrough in-addr.arpa ip6.arpa
+          ttl 30
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf {
+          max_concurrent 1000
+        }
+        cache 30
+        loop
+        reload
+        loadbalance
+        
+        # Custom homelab entries
+        template IN A homelab.local {
+          match "^(.*)\.homelab\.local"
+          answer "{{ .Name }} 60 IN A 192.168.1.100"  # Change to your load balancer IP!
+        }
+    }
+
+---
+# External DNS for Automatic Record Management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns
+  namespace: networking
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: external-dns
+  template:
+    metadata:
+      labels:
+        app: external-dns
+    spec:
+      # Run on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      serviceAccountName: external-dns
+      containers:
+      - name: external-dns
+        image: registry.k8s.io/external-dns/external-dns:v0.14.0
+        args:
+        - --source=ingress
+        - --source=service
+        - --domain-filter=homelab.local
+        - --provider=coredns
+        - --coredns-prefix=/skydns/
+        - --registry=txt
+        - --txt-owner-id=homelab-cluster
+        - --interval=30s
+        - --log-level=info
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "32Mi"
+          limits:
+            cpu: "50m"
+            memory: "128Mi"
+
+---
+# External DNS Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-dns
+  namespace: networking
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-dns
+rules:
+- apiGroups: [""]
+  resources: ["services", "endpoints", "pods"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["extensions", "networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-dns-viewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-dns
+subjects:
+- kind: ServiceAccount
+  name: external-dns
+  namespace: networking
+
+---
+# Cert-Manager for SSL Certificates
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-manager-controller
+  namespace: networking
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-manager-controller
+  template:
+    metadata:
+      labels:
+        app: cert-manager-controller
+    spec:
+      # Prefer ARM64 for certificate management
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64", "amd64"]
+      serviceAccountName: cert-manager
+      containers:
+      - name: cert-manager
+        image: quay.io/jetstack/cert-manager-controller:v1.13.0
+        args:
+          - --v=2
+          - --cluster-resource-namespace=$(POD_NAMESPACE)
+          - --leader-election-namespace=networking
+          - --acme-http01-solver-image=quay.io/jetstack/cert-manager-acmesolver:v1.13.0
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        resources:
+          requests:
+            cpu: "20m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+
+---
+# Cert-Manager Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-manager
+  namespace: networking
+
+---
+# Let's Encrypt ClusterIssuer
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@homelab.local  # Change this!
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          class: traefik
+
+---
+# Network Monitoring with Netshoot
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: network-monitor
+  namespace: networking
+spec:
+  selector:
+    matchLabels:
+      app: network-monitor
+  template:
+    metadata:
+      labels:
+        app: network-monitor
+    spec:
+      hostNetwork: true
+      containers:
+      - name: netshoot
+        image: nicolaka/netshoot:latest
+        command: ["/bin/sleep", "infinity"]
+        resources:
+          requests:
+            cpu: "5m"
+            memory: "16Mi"
+          limits:
+            cpu: "50m"
+            memory: "128Mi"
+        securityContext:
+          capabilities:
+            add: ["NET_ADMIN", "NET_RAW"]
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+
+---
+# Bandwidth Monitoring
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: speedtest-tracker
+  namespace: networking
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: speedtest-tracker
+  template:
+    metadata:
+      labels:
+        app: speedtest-tracker
+        network-policy: "web-accessible"
+    spec:
+      # Run on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      containers:
+      - name: speedtest-tracker
+        image: lscr.io/linuxserver/speedtest-tracker:latest
+        ports:
+        - containerPort: 80
+        env:
+        - name: PUID
+          value: "1000"
+        - name: PGID
+          value: "1000"
+        - name: TZ
+          value: "America/New_York"  # Change this!
+        - name: APP_KEY
+          value: "base64:your-app-key-here"  # Generate with: echo "base64:$(openssl rand -base64 32)"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        resources:
+          requests:
+            cpu: "20m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "512Mi"
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: speedtest-data
+
+---
+# Speedtest Data PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: speedtest-data
+  namespace: networking
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: local-path
+
+---
+# Speedtest Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: speedtest-tracker
+  namespace: networking
+spec:
+  selector:
+    app: speedtest-tracker
+  ports:
+  - port: 80
+    targetPort: 80
+
+---
+# Speedtest Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: speedtest-ingress
+  namespace: networking
+spec:
+  rules:
+  - host: speedtest.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: speedtest-tracker
+            port:
+              number: 80
+
+---
+# DHCP Server for IoT Devices (Optional)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dhcp-server
+  namespace: networking
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dhcp-server
+  template:
+    metadata:
+      labels:
+        app: dhcp-server
+    spec:
+      hostNetwork: true
+      # Prefer ARM for low-power DHCP
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: dhcp-server
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache dhcp
+          
+          # DHCP configuration for IoT devices
+          cat > /etc/dhcp/dhcpd.conf << 'EOF'
+          default-lease-time 86400;
+          max-lease-time 86400;
+          
+          subnet 192.168.2.0 netmask 255.255.255.0 {
+            range 192.168.2.100 192.168.2.200;
+            option routers 192.168.2.1;
+            option domain-name-servers 192.168.1.100;  # Pi-hole IP
+            option domain-name "iot.homelab.local";
+          }
+          EOF
+          
+          # Start DHCP server
+          touch /var/lib/dhcp/dhcpd.leases
+          exec dhcpd -f -d -cf /etc/dhcp/dhcpd.conf
+        securityContext:
+          capabilities:
+            add: ["NET_BIND_SERVICE", "NET_BROADCAST", "NET_RAW"]
+        resources:
+          requests:
+            cpu: "5m"
+            memory: "16Mi"
+          limits:
+            cpu: "50m"
+            memory: "64Mi"
+
+---
+# Network Policy for IoT Isolation
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: iot-isolation
+  namespace: smart-home
+spec:
+  podSelector:
+    matchLabels:
+      type: "iot-device"
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: smart-home
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: smart-home
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53  # DNS
+    - protocol: TCP
+      port: 1883  # MQTT

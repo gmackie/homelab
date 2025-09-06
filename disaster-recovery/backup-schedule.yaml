@@ -1,0 +1,301 @@
+# Automated Backup Schedule for Homelab Disaster Recovery
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backup
+  labels:
+    name: backup
+
+---
+# Velero Backup System
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: velero-backup-scheduler
+  namespace: backup
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: velero-backup-scheduler
+  template:
+    metadata:
+      labels:
+        app: velero-backup-scheduler
+    spec:
+      # Run on AMD64 for better performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: backup-scheduler
+        image: bitnami/kubectl:latest
+        command: ["/bin/sh"]
+        args:
+          - -c
+          - |
+            while true; do
+              echo "$(date): Starting scheduled backup..."
+              
+              # Configuration backup
+              kubectl create configmap homelab-backup-$(date +%Y%m%d-%H%M) \
+                --from-file=/configs \
+                --namespace=backup || echo "Config backup failed"
+              
+              # Application data backup (if Velero available)
+              if command -v velero &> /dev/null; then
+                velero backup create homelab-$(date +%Y%m%d-%H%M) \
+                  --include-namespaces=storage,smart-home,media,monitoring \
+                  --storage-location=default || echo "Velero backup failed"
+              fi
+              
+              echo "$(date): Backup cycle complete"
+              sleep 21600  # 6 hours
+            done
+        volumeMounts:
+        - name: config-volume
+          mountPath: /configs
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+      volumes:
+      - name: config-volume
+        projected:
+          sources:
+          - configMap:
+              name: homelab-configs
+
+---
+# Configuration Backup ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: homelab-configs
+  namespace: backup
+data:
+  # Essential configuration references for backup
+  backup-manifest.yaml: |
+    # Homelab Backup Manifest
+    backup_version: "1.0"
+    timestamp: "$(date)"
+    
+    critical_configs:
+      - "storage/network-storage.yaml"
+      - "services/homelab-services.yaml"
+      - "smart-home/home-assistant.yaml"
+      - "media/media-stack.yaml"
+      - "monitoring/grafana-homeassistant.yaml"
+    
+    persistent_data:
+      namespaces:
+        - storage
+        - smart-home
+        - media
+        - monitoring
+      
+      critical_pvcs:
+        - storage/minio-data
+        - storage/nextcloud-data
+        - smart-home/home-assistant-config
+        - media/jellyfin-data
+        - media/arr-configs
+
+---
+# Daily Backup CronJob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-config-backup
+  namespace: backup
+spec:
+  schedule: "0 2 * * *"  # 2 AM daily
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64", "arm64"]
+          containers:
+          - name: backup-configs
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Starting daily configuration backup..."
+              
+              # Create backup directory
+              BACKUP_DATE=$(date +%Y%m%d)
+              
+              # Export all homelab configurations
+              kubectl get all -n storage -o yaml > /tmp/storage-backup-$BACKUP_DATE.yaml
+              kubectl get all -n homelab-services -o yaml > /tmp/services-backup-$BACKUP_DATE.yaml
+              kubectl get all -n smart-home -o yaml > /tmp/smarthome-backup-$BACKUP_DATE.yaml
+              kubectl get all -n media -o yaml > /tmp/media-backup-$BACKUP_DATE.yaml
+              kubectl get all -n monitoring -o yaml > /tmp/monitoring-backup-$BACKUP_DATE.yaml
+              
+              # Store as ConfigMaps for later retrieval
+              kubectl create configmap config-backup-$BACKUP_DATE \
+                --from-file=/tmp/ \
+                --namespace=backup || echo "Backup ConfigMap creation failed"
+              
+              # Clean up old backups (keep 7 days)
+              kubectl get configmaps -n backup | grep "config-backup-" | \
+                awk '{print $1}' | sort | head -n -7 | \
+                xargs -r kubectl delete configmap -n backup || true
+              
+              echo "Daily backup completed: config-backup-$BACKUP_DATE"
+            resources:
+              requests:
+                cpu: "20m"
+                memory: "64Mi"
+              limits:
+                cpu: "200m"
+                memory: "256Mi"
+          restartPolicy: OnFailure
+
+---
+# Weekly Full System Backup
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: weekly-system-backup
+  namespace: backup
+spec:
+  schedule: "0 1 * * 0"  # 1 AM every Sunday
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64"]  # Use powerful nodes for full backup
+          containers:
+          - name: full-backup
+            image: alpine:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache curl kubectl
+              
+              echo "Starting weekly full system backup..."
+              BACKUP_DATE=$(date +%Y%m%d)
+              
+              # Full cluster state backup
+              kubectl get all --all-namespaces -o yaml > /tmp/cluster-full-$BACKUP_DATE.yaml
+              kubectl get pv,pvc --all-namespaces -o yaml > /tmp/storage-full-$BACKUP_DATE.yaml
+              kubectl get configmaps,secrets --all-namespaces -o yaml > /tmp/configs-full-$BACKUP_DATE.yaml
+              
+              # Create comprehensive backup archive
+              tar -czf /tmp/homelab-full-backup-$BACKUP_DATE.tar.gz /tmp/*-full-$BACKUP_DATE.yaml
+              
+              # Store backup metadata
+              kubectl create configmap full-backup-$BACKUP_DATE \
+                --from-literal=backup_date="$BACKUP_DATE" \
+                --from-literal=backup_type="full-system" \
+                --from-literal=cluster_version="$(kubectl version --short)" \
+                --namespace=backup || echo "Metadata storage failed"
+              
+              echo "Weekly full backup completed: $BACKUP_DATE"
+              
+              # Clean up old full backups (keep 4 weeks)
+              kubectl get configmaps -n backup | grep "full-backup-" | \
+                awk '{print $1}' | sort | head -n -4 | \
+                xargs -r kubectl delete configmap -n backup || true
+                
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "128Mi"
+              limits:
+                cpu: "500m"
+                memory: "512Mi"
+          restartPolicy: OnFailure
+
+---
+# Backup Monitoring & Alerts
+apiVersion: v1
+kind: Service
+metadata:
+  name: backup-webhook
+  namespace: backup
+spec:
+  selector:
+    app: backup-webhook
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backup-webhook
+  namespace: backup
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backup-webhook
+  template:
+    metadata:
+      labels:
+        app: backup-webhook
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]  # Use efficient nodes for monitoring
+      containers:
+      - name: webhook
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache curl socat
+          
+          while true; do
+            # Simple webhook server for backup notifications
+            echo "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK" | \
+              socat TCP-LISTEN:8080,reuseaddr,fork STDIO
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "5m"
+            memory: "16Mi"
+          limits:
+            cpu: "50m"
+            memory: "64Mi"

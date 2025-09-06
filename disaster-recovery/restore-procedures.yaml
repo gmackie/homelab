@@ -1,0 +1,321 @@
+# Disaster Recovery Procedures and Automation
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: disaster-recovery-procedures
+  namespace: backup
+data:
+  restore-guide.md: |
+    # 🆘 Homelab Disaster Recovery Guide
+    
+    ## 🚨 Emergency Recovery Scenarios
+    
+    ### 1. Complete Cluster Loss
+    ```bash
+    # Prerequisites: New k3s cluster running
+    
+    # Step 1: Restore configurations
+    kubectl apply -f disaster-recovery/restore-minimal.yaml
+    
+    # Step 2: Restore storage layer first
+    kubectl apply -f storage/network-storage.yaml
+    kubectl wait --for=condition=ready pod -l app=minio -n storage --timeout=600s
+    
+    # Step 3: Restore critical services
+    kubectl apply -f services/homelab-services.yaml
+    kubectl apply -f smart-home/home-assistant.yaml
+    
+    # Step 4: Restore data from backups
+    ./disaster-recovery/restore-data.sh
+    
+    # Step 5: Verify and redeploy remaining services
+    ./setup/health-check.sh
+    kubectl apply -f media/
+    kubectl apply -f monitoring/
+    ```
+    
+    ### 2. Single Service Failure
+    ```bash
+    # Identify failed service
+    kubectl get pods --all-namespaces | grep -v Running
+    
+    # Restart deployment
+    kubectl rollout restart deployment <service-name> -n <namespace>
+    
+    # Check logs
+    kubectl logs -l app=<service-name> -n <namespace> --tail=50
+    
+    # Restore from backup if needed
+    kubectl get configmap -n backup | grep backup-$(date +%Y%m%d)
+    ```
+    
+    ### 3. Storage Corruption
+    ```bash
+    # Check PVC status
+    kubectl get pvc --all-namespaces
+    
+    # Restore from latest backup
+    kubectl get configmap -n backup | grep "full-backup-"
+    
+    # Manual data restoration
+    ./disaster-recovery/restore-storage.sh <backup-date>
+    ```
+    
+    ## 📋 Recovery Checklist
+    
+    - [ ] Cluster connectivity restored
+    - [ ] Storage layer functional
+    - [ ] Core services running (Homer, Pi-hole)
+    - [ ] Home Assistant restored with configurations
+    - [ ] Media services restored with library data
+    - [ ] Monitoring and dashboards functional
+    - [ ] Touchscreen dashboard accessible
+    - [ ] All ingress routes working
+    - [ ] Backup system re-enabled
+    
+    ## 🔧 Common Fixes
+    
+    ### Storage Issues
+    - NFS mount failures: Check network connectivity
+    - PVC pending: Verify storage classes
+    - MinIO access denied: Reset credentials
+    
+    ### Service Issues  
+    - Home Assistant config error: Restore from backup
+    - Jellyfin transcoding failure: Check AMD64 placement
+    - Grafana datasource error: Verify Prometheus connection
+    
+    ### Network Issues
+    - Ingress not working: Check ingress controller
+    - DNS resolution: Restart Pi-hole
+    - Service discovery: Check CoreDNS
+
+  restore-checklist.yaml: |
+    recovery_steps:
+      critical_path:
+        - name: "Verify cluster access"
+          command: "kubectl cluster-info"
+          timeout: "30s"
+          
+        - name: "Deploy storage foundation"
+          command: "kubectl apply -f storage/network-storage.yaml"
+          wait_for: "pods ready in storage namespace"
+          timeout: "600s"
+          
+        - name: "Deploy essential services"
+          command: "kubectl apply -f services/homelab-services.yaml"
+          wait_for: "Homer and Pi-hole ready"
+          timeout: "300s"
+          
+        - name: "Restore Home Assistant"
+          command: "kubectl apply -f smart-home/home-assistant.yaml"
+          wait_for: "Home Assistant pod ready"
+          timeout: "600s"
+          
+        - name: "Verify core functionality"
+          command: "./setup/health-check.sh"
+          timeout: "120s"
+      
+      recovery_validation:
+        - service: "homer"
+          url: "http://homer.homelab.local"
+          expected_status: 200
+          
+        - service: "home-assistant"
+          url: "http://homeassistant.homelab.local"
+          expected_status: 200
+          
+        - service: "pihole"
+          url: "http://pihole.homelab.local/admin"
+          expected_status: 200
+
+---
+# Emergency Restore Job Template
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: emergency-restore-template
+  namespace: backup
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: emergency-restore
+        image: bitnami/kubectl:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "🆘 Emergency restore initiated..."
+          
+          # Get latest backup
+          LATEST_BACKUP=$(kubectl get configmaps -n backup | grep "config-backup-" | sort -k1 -r | head -1 | awk '{print $1}')
+          
+          if [[ -n "$LATEST_BACKUP" ]]; then
+            echo "📦 Found backup: $LATEST_BACKUP"
+            
+            # Extract backup files
+            kubectl get configmap "$LATEST_BACKUP" -n backup -o jsonpath='{.data}' > /tmp/backup-data.yaml
+            
+            echo "🔄 Applying critical services from backup..."
+            
+            # Apply in dependency order
+            kubectl apply -f /configs/storage-restore.yaml || echo "Storage restore failed"
+            sleep 30
+            
+            kubectl apply -f /configs/services-restore.yaml || echo "Services restore failed"
+            sleep 20
+            
+            kubectl apply -f /configs/smarthome-restore.yaml || echo "Smart home restore failed"
+            
+            echo "✅ Emergency restore completed"
+            echo "🔍 Run health checks to verify system status"
+          else
+            echo "❌ No backup found - manual intervention required"
+            exit 1
+          fi
+        volumeMounts:
+        - name: restore-configs
+          mountPath: /configs
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: restore-configs
+        configMap:
+          name: restore-manifests
+
+---
+# Restore Configuration Templates
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: restore-manifests
+  namespace: backup
+data:
+  storage-restore.yaml: |
+    # Minimal storage for emergency restore
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: storage
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: minio
+      namespace: storage
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: minio
+      template:
+        metadata:
+          labels:
+            app: minio
+        spec:
+          containers:
+          - name: minio
+            image: minio/minio:latest
+            args: ["server", "/data", "--console-address", ":9001"]
+            ports:
+            - containerPort: 9000
+            - containerPort: 9001
+            env:
+            - name: MINIO_ROOT_USER
+              value: "minioadmin"
+            - name: MINIO_ROOT_PASSWORD
+              value: "changeme"  # Change this!
+            volumeMounts:
+            - name: data
+              mountPath: /data
+          volumes:
+          - name: data
+            emptyDir: {}
+  
+  services-restore.yaml: |
+    # Minimal essential services
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: homelab-services
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: homer
+      namespace: homelab-services
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: homer
+      template:
+        metadata:
+          labels:
+            app: homer
+        spec:
+          containers:
+          - name: homer
+            image: b4bz/homer:latest
+            ports:
+            - containerPort: 8080
+
+---
+# Backup Retention Policy
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-cleanup
+  namespace: backup
+spec:
+  schedule: "0 3 * * 1"  # 3 AM every Monday
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cleanup
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "🧹 Starting backup cleanup..."
+              
+              # Keep last 7 daily backups
+              kubectl get configmaps -n backup | grep "config-backup-" | \
+                sort -k1 -r | tail -n +8 | awk '{print $1}' | \
+                xargs -r kubectl delete configmap -n backup
+              
+              # Keep last 4 weekly backups
+              kubectl get configmaps -n backup | grep "full-backup-" | \
+                sort -k1 -r | tail -n +5 | awk '{print $1}' | \
+                xargs -r kubectl delete configmap -n backup
+              
+              echo "✅ Backup cleanup completed"
+              
+              # Report backup status
+              echo "📊 Current backup inventory:"
+              kubectl get configmaps -n backup | grep "backup-"
+            resources:
+              requests:
+                cpu: "10m"
+                memory: "32Mi"
+          restartPolicy: OnFailure

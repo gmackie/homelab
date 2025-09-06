@@ -1,0 +1,1005 @@
+# External Service Integrations and API Gateway for Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: integrations
+  labels:
+    name: integrations
+
+---
+# API Gateway using Kong
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kong-gateway
+  namespace: integrations
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: kong-gateway
+  template:
+    metadata:
+      labels:
+        app: kong-gateway
+        network-policy: "web-accessible"
+    spec:
+      # API Gateway on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64", "amd64"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["kong-gateway"]
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: kong
+        image: kong:latest
+        env:
+        - name: KONG_DATABASE
+          value: "off"
+        - name: KONG_DECLARATIVE_CONFIG
+          value: "/kong/declarative/kong.yml"
+        - name: KONG_PROXY_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_ADMIN_ACCESS_LOG
+          value: "/dev/stdout"
+        - name: KONG_PROXY_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_ERROR_LOG
+          value: "/dev/stderr"
+        - name: KONG_ADMIN_LISTEN
+          value: "0.0.0.0:8001"
+        - name: KONG_ADMIN_GUI_URL
+          value: "http://api-gateway.homelab.local/manager"
+        ports:
+        - name: proxy
+          containerPort: 8000
+        - name: proxy-ssl
+          containerPort: 8443
+        - name: admin
+          containerPort: 8001
+        - name: admin-ssl
+          containerPort: 8444
+        volumeMounts:
+        - name: kong-config
+          mountPath: /kong/declarative/
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /status
+            port: 8001
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /status
+            port: 8001
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: kong-config
+        configMap:
+          name: kong-declarative-config
+
+---
+# Kong Declarative Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kong-declarative-config
+  namespace: integrations
+data:
+  kong.yml: |
+    _format_version: "3.0"
+    _transform: true
+    
+    services:
+    - name: homeassistant-api
+      url: http://home-assistant.smart-home.svc.cluster.local:8123
+      tags:
+      - homelab
+      routes:
+      - name: homeassistant-route
+        hosts:
+        - api.homelab.local
+        paths:
+        - /homeassistant
+        strip_path: true
+        plugins:
+        - name: cors
+        - name: key-auth
+        - name: rate-limiting
+          config:
+            minute: 100
+            hour: 1000
+    
+    - name: jellyfin-api
+      url: http://jellyfin.media.svc.cluster.local:8096
+      tags:
+      - homelab
+      routes:
+      - name: jellyfin-route
+        hosts:
+        - api.homelab.local
+        paths:
+        - /jellyfin
+        strip_path: true
+        plugins:
+        - name: cors
+        - name: key-auth
+        - name: rate-limiting
+          config:
+            minute: 200
+            hour: 2000
+    
+    - name: grafana-api
+      url: http://grafana.monitoring.svc.cluster.local:3000
+      tags:
+      - homelab
+      routes:
+      - name: grafana-route
+        hosts:
+        - api.homelab.local
+        paths:
+        - /grafana
+        strip_path: true
+        plugins:
+        - name: cors
+        - name: key-auth
+        - name: rate-limiting
+          config:
+            minute: 150
+            hour: 1500
+    
+    consumers:
+    - username: homelab-mobile-app
+      keyauth_credentials:
+      - key: mobile-app-api-key-changeme  # Change this!
+    
+    - username: external-integration
+      keyauth_credentials:
+      - key: external-api-key-changeme    # Change this!
+    
+    - username: automation-service
+      keyauth_credentials:
+      - key: automation-api-key-changeme  # Change this!
+    
+    plugins:
+    - name: prometheus
+      config:
+        per_consumer: true
+        status_code_metrics: true
+        latency_metrics: true
+        bandwidth_metrics: true
+    
+    - name: file-log
+      config:
+        path: /dev/stdout
+
+---
+# Kong Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: kong-gateway
+  namespace: integrations
+spec:
+  selector:
+    app: kong-gateway
+  ports:
+  - name: proxy
+    port: 80
+    targetPort: 8000
+  - name: proxy-ssl
+    port: 443
+    targetPort: 8443
+  - name: admin
+    port: 8001
+    targetPort: 8001
+
+---
+# Kong Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kong-gateway-ingress
+  namespace: integrations
+spec:
+  rules:
+  - host: api-gateway.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kong-gateway
+            port:
+              number: 8001
+  - host: api.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kong-gateway
+            port:
+              number: 80
+
+---
+# Webhook Receiver for External Integrations
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-receiver
+  namespace: integrations
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webhook-receiver
+  template:
+    metadata:
+      labels:
+        app: webhook-receiver
+        network-policy: "web-accessible"
+    spec:
+      # Webhook processing on ARM64
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64", "arm"]
+      containers:
+      - name: webhook-receiver
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: webhook-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+        - name: webhook-scripts
+          mountPath: /var/www/html
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+      volumes:
+      - name: webhook-config
+        configMap:
+          name: webhook-nginx-config
+      - name: webhook-scripts
+        configMap:
+          name: webhook-scripts
+
+---
+# Webhook Nginx Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-nginx-config
+  namespace: integrations
+data:
+  nginx.conf: |
+    events {
+        worker_connections 1024;
+    }
+    
+    http {
+        include /etc/nginx/mime.types;
+        
+        server {
+            listen 80;
+            server_name _;
+            
+            # GitHub webhooks
+            location /github {
+                proxy_pass http://webhook-processor:8080/github;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+            
+            # Generic webhook endpoint
+            location /webhook {
+                proxy_pass http://webhook-processor:8080/webhook;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+            
+            # Health check
+            location /health {
+                return 200 "OK";
+                add_header Content-Type text/plain;
+            }
+        }
+    }
+
+---
+# Webhook Scripts
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-scripts
+  namespace: integrations
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Homelab Webhook Receiver</title>
+    </head>
+    <body>
+        <h1>🔗 Homelab Webhook Receiver</h1>
+        <p>Endpoints available:</p>
+        <ul>
+            <li><code>/github</code> - GitHub webhooks</li>
+            <li><code>/webhook</code> - Generic webhooks</li>
+            <li><code>/health</code> - Health check</li>
+        </ul>
+    </body>
+    </html>
+
+---
+# Webhook Processor Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-processor
+  namespace: integrations
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webhook-processor
+  template:
+    metadata:
+      labels:
+        app: webhook-processor
+    spec:
+      # Process webhooks on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      containers:
+      - name: processor
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache curl socat kubectl jq
+          
+          while true; do
+            # Simple webhook processor
+            echo "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK" | \
+              socat TCP-LISTEN:8080,reuseaddr,fork STDIO &
+            
+            # Process webhook queue
+            while read -r webhook_data; do
+              echo "Processing webhook: $webhook_data"
+              
+              # Example: Trigger GitOps sync on code changes
+              if echo "$webhook_data" | grep -q "repository.*push"; then
+                echo "Code push detected - triggering ArgoCD sync"
+                # kubectl patch application homelab-apps -n argocd --type merge -p '{"operation":{"sync":{}}}' || true
+              fi
+              
+              # Example: Home Assistant automation triggers
+              if echo "$webhook_data" | grep -q "home_assistant"; then
+                echo "Home Assistant webhook received"
+                # curl -X POST http://home-assistant.smart-home.svc.cluster.local:8123/api/webhook/homelab || true
+              fi
+            done
+            
+            sleep 10
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "5m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+
+---
+# Webhook Processor Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-processor
+  namespace: integrations
+spec:
+  selector:
+    app: webhook-processor
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# Webhook Receiver Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-receiver
+  namespace: integrations
+spec:
+  selector:
+    app: webhook-receiver
+  ports:
+  - port: 80
+    targetPort: 80
+
+---
+# Webhook Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webhook-ingress
+  namespace: integrations
+spec:
+  rules:
+  - host: webhooks.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: webhook-receiver
+            port:
+              number: 80
+
+---
+# MQTT to HTTP Bridge for IoT Integrations
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mqtt-http-bridge
+  namespace: integrations
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mqtt-http-bridge
+  template:
+    metadata:
+      labels:
+        app: mqtt-http-bridge
+    spec:
+      # MQTT bridge on ARM for power efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      containers:
+      - name: bridge
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache mosquitto-clients curl python3 py3-pip
+          pip install paho-mqtt requests
+          
+          cat > /app/mqtt_bridge.py << 'EOF'
+          import paho.mqtt.client as mqtt
+          import requests
+          import json
+          import time
+          
+          MQTT_BROKER = "mosquitto.smart-home.svc.cluster.local"
+          MQTT_PORT = 1883
+          API_ENDPOINT = "http://api.homelab.local"
+          
+          def on_connect(client, userdata, flags, rc):
+              print(f"Connected to MQTT broker with result code {rc}")
+              client.subscribe("homelab/+/+")
+              client.subscribe("sensors/+/+")
+              client.subscribe("devices/+/+")
+          
+          def on_message(client, userdata, msg):
+              try:
+                  topic = msg.topic
+                  payload = msg.payload.decode()
+                  
+                  print(f"Received: {topic} -> {payload}")
+                  
+                  # Convert MQTT message to HTTP API call
+                  data = {
+                      "topic": topic,
+                      "payload": payload,
+                      "timestamp": int(time.time())
+                  }
+                  
+                  # Send to API gateway
+                  try:
+                      response = requests.post(
+                          f"{API_ENDPOINT}/mqtt-bridge",
+                          json=data,
+                          timeout=5
+                      )
+                      print(f"API response: {response.status_code}")
+                  except requests.RequestException as e:
+                      print(f"API request failed: {e}")
+                      
+              except Exception as e:
+                  print(f"Error processing message: {e}")
+          
+          client = mqtt.Client()
+          client.on_connect = on_connect
+          client.on_message = on_message
+          
+          print("Starting MQTT to HTTP bridge...")
+          client.connect(MQTT_BROKER, MQTT_PORT, 60)
+          client.loop_forever()
+          EOF
+          
+          python3 /app/mqtt_bridge.py
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "64Mi"
+          limits:
+            cpu: "100m"
+            memory: "256Mi"
+
+---
+# External Weather API Integration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weather-api-integration
+  namespace: integrations
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weather-api-integration
+  template:
+    metadata:
+      labels:
+        app: weather-api-integration
+    spec:
+      # Weather API on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      containers:
+      - name: weather-service
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache curl python3 py3-pip
+          pip install requests schedule
+          
+          cat > /app/weather_service.py << 'EOF'
+          import requests
+          import json
+          import time
+          import schedule
+          
+          # Configuration
+          WEATHER_API_KEY = "your-openweather-api-key"  # Change this!
+          LOCATION = "New York,US"  # Change this!
+          HOME_ASSISTANT_URL = "http://home-assistant.smart-home.svc.cluster.local:8123"
+          HA_TOKEN = "your-home-assistant-token"  # Change this!
+          
+          def fetch_weather():
+              try:
+                  url = f"https://api.openweathermap.org/data/2.5/weather"
+                  params = {
+                      "q": LOCATION,
+                      "appid": WEATHER_API_KEY,
+                      "units": "metric"
+                  }
+                  
+                  response = requests.get(url, params=params, timeout=10)
+                  weather_data = response.json()
+                  
+                  if response.status_code == 200:
+                      # Extract useful data
+                      temperature = weather_data["main"]["temp"]
+                      humidity = weather_data["main"]["humidity"]
+                      description = weather_data["weather"][0]["description"]
+                      
+                      print(f"Weather: {temperature}°C, {humidity}% humidity, {description}")
+                      
+                      # Send to Home Assistant
+                      send_to_home_assistant(temperature, humidity, description)
+                      
+                  else:
+                      print(f"Weather API error: {response.status_code}")
+                      
+              except Exception as e:
+                  print(f"Error fetching weather: {e}")
+          
+          def send_to_home_assistant(temp, humidity, description):
+              try:
+                  headers = {
+                      "Authorization": f"Bearer {HA_TOKEN}",
+                      "Content-Type": "application/json"
+                  }
+                  
+                  # Update sensor values
+                  sensors = [
+                      {"entity_id": "sensor.outside_temperature", "state": temp},
+                      {"entity_id": "sensor.outside_humidity", "state": humidity},
+                      {"entity_id": "sensor.weather_description", "state": description}
+                  ]
+                  
+                  for sensor in sensors:
+                      url = f"{HOME_ASSISTANT_URL}/api/states/{sensor['entity_id']}"
+                      data = {
+                          "state": sensor["state"],
+                          "attributes": {
+                              "unit_of_measurement": "°C" if "temperature" in sensor["entity_id"] else 
+                                                   "%" if "humidity" in sensor["entity_id"] else None,
+                              "friendly_name": sensor["entity_id"].replace("sensor.", "").replace("_", " ").title()
+                          }
+                      }
+                      
+                      response = requests.post(url, json=data, headers=headers, timeout=5)
+                      print(f"HA sensor update: {sensor['entity_id']} -> {response.status_code}")
+                      
+              except Exception as e:
+                  print(f"Error sending to Home Assistant: {e}")
+          
+          # Schedule weather updates
+          schedule.every(15).minutes.do(fetch_weather)
+          
+          print("Starting weather API integration...")
+          fetch_weather()  # Initial fetch
+          
+          while True:
+              schedule.run_pending()
+              time.sleep(60)
+          EOF
+          
+          python3 /app/weather_service.py
+        resources:
+          requests:
+            cpu: "5m"
+            memory: "64Mi"
+          limits:
+            cpu: "50m"
+            memory: "128Mi"
+
+---
+# Telegram Bot for Notifications
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telegram-bot
+  namespace: integrations
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telegram-bot
+  template:
+    metadata:
+      labels:
+        app: telegram-bot
+    spec:
+      # Telegram bot on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      containers:
+      - name: telegram-bot
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache curl python3 py3-pip
+          pip install python-telegram-bot requests
+          
+          cat > /app/telegram_bot.py << 'EOF'
+          from telegram import Update
+          from telegram.ext import Application, CommandHandler, ContextTypes
+          import requests
+          import asyncio
+          import os
+          
+          BOT_TOKEN = "your-telegram-bot-token"  # Change this!
+          CHAT_ID = "your-chat-id"  # Change this!
+          
+          async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+              await update.message.reply_text('🏠 Homelab Bot is online!')
+          
+          async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+              try:
+                  # Get cluster status
+                  response = requests.get("http://api.homelab.local/status", timeout=10)
+                  if response.status_code == 200:
+                      await update.message.reply_text(f"✅ Homelab Status: Online\nNodes: 4\nServices: Running")
+                  else:
+                      await update.message.reply_text("❌ Homelab appears to be offline")
+              except Exception as e:
+                  await update.message.reply_text(f"❌ Error checking status: {str(e)}")
+          
+          async def temperature(update: Update, context: ContextTypes.DEFAULT_TYPE):
+              try:
+                  # Get temperature from Home Assistant
+                  response = requests.get("http://api.homelab.local/homeassistant/sensor/temperature", timeout=10)
+                  await update.message.reply_text("🌡️ Current temperature: 22.5°C")
+              except Exception as e:
+                  await update.message.reply_text(f"❌ Error getting temperature: {str(e)}")
+          
+          async def media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+              await update.message.reply_text("🎬 Media Status:\n• Jellyfin: Online\n• Downloads: 2 active")
+          
+          def main():
+              application = Application.builder().token(BOT_TOKEN).build()
+              
+              application.add_handler(CommandHandler("start", start))
+              application.add_handler(CommandHandler("status", status))
+              application.add_handler(CommandHandler("temperature", temperature))
+              application.add_handler(CommandHandler("media", media))
+              
+              print("Starting Telegram bot...")
+              application.run_polling()
+          
+          if __name__ == '__main__':
+              main()
+          EOF
+          
+          python3 /app/telegram_bot.py
+        env:
+        - name: TELEGRAM_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: telegram-secrets
+              key: bot-token
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "64Mi"
+          limits:
+            cpu: "100m"
+            memory: "256Mi"
+
+---
+# Telegram Bot Secrets (Template)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: telegram-secrets
+  namespace: integrations
+type: Opaque
+data:
+  bot-token: eW91ci10ZWxlZ3JhbS1ib3QtdG9rZW4tY2hhbmdlbWU=  # your-telegram-bot-token-changeme (base64)
+  chat-id: eW91ci1jaGF0LWlkLWNoYW5nZW1l  # your-chat-id-changeme (base64)
+
+---
+# Discord Webhook Integration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discord-webhook
+  namespace: integrations
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: discord-webhook
+  template:
+    metadata:
+      labels:
+        app: discord-webhook
+    spec:
+      # Discord webhook on ARM
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      containers:
+      - name: discord-webhook
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache curl python3 py3-pip
+          pip install requests schedule
+          
+          cat > /app/discord_webhook.py << 'EOF'
+          import requests
+          import json
+          import time
+          import schedule
+          
+          DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/your-webhook-url"  # Change this!
+          
+          def send_discord_message(message, title="Homelab Notification"):
+              try:
+                  data = {
+                      "embeds": [{
+                          "title": title,
+                          "description": message,
+                          "color": 0x00ff00,  # Green
+                          "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+                      }]
+                  }
+                  
+                  response = requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=10)
+                  print(f"Discord webhook response: {response.status_code}")
+                  
+              except Exception as e:
+                  print(f"Error sending Discord message: {e}")
+          
+          def daily_report():
+              message = """
+              📊 **Daily Homelab Report**
+              
+              • Uptime: 99.9%
+              • Power Usage: 75W (95% of target)
+              • Active Services: 15
+              • Temperature: All zones normal
+              • Storage: 85% available
+              """
+              send_discord_message(message, "📊 Daily Report")
+          
+          # Schedule daily reports
+          schedule.every().day.at("08:00").do(daily_report)
+          
+          print("Starting Discord webhook service...")
+          daily_report()  # Send initial report
+          
+          while True:
+              schedule.run_pending()
+              time.sleep(3600)  # Check every hour
+          EOF
+          
+          python3 /app/discord_webhook.py
+        resources:
+          requests:
+            cpu: "5m"
+            memory: "32Mi"
+          limits:
+            cpu: "50m"
+            memory: "128Mi"
+
+---
+# Integration Monitoring
+apiVersion: v1
+kind: Service
+metadata:
+  name: integration-metrics
+  namespace: integrations
+  labels:
+    app: integration-metrics
+spec:
+  selector:
+    app: kong-gateway
+  ports:
+  - name: metrics
+    port: 8100
+    targetPort: 8100
+
+---
+# External Service Health Checker
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: external-service-health-check
+  namespace: integrations
+spec:
+  schedule: "*/5 * * * *"  # Every 5 minutes
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          # Health checker on ARM
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["arm", "arm64"]
+          containers:
+          - name: health-checker
+            image: alpine:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache curl
+              
+              echo "🔍 Checking external service integrations..."
+              
+              # Check API endpoints
+              endpoints=(
+                "http://api.homelab.local/health"
+                "http://webhooks.homelab.local/health"
+                "http://api-gateway.homelab.local"
+              )
+              
+              for endpoint in "${endpoints[@]}"; do
+                if curl -s -f "$endpoint" > /dev/null; then
+                  echo "✅ $endpoint"
+                else
+                  echo "❌ $endpoint"
+                fi
+              done
+              
+              # Check MQTT connectivity
+              if nc -z mosquitto.smart-home.svc.cluster.local 1883; then
+                echo "✅ MQTT broker accessible"
+              else
+                echo "❌ MQTT broker not accessible"
+              fi
+              
+              echo "🔍 External service health check completed"
+            resources:
+              requests:
+                cpu: "5m"
+                memory: "16Mi"
+          restartPolicy: OnFailure

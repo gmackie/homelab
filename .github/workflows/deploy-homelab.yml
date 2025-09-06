@@ -1,0 +1,324 @@
+name: 🚀 Deploy Homelab to Kubernetes
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_context:
+        description: 'Kubernetes cluster context'
+        required: true
+        type: string
+        default: 'homelab-cluster'
+      deploy_components:
+        description: 'Components to deploy (comma-separated)'
+        required: false
+        type: string
+        default: 'storage,services,smart-home,media,monitoring,dashboard'
+      force_deploy:
+        description: 'Force deployment even if validation fails'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  HOMELAB_DIR: ${{ github.workspace }}
+  KUBECONFIG: ${{ secrets.KUBECONFIG }}
+
+jobs:
+  pre-deployment-check:
+    name: ✅ Pre-Deployment Validation
+    runs-on: ubuntu-latest
+    outputs:
+      validation_status: ${{ steps.validate.outputs.status }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        pip install pyyaml
+        chmod +x setup/*.sh
+    
+    - name: Validate configurations
+      id: validate
+      run: |
+        echo "🔍 Running validation checks..."
+        
+        # Run validation script
+        if ./setup/validate-simple.sh; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ All validations passed"
+        else
+          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "❌ Validation failed"
+          
+          if [[ "${{ github.event.inputs.force_deploy }}" == "true" ]]; then
+            echo "⚠️ Continuing with force deployment"
+          else
+            exit 1
+          fi
+        fi
+
+  deploy-infrastructure:
+    name: 🏗️ Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: pre-deployment-check
+    if: contains(github.event.inputs.deploy_components, 'storage') || github.event.inputs.deploy_components == ''
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Configure cluster context
+      run: |
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > /tmp/kubeconfig
+        export KUBECONFIG=/tmp/kubeconfig
+        kubectl config use-context ${{ github.event.inputs.cluster_context }}
+    
+    - name: Deploy storage layer
+      run: |
+        echo "🏗️ Deploying storage infrastructure..."
+        kubectl apply -f storage/network-storage.yaml
+        
+        echo "⏳ Waiting for storage to be ready..."
+        sleep 30
+        kubectl wait --for=condition=ready pod -l app=minio -n storage --timeout=300s || true
+        kubectl wait --for=condition=ready pod -l app=nextcloud -n storage --timeout=300s || true
+    
+    - name: Verify storage deployment
+      run: |
+        echo "✅ Verifying storage deployment..."
+        kubectl get pods -n storage
+        kubectl get pvc -n storage
+
+  deploy-services:
+    name: 🛠️ Deploy Core Services
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-check, deploy-infrastructure]
+    if: contains(github.event.inputs.deploy_components, 'services') || github.event.inputs.deploy_components == ''
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Configure cluster context
+      run: |
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > /tmp/kubeconfig
+        export KUBECONFIG=/tmp/kubeconfig
+        kubectl config use-context ${{ github.event.inputs.cluster_context }}
+    
+    - name: Deploy core services
+      run: |
+        echo "🛠️ Deploying core services..."
+        kubectl apply -f services/homelab-services.yaml
+        
+        echo "⏳ Waiting for services to be ready..."
+        sleep 20
+        kubectl wait --for=condition=ready pod -l app=homer -n homelab-services --timeout=300s || true
+        kubectl wait --for=condition=ready pod -l app=pihole -n homelab-services --timeout=300s || true
+
+  deploy-smart-home:
+    name: 🏠 Deploy Smart Home
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-check, deploy-services]
+    if: contains(github.event.inputs.deploy_components, 'smart-home') || github.event.inputs.deploy_components == ''
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Configure cluster context
+      run: |
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > /tmp/kubeconfig
+        export KUBECONFIG=/tmp/kubeconfig
+        kubectl config use-context ${{ github.event.inputs.cluster_context }}
+    
+    - name: Deploy Home Assistant
+      run: |
+        echo "🏠 Deploying Home Assistant platform..."
+        kubectl apply -f smart-home/home-assistant.yaml
+        kubectl apply -f smart-home/esphome-devices.yaml
+        
+        echo "⏳ Waiting for Home Assistant..."
+        sleep 30
+        kubectl wait --for=condition=ready pod -l app=home-assistant -n smart-home --timeout=600s || true
+
+  deploy-media:
+    name: 🎬 Deploy Media Stack
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-check, deploy-infrastructure]
+    if: contains(github.event.inputs.deploy_components, 'media') || github.event.inputs.deploy_components == ''
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Configure cluster context
+      run: |
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > /tmp/kubeconfig
+        export KUBECONFIG=/tmp/kubeconfig
+        kubectl config use-context ${{ github.event.inputs.cluster_context }}
+    
+    - name: Deploy media services
+      run: |
+        echo "🎬 Deploying media stack..."
+        kubectl apply -f media/media-stack.yaml
+        kubectl apply -f media/sabnzbd.yaml
+        
+        echo "⏳ Waiting for media services..."
+        sleep 45
+        kubectl wait --for=condition=ready pod -l app=jellyfin -n media --timeout=600s || true
+
+  deploy-monitoring:
+    name: 📊 Deploy Monitoring
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-check, deploy-smart-home]
+    if: contains(github.event.inputs.deploy_components, 'monitoring') || github.event.inputs.deploy_components == ''
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Configure cluster context
+      run: |
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > /tmp/kubeconfig
+        export KUBECONFIG=/tmp/kubeconfig
+        kubectl config use-context ${{ github.event.inputs.cluster_context }}
+    
+    - name: Deploy monitoring stack
+      run: |
+        echo "📊 Deploying monitoring with Grafana dashboards..."
+        kubectl apply -f monitoring/grafana-homeassistant.yaml
+        
+        echo "⏳ Waiting for monitoring services..."
+        sleep 20
+        kubectl wait --for=condition=ready pod -l app=grafana -n monitoring --timeout=300s || true
+
+  deploy-dashboard:
+    name: 📱 Deploy Dashboard
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-check, deploy-services]
+    if: contains(github.event.inputs.deploy_components, 'dashboard') || github.event.inputs.deploy_components == ''
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Configure cluster context
+      run: |
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > /tmp/kubeconfig
+        export KUBECONFIG=/tmp/kubeconfig
+        kubectl config use-context ${{ github.event.inputs.cluster_context }}
+    
+    - name: Deploy touchscreen dashboard
+      run: |
+        echo "📱 Deploying touchscreen dashboard..."
+        kubectl apply -f apps/touchscreen-monitor/touchscreen-dashboard.yaml
+        kubectl apply -f apps/dashboard/api/deployment.yaml
+        kubectl apply -f apps/dashboard/ui/deployment.yaml
+        
+        echo "⏳ Waiting for dashboard services..."
+        sleep 15
+        kubectl wait --for=condition=ready pod -l app=touchscreen-dashboard -n touchscreen --timeout=300s || true
+
+  post-deployment-verification:
+    name: ✅ Post-Deployment Verification
+    runs-on: ubuntu-latest
+    needs: [deploy-infrastructure, deploy-services, deploy-smart-home, deploy-media, deploy-monitoring, deploy-dashboard]
+    if: always()
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Configure cluster context
+      run: |
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > /tmp/kubeconfig
+        export KUBECONFIG=/tmp/kubeconfig
+        kubectl config use-context ${{ github.event.inputs.cluster_context }}
+    
+    - name: Run health checks
+      run: |
+        echo "🏥 Running comprehensive health checks..."
+        chmod +x setup/health-check.sh
+        ./setup/health-check.sh || {
+          echo "⚠️ Some health checks failed - reviewing..."
+          chmod +x setup/troubleshoot.sh
+          ./setup/troubleshoot.sh all
+        }
+    
+    - name: Generate deployment report
+      run: |
+        echo "📋 Generating deployment report..."
+        
+        {
+          echo "# 🏠 Homelab Deployment Report"
+          echo
+          echo "**Deployment Time:** $(date)"
+          echo "**Branch:** ${{ github.ref_name }}"
+          echo "**Commit:** ${{ github.sha }}"
+          echo
+          
+          echo "## 📊 Cluster Status"
+          kubectl get nodes -o wide
+          echo
+          
+          echo "## 🎯 Service Health"
+          kubectl get pods --all-namespaces | grep -E "(storage|homelab-services|smart-home|media|monitoring|touchscreen)"
+          echo
+          
+          echo "## 🌐 Available Services"
+          echo "- 🏠 Homer Dashboard: http://homer.homelab.local"
+          echo "- 📱 Touchscreen Monitor: http://touchscreen.homelab.local"
+          echo "- 🏠 Home Assistant: http://homeassistant.homelab.local"
+          echo "- 📊 Grafana: http://grafana.homelab.local"
+          echo "- 🎬 Jellyfin: http://jellyfin.homelab.local"
+          echo "- 🛡️ Pi-hole: http://pihole.homelab.local/admin"
+          echo
+          
+        } > deployment-report.md
+        
+        cat deployment-report.md
+    
+    - name: Upload deployment report
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-report
+        path: deployment-report.md

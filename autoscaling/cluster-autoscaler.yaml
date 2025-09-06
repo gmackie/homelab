@@ -1,0 +1,766 @@
+# Cluster Autoscaling and Resource Optimization for Multi-Architecture Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autoscaling
+  labels:
+    name: autoscaling
+
+---
+# Vertical Pod Autoscaler (VPA) for Right-Sizing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vpa-recommender
+  namespace: autoscaling
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vpa-recommender
+  template:
+    metadata:
+      labels:
+        app: vpa-recommender
+    spec:
+      # VPA runs efficiently on ARM64
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64", "amd64"]
+      serviceAccountName: vpa-recommender
+      containers:
+      - name: recommender
+        image: registry.k8s.io/autoscaling/vpa-recommender:0.14.0
+        args:
+          - --v=4
+          - --stderrthreshold=info
+          - --pod-recommendation-min-cpu-millicores=5    # Very low for homelab
+          - --pod-recommendation-min-memory-mb=16        # Very low for homelab
+          - --target-cpu-percentile=0.9                  # Conservative
+          - --recommendation-margin-fraction=0.15        # 15% margin
+          - --checkpoints-timeout=10m
+        resources:
+          requests:
+            cpu: "20m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+        ports:
+        - name: metrics
+          containerPort: 8942
+
+---
+# VPA Recommender Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vpa-recommender
+  namespace: autoscaling
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vpa-recommender
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "limitranges"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["autoscaling.k8s.io"]
+  resources: ["verticalpodautoscalers"]
+  verbs: ["get", "list", "watch", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vpa-recommender
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vpa-recommender
+subjects:
+- kind: ServiceAccount
+  name: vpa-recommender
+  namespace: autoscaling
+
+---
+# VPA Configurations for Homelab Services
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: home-assistant-vpa
+  namespace: smart-home
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: home-assistant
+  updatePolicy:
+    updateMode: "Auto"  # Automatically apply recommendations
+  resourcePolicy:
+    containerPolicies:
+    - containerName: home-assistant
+      minAllowed:
+        cpu: "50m"
+        memory: "128Mi"
+      maxAllowed:
+        cpu: "1000m"    # Max 1 CPU for homelab
+        memory: "2Gi"   # Max 2GB RAM
+      controlledResources: ["cpu", "memory"]
+
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: jellyfin-vpa
+  namespace: media
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: jellyfin
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: jellyfin
+      minAllowed:
+        cpu: "100m"     # Higher minimum for transcoding
+        memory: "256Mi"
+      maxAllowed:
+        cpu: "2000m"    # Can use more CPU for transcoding
+        memory: "4Gi"   # More RAM for media processing
+      controlledResources: ["cpu", "memory"]
+
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: pihole-vpa
+  namespace: homelab-services
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: pihole
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: pihole
+      minAllowed:
+        cpu: "10m"      # Very efficient DNS blocking
+        memory: "32Mi"
+      maxAllowed:
+        cpu: "200m"
+        memory: "512Mi"
+      controlledResources: ["cpu", "memory"]
+
+---
+# Horizontal Pod Autoscaler for High-Traffic Services
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: homer-hpa
+  namespace: homelab-services
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: homer
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 minutes
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60   # 1 minute
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 30
+
+---
+# Resource Quota for Power Management
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: power-budget-quota
+  namespace: media
+spec:
+  hard:
+    requests.cpu: "3000m"      # 3 CPU cores max for media namespace
+    requests.memory: "8Gi"     # 8GB RAM max for media namespace
+    limits.cpu: "4000m"        # 4 CPU cores limit
+    limits.memory: "12Gi"      # 12GB RAM limit
+    persistentvolumeclaims: "10"
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: efficiency-quota
+  namespace: homelab-services
+spec:
+  hard:
+    requests.cpu: "500m"       # 0.5 CPU cores for efficient services
+    requests.memory: "2Gi"     # 2GB RAM for services
+    limits.cpu: "1000m"        # 1 CPU core limit
+    limits.memory: "4Gi"       # 4GB RAM limit
+
+---
+# Priority Classes for Workload Scheduling
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: critical-homelab
+value: 1000
+globalDefault: false
+description: "Critical homelab services (Pi-hole, Homer, Home Assistant)"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: media-processing
+value: 500
+globalDefault: false
+description: "Media processing services (Jellyfin, transcoding)"
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: background-tasks
+value: 100
+globalDefault: false
+description: "Background services (Radarr, Sonarr, backups)"
+
+---
+# Power Optimization Controller
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: power-optimizer
+  namespace: autoscaling
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: power-optimizer
+  template:
+    metadata:
+      labels:
+        app: power-optimizer
+    spec:
+      # Run on ARM for ultra-low power management
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      serviceAccountName: power-optimizer
+      containers:
+      - name: optimizer
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache curl kubectl
+          
+          while true; do
+            echo "$(date): Power optimization cycle"
+            
+            # Get current cluster power usage (estimated)
+            total_cpu=$(kubectl top nodes 2>/dev/null | awk 'NR>1 {sum += $3} END {print sum}' | sed 's/%//' || echo "0")
+            total_memory=$(kubectl top nodes 2>/dev/null | awk 'NR>1 {sum += $5} END {print sum}' | sed 's/%//' || echo "0")
+            
+            echo "Current usage: ${total_cpu}% CPU, ${total_memory}% Memory"
+            
+            # Scale down non-critical services during low usage periods
+            hour=$(date +%H)
+            if [[ "$hour" -ge 23 || "$hour" -le 6 ]]; then
+              echo "Night mode: Scaling down non-critical services"
+              
+              # Scale down media processing
+              kubectl scale deployment radarr --replicas=0 -n media 2>/dev/null || true
+              kubectl scale deployment sonarr --replicas=0 -n media 2>/dev/null || true
+              
+              # Keep critical services running
+              kubectl scale deployment home-assistant --replicas=1 -n smart-home 2>/dev/null || true
+              kubectl scale deployment pihole --replicas=1 -n homelab-services 2>/dev/null || true
+            else
+              echo "Day mode: Ensuring all services are available"
+              
+              # Scale up for daily usage
+              kubectl scale deployment radarr --replicas=1 -n media 2>/dev/null || true
+              kubectl scale deployment sonarr --replicas=1 -n media 2>/dev/null || true
+            fi
+            
+            sleep 1800  # Check every 30 minutes
+          done
+        resources:
+          requests:
+            cpu: "5m"
+            memory: "16Mi"
+          limits:
+            cpu: "50m"
+            memory: "64Mi"
+
+---
+# Power Optimizer Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: power-optimizer
+  namespace: autoscaling
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: power-optimizer
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale"]
+  verbs: ["get", "list", "patch", "update"]
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: power-optimizer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: power-optimizer
+subjects:
+- kind: ServiceAccount
+  name: power-optimizer
+  namespace: autoscaling
+
+---
+# Node Resource Monitor
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-resource-monitor
+  namespace: autoscaling
+spec:
+  selector:
+    matchLabels:
+      app: node-resource-monitor
+  template:
+    metadata:
+      labels:
+        app: node-resource-monitor
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: monitor
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            # Monitor system metrics
+            echo "$(date): Node $(hostname) metrics:"
+            
+            # CPU usage
+            cpu_usage=$(cat /proc/loadavg | awk '{print $1}')
+            echo "  Load: $cpu_usage"
+            
+            # Memory usage
+            mem_total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+            mem_available=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+            mem_usage=$((100 - (mem_available * 100 / mem_total)))
+            echo "  Memory: ${mem_usage}%"
+            
+            # Temperature (if available)
+            if [[ -f /sys/class/thermal/thermal_zone0/temp ]]; then
+              temp=$(cat /sys/class/thermal/thermal_zone0/temp)
+              temp_c=$((temp / 1000))
+              echo "  Temperature: ${temp_c}°C"
+              
+              # Throttle if too hot
+              if [[ "$temp_c" -gt 70 ]]; then
+                echo "⚠️ High temperature detected - consider workload redistribution"
+              fi
+            fi
+            
+            sleep 60
+          done
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: "5m"
+            memory: "16Mi"
+          limits:
+            cpu: "50m"
+            memory: "64Mi"
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+
+---
+# Smart Workload Scheduler
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smart-scheduler
+  namespace: autoscaling
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: smart-scheduler
+  template:
+    metadata:
+      labels:
+        app: smart-scheduler
+    spec:
+      # Scheduler runs on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      serviceAccountName: smart-scheduler
+      containers:
+      - name: scheduler
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache kubectl
+          
+          while true; do
+            echo "$(date): Smart workload scheduling cycle"
+            
+            # Get node capabilities
+            amd64_nodes=$(kubectl get nodes -l kubernetes.io/arch=amd64 --no-headers | wc -l)
+            arm64_nodes=$(kubectl get nodes -l kubernetes.io/arch=arm64 --no-headers | wc -l)
+            arm_nodes=$(kubectl get nodes -l kubernetes.io/arch=arm --no-headers | wc -l)
+            
+            echo "Cluster composition: AMD64=$amd64_nodes, ARM64=$arm64_nodes, ARM=$arm_nodes"
+            
+            # Optimize workload placement based on current load
+            if command -v kubectl top &> /dev/null; then
+              # Check node utilization
+              kubectl top nodes 2>/dev/null | awk 'NR>1 {
+                if ($3 ~ /%/) {
+                  cpu = $3; gsub(/%/, "", cpu)
+                  mem = $5; gsub(/%/, "", mem)
+                  if (cpu > 80 || mem > 80) {
+                    print "High load on " $1 ": CPU=" cpu "%, Memory=" mem "%"
+                  }
+                }
+              }'
+            fi
+            
+            # Smart scaling decisions
+            current_hour=$(date +%H)
+            day_of_week=$(date +%u)  # 1=Monday, 7=Sunday
+            
+            if [[ "$current_hour" -ge 8 && "$current_hour" -le 22 ]]; then
+              # Daytime: Scale up interactive services
+              kubectl scale deployment homer --replicas=2 -n homelab-services 2>/dev/null || true
+              kubectl scale deployment grafana --replicas=2 -n monitoring 2>/dev/null || true
+            else
+              # Nighttime: Scale down to save power
+              kubectl scale deployment homer --replicas=1 -n homelab-services 2>/dev/null || true
+              kubectl scale deployment grafana --replicas=1 -n monitoring 2>/dev/null || true
+            fi
+            
+            # Weekend media optimization
+            if [[ "$day_of_week" -ge 6 ]]; then
+              echo "Weekend: Optimizing for media usage"
+              kubectl scale deployment jellyfin --replicas=2 -n media 2>/dev/null || true
+            else
+              kubectl scale deployment jellyfin --replicas=1 -n media 2>/dev/null || true
+            fi
+            
+            sleep 600  # Run every 10 minutes
+          done
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+
+---
+# Smart Scheduler Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: smart-scheduler
+  namespace: autoscaling
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: smart-scheduler
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale"]
+  verbs: ["get", "list", "patch", "update"]
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: smart-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: smart-scheduler
+subjects:
+- kind: ServiceAccount
+  name: smart-scheduler
+  namespace: autoscaling
+
+---
+# Cluster Resource Monitor
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resource-monitor
+  namespace: autoscaling
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: resource-monitor
+  template:
+    metadata:
+      labels:
+        app: resource-monitor
+    spec:
+      # Monitor runs on ARM for power efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      serviceAccountName: resource-monitor
+      containers:
+      - name: monitor
+        image: prom/node-exporter:latest
+        ports:
+        - containerPort: 9100
+          name: metrics
+        command:
+        - /bin/sh
+        - -c
+        - |
+          # Custom resource monitoring for homelab
+          while true; do
+            echo "$(date): Cluster resource analysis"
+            
+            # Calculate total cluster capacity
+            if command -v kubectl &> /dev/null; then
+              echo "=== Cluster Capacity ==="
+              kubectl describe nodes | grep -A 5 "Allocatable:" | grep -E "(cpu|memory)" | \
+                awk '{if(NR%2==1) cpu+=$2; else mem+=$2} END {print "Total CPU: " cpu " cores, Total Memory: " mem/1024/1024 " GB"}'
+              
+              echo "=== Current Usage ==="
+              kubectl top nodes 2>/dev/null || echo "Metrics server not available"
+              
+              echo "=== Power Estimation ==="
+              # Estimate power usage based on CPU utilization
+              total_usage=$(kubectl top nodes 2>/dev/null | awk 'NR>1 {gsub(/%/, "", $3); sum+=$3} END {print sum/NR}' || echo "50")
+              estimated_power=$((total_usage * 79 / 100))  # Scale from 79W max
+              echo "Estimated power usage: ${estimated_power}W (${total_usage}% of 79W target)"
+              
+              # Alert if power usage is high
+              if [[ "$estimated_power" -gt 60 ]]; then
+                echo "⚠️ High power usage detected - consider scaling down non-critical services"
+              fi
+            fi
+            
+            sleep 300  # Every 5 minutes
+          done
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+
+---
+# Resource Monitor Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: resource-monitor
+  namespace: autoscaling
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: resource-monitor
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: resource-monitor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: resource-monitor
+subjects:
+- kind: ServiceAccount
+  name: resource-monitor
+  namespace: autoscaling
+
+---
+# Resource Monitor Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: resource-monitor
+  namespace: autoscaling
+  labels:
+    app: resource-monitor
+spec:
+  selector:
+    app: resource-monitor
+  ports:
+  - name: metrics
+    port: 9100
+    targetPort: 9100
+
+---
+# Node Affinity Scheduler Enhancement
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-config
+  namespace: autoscaling
+data:
+  workload-placement.yaml: |
+    # Workload placement strategy for multi-architecture homelab
+    placement_rules:
+      high_performance:
+        architectures: ["amd64"]
+        services:
+          - jellyfin
+          - sabnzbd
+          - postgresql
+          - nextcloud
+        resource_requirements:
+          cpu_min: "500m"
+          memory_min: "512Mi"
+      
+      balanced_efficiency:
+        architectures: ["arm64", "amd64"]
+        services:
+          - home-assistant
+          - grafana
+          - homer
+          - portainer
+        resource_requirements:
+          cpu_min: "50m"
+          memory_min: "128Mi"
+      
+      ultra_low_power:
+        architectures: ["arm"]
+        services:
+          - pihole
+          - mosquitto
+          - external-dns
+          - backup-scheduler
+        resource_requirements:
+          cpu_min: "5m"
+          memory_min: "16Mi"
+    
+    power_targets:
+      amd64_max_power: "45W"
+      arm64_max_power: "7W"
+      arm_max_power: "3W"
+      total_target: "79W"

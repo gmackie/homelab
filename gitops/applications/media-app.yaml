@@ -1,0 +1,39 @@
+# ArgoCD Application for Media Stack
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: homelab-media
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: homelab-media
+    app.kubernetes.io/part-of: homelab
+spec:
+  project: homelab-services
+  source:
+    repoURL: https://github.com/your-org/homelab # Change this!
+    targetRevision: HEAD
+    path: media
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: media
+  syncPolicy:
+    automated:
+      prune: false # Don't auto-prune media data
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+  
+  # Media services require persistent storage
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers:
+    - /spec/template/spec/containers/0/resources

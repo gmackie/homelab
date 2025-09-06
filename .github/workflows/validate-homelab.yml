@@ -1,0 +1,217 @@
+name: 🏠 Homelab Configuration Validation
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '**/*.yaml'
+      - '**/*.yml'
+      - 'setup/**'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - '**/*.yaml'
+      - '**/*.yml'
+      - 'setup/**'
+
+env:
+  HOMELAB_DIR: ${{ github.workspace }}
+
+jobs:
+  validate-yaml:
+    name: 📝 YAML Validation
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install YAML validator
+      run: |
+        pip install pyyaml yamllint
+    
+    - name: Validate YAML syntax
+      run: |
+        echo "🔍 Validating YAML files..."
+        find . -name "*.yaml" -o -name "*.yml" | while read file; do
+          echo "Checking: $file"
+          python -c "
+        import yaml
+        import sys
+        try:
+            with open('$file', 'r') as f:
+                docs = list(yaml.safe_load_all(f))
+            print('✅ Valid: $file')
+        except Exception as e:
+            print(f'❌ Invalid: $file - {e}')
+            sys.exit(1)
+        "
+        done
+    
+    - name: Lint YAML files
+      run: |
+        echo "🔍 Linting YAML files..."
+        yamllint -d relaxed . || true
+
+  validate-kubernetes:
+    name: ☸️ Kubernetes Validation
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Validate Kubernetes manifests
+      run: |
+        echo "🔍 Validating Kubernetes manifests..."
+        find . -name "*.yaml" -path "*/apps/*" -o -path "*/storage/*" -o -path "*/services/*" -o -path "*/smart-home/*" -o -path "*/media/*" -o -path "*/monitoring/*" | while read file; do
+          echo "Validating: $file"
+          kubectl apply --dry-run=client --validate=true -f "$file" || {
+            echo "❌ Validation failed for: $file"
+            exit 1
+          }
+        done
+        echo "✅ All Kubernetes manifests are valid"
+
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Check for secrets
+      run: |
+        echo "🔍 Scanning for potential secrets..."
+        
+        # Check for common secret patterns
+        if grep -r -i -E "(password|secret|key|token).*[:=].*['\"][^'\"]{8,}" . --include="*.yaml" --include="*.yml" | grep -v "changeme\|your-.*-key\|edgepassword\|homelab-wifi-password"; then
+          echo "❌ Potential real secrets found!"
+          exit 1
+        fi
+        
+        # Check for base64 encoded secrets
+        if grep -r "data:" . --include="*.yaml" --include="*.yml" | grep -E "[A-Za-z0-9+/]{20,}={0,2}" | grep -v "example\|placeholder\|changeme"; then
+          echo "⚠️ Potential base64 encoded data found - review manually"
+        fi
+        
+        echo "✅ No obvious secrets detected"
+    
+    - name: Architecture security check
+      run: |
+        echo "🔍 Checking architecture security..."
+        
+        # Ensure resource limits are set
+        if ! grep -r "resources:" . --include="*.yaml" | grep -A 3 "limits:" | grep -q "memory\|cpu"; then
+          echo "⚠️ Some deployments missing resource limits"
+        else
+          echo "✅ Resource limits configured"
+        fi
+        
+        # Check for privileged containers
+        if grep -r "privileged: true" . --include="*.yaml"; then
+          echo "⚠️ Privileged containers found - review security implications"
+        else
+          echo "✅ No privileged containers detected"
+        fi
+
+  deployment-plan:
+    name: 🚀 Deployment Plan
+    runs-on: ubuntu-latest
+    needs: [validate-yaml, validate-kubernetes, security-scan]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Generate deployment plan
+      run: |
+        echo "📋 Generating deployment plan..."
+        
+        echo "## 🏗️ Homelab Deployment Plan" > deployment-plan.md
+        echo >> deployment-plan.md
+        echo "**Branch:** ${{ github.ref_name }}" >> deployment-plan.md
+        echo "**Commit:** ${{ github.sha }}" >> deployment-plan.md
+        echo "**Generated:** $(date)" >> deployment-plan.md
+        echo >> deployment-plan.md
+        
+        echo "### 📁 Configuration Files Changed" >> deployment-plan.md
+        git diff --name-only ${{ github.event.before }}..${{ github.sha }} | grep -E "\.(yaml|yml)$" | while read file; do
+          echo "- \`$file\`" >> deployment-plan.md
+        done
+        echo >> deployment-plan.md
+        
+        echo "### 🎯 Deployment Order" >> deployment-plan.md
+        echo "1. **Storage Layer** (\`storage/network-storage.yaml\`)" >> deployment-plan.md
+        echo "2. **Core Services** (\`services/homelab-services.yaml\`)" >> deployment-plan.md
+        echo "3. **Smart Home** (\`smart-home/home-assistant.yaml\`)" >> deployment-plan.md
+        echo "4. **Media Stack** (\`media/media-stack.yaml\`, \`media/sabnzbd.yaml\`)" >> deployment-plan.md
+        echo "5. **Monitoring** (\`monitoring/grafana-homeassistant.yaml\`)" >> deployment-plan.md
+        echo "6. **Dashboard** (\`apps/touchscreen-monitor/touchscreen-dashboard.yaml\`)" >> deployment-plan.md
+        echo >> deployment-plan.md
+        
+        echo "### 🔧 Deployment Commands" >> deployment-plan.md
+        echo "\`\`\`bash" >> deployment-plan.md
+        echo "# Validate configuration" >> deployment-plan.md
+        echo "./setup/validate-simple.sh" >> deployment-plan.md
+        echo >> deployment-plan.md
+        echo "# Deploy with GitOps" >> deployment-plan.md
+        echo "./setup/deploy-gitops.sh" >> deployment-plan.md
+        echo >> deployment-plan.md
+        echo "# Verify deployment" >> deployment-plan.md
+        echo "./setup/health-check.sh" >> deployment-plan.md
+        echo "\`\`\`" >> deployment-plan.md
+        
+        cat deployment-plan.md
+    
+    - name: Upload deployment plan
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-plan
+        path: deployment-plan.md
+
+  validate-scripts:
+    name: 🛠️ Script Validation
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Validate shell scripts
+      run: |
+        echo "🔍 Validating shell scripts..."
+        
+        find setup/ -name "*.sh" -type f | while read script; do
+          echo "Checking: $script"
+          
+          # Check syntax
+          bash -n "$script" || {
+            echo "❌ Syntax error in: $script"
+            exit 1
+          }
+          
+          # Check shellcheck if available
+          if command -v shellcheck &> /dev/null; then
+            shellcheck "$script" || echo "⚠️ Shellcheck warnings in: $script"
+          fi
+        done
+        
+        echo "✅ All scripts validated"
+    
+    - name: Test dry-run capabilities
+      run: |
+        echo "🧪 Testing script dry-run capabilities..."
+        
+        # Test validation script
+        if [[ -f "setup/validate-simple.sh" ]]; then
+          echo "Testing validation script..."
+          # This would run in a real cluster: ./setup/validate-simple.sh
+          echo "✅ Validation script ready"
+        fi

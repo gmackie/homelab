@@ -1,0 +1,746 @@
+# Development and Testing Environment for Homelab
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: development
+  labels:
+    name: development
+    environment: dev
+
+---
+# Code-Server IDE for Remote Development
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: code-server
+  namespace: development
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: code-server
+  template:
+    metadata:
+      labels:
+        app: code-server
+        network-policy: "web-accessible"
+    spec:
+      # Prefer AMD64 for development tools
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64", "arm64"]
+      containers:
+      - name: code-server
+        image: codercom/code-server:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: PASSWORD
+          value: "homelab-dev-changeme"  # Change this!
+        - name: SUDO_PASSWORD
+          value: "homelab-dev-changeme"  # Change this!
+        volumeMounts:
+        - name: dev-workspace
+          mountPath: /home/coder/workspace
+        - name: dev-config
+          mountPath: /home/coder/.config
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+      volumes:
+      - name: dev-workspace
+        persistentVolumeClaim:
+          claimName: dev-workspace
+      - name: dev-config
+        persistentVolumeClaim:
+          claimName: dev-config
+
+---
+# Development Workspace PVCs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dev-workspace
+  namespace: development
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dev-config
+  namespace: development
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: local-path
+
+---
+# Code-Server Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: code-server
+  namespace: development
+spec:
+  selector:
+    app: code-server
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# Code-Server Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: code-server-ingress
+  namespace: development
+spec:
+  rules:
+  - host: code.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: code-server
+            port:
+              number: 8080
+
+---
+# GitLab CE for Internal Git Hosting
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitlab-ce
+  namespace: development
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitlab-ce
+  template:
+    metadata:
+      labels:
+        app: gitlab-ce
+        network-policy: "web-accessible"
+    spec:
+      # GitLab needs AMD64 for better performance
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: gitlab
+        image: gitlab/gitlab-ce:latest
+        ports:
+        - containerPort: 80
+        - containerPort: 22
+        env:
+        - name: GITLAB_OMNIBUS_CONFIG
+          value: |
+            external_url 'http://gitlab.homelab.local'
+            gitlab_rails['gitlab_shell_ssh_port'] = 2222
+            gitlab_rails['monitoring_whitelist'] = ['127.0.0.0/8', '192.168.0.0/16']
+            gitlab_rails['backup_keep_time'] = 604800
+            prometheus_monitoring['enable'] = true
+            
+            # Resource optimization for homelab
+            puma['worker_processes'] = 2
+            sidekiq['max_concurrency'] = 10
+            postgresql['shared_buffers'] = "64MB"
+            
+            # Disable unnecessary features for homelab
+            gitlab_kas['enable'] = false
+            prometheus['enable'] = false
+            grafana['enable'] = false
+        volumeMounts:
+        - name: gitlab-config
+          mountPath: /etc/gitlab
+        - name: gitlab-logs
+          mountPath: /var/log/gitlab
+        - name: gitlab-data
+          mountPath: /var/opt/gitlab
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2000m"
+            memory: "6Gi"
+        livenessProbe:
+          httpGet:
+            path: /-/health
+            port: 80
+          initialDelaySeconds: 300
+          periodSeconds: 30
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /-/readiness
+            port: 80
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: gitlab-config
+        persistentVolumeClaim:
+          claimName: gitlab-config
+      - name: gitlab-logs
+        persistentVolumeClaim:
+          claimName: gitlab-logs
+      - name: gitlab-data
+        persistentVolumeClaim:
+          claimName: gitlab-data
+
+---
+# GitLab PVCs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitlab-config
+  namespace: development
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: local-path
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitlab-logs
+  namespace: development
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: local-path
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitlab-data
+  namespace: development
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: local-path
+
+---
+# GitLab Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitlab-ce
+  namespace: development
+spec:
+  selector:
+    app: gitlab-ce
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  - name: ssh
+    port: 2222
+    targetPort: 22
+
+---
+# GitLab Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gitlab-ingress
+  namespace: development
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  rules:
+  - host: gitlab.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: gitlab-ce
+            port:
+              number: 80
+
+---
+# Jenkins for CI/CD Automation
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: development
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jenkins
+  template:
+    metadata:
+      labels:
+        app: jenkins
+        network-policy: "web-accessible"
+    spec:
+      # Jenkins prefers AMD64 for plugins
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      serviceAccountName: jenkins
+      containers:
+      - name: jenkins
+        image: jenkins/jenkins:lts
+        ports:
+        - containerPort: 8080
+        - containerPort: 50000
+        env:
+        - name: JAVA_OPTS
+          value: "-Djenkins.install.runSetupWizard=false -Xmx1g"
+        - name: JENKINS_OPTS
+          value: "--httpPort=8080"
+        volumeMounts:
+        - name: jenkins-home
+          mountPath: /var/jenkins_home
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "1Gi"
+          limits:
+            cpu: "1000m"
+            memory: "3Gi"
+      volumes:
+      - name: jenkins-home
+        persistentVolumeClaim:
+          claimName: jenkins-data
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+
+---
+# Jenkins Data PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jenkins-data
+  namespace: development
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 15Gi
+  storageClassName: local-path
+
+---
+# Jenkins Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins
+  namespace: development
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jenkins
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints", "persistentvolumeclaims", "events", "configmaps", "secrets"]
+  verbs: ["*"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+  verbs: ["*"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jenkins
+subjects:
+- kind: ServiceAccount
+  name: jenkins
+  namespace: development
+
+---
+# Jenkins Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins
+  namespace: development
+spec:
+  selector:
+    app: jenkins
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  - name: jnlp
+    port: 50000
+    targetPort: 50000
+
+---
+# Jenkins Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jenkins-ingress
+  namespace: development
+spec:
+  rules:
+  - host: jenkins.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: jenkins
+            port:
+              number: 8080
+
+---
+# Testing Environment Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: testing
+  labels:
+    name: testing
+    environment: test
+
+---
+# Test Runner for Homelab Configurations
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: homelab-config-tests
+  namespace: testing
+spec:
+  schedule: "0 6 * * *"  # 6 AM daily
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          # Test runner on ARM64 for efficiency
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["arm64", "amd64"]
+          containers:
+          - name: config-tester
+            image: alpine:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache kubectl python3 py3-pip curl
+              pip install pyyaml
+              
+              echo "🧪 Starting homelab configuration tests..."
+              
+              # Test 1: YAML Validation
+              echo "Test 1: YAML syntax validation"
+              find /configs -name "*.yaml" | while read file; do
+                python3 -c "
+              import yaml
+              try:
+                  with open('$file', 'r') as f:
+                      list(yaml.safe_load_all(f))
+                  print('✅ $file')
+              except Exception as e:
+                  print('❌ $file: ' + str(e))
+                  exit(1)
+              "
+              done
+              
+              # Test 2: Service Accessibility
+              echo "Test 2: Service accessibility"
+              services=(
+                "homer.homelab.local"
+                "homeassistant.homelab.local"
+                "grafana.homelab.local"
+                "jellyfin.homelab.local"
+              )
+              
+              for service in "${services[@]}"; do
+                if timeout 10 curl -s -o /dev/null -w "%{http_code}" "http://$service" | grep -q "200\|302\|401"; then
+                  echo "✅ $service accessible"
+                else
+                  echo "❌ $service not accessible"
+                fi
+              done
+              
+              # Test 3: Architecture Distribution
+              echo "Test 3: Architecture distribution"
+              kubectl get nodes -o custom-columns="ARCH:.status.nodeInfo.architecture" --no-headers | sort | uniq -c
+              
+              # Test 4: Resource Utilization
+              echo "Test 4: Resource utilization check"
+              kubectl top nodes 2>/dev/null || echo "Metrics not available"
+              
+              echo "🧪 Configuration tests completed"
+            volumeMounts:
+            - name: config-volume
+              mountPath: /configs
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "128Mi"
+              limits:
+                cpu: "500m"
+                memory: "512Mi"
+          volumes:
+          - name: config-volume
+            projected:
+              sources:
+              - configMap:
+                  name: test-configs
+          restartPolicy: OnFailure
+
+---
+# Test Configuration Data
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-configs
+  namespace: testing
+data:
+  test-suite.yaml: |
+    # Homelab Test Suite Configuration
+    test_environments:
+      - name: "production"
+        namespace_pattern: "storage|homelab-services|smart-home|media|monitoring"
+        required_services:
+          - "homer"
+          - "pihole"
+          - "home-assistant"
+          - "jellyfin"
+          - "grafana"
+      
+      - name: "staging"
+        namespace_pattern: "staging-.*"
+        required_services:
+          - "test-homer"
+          - "test-pihole"
+    
+    performance_thresholds:
+      cpu_utilization_max: 80
+      memory_utilization_max: 85
+      pod_startup_time_max: 120
+      service_response_time_max: 5
+    
+    power_efficiency_targets:
+      total_power_max: 85  # 85W max with 5W buffer
+      cpu_efficiency_min: 0.7
+      memory_efficiency_min: 0.6
+
+---
+# Staging Environment for Testing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: staging-homer
+  namespace: testing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: staging-homer
+  template:
+    metadata:
+      labels:
+        app: staging-homer
+    spec:
+      # Testing on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64", "arm"]
+      containers:
+      - name: homer
+        image: b4bz/homer:latest
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: config
+          mountPath: /www/assets
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+      volumes:
+      - name: config
+        configMap:
+          name: staging-homer-config
+
+---
+# Staging Homer Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: staging-homer-config
+  namespace: testing
+data:
+  config.yml: |
+    title: "🧪 Homelab Testing Environment"
+    subtitle: "Staging & Development"
+    
+    defaults:
+      layout: columns
+      colorTheme: auto
+    
+    services:
+      - name: "Development Tools"
+        icon: "fas fa-code"
+        items:
+          - name: "Code Server"
+            logo: "https://github.com/coder/code-server/raw/main/src/browser/media/favicon.svg"
+            subtitle: "VS Code in browser"
+            url: "http://code.homelab.local"
+            
+          - name: "GitLab"
+            logo: "https://about.gitlab.com/images/press/logo/svg/gitlab-logo-600.svg"
+            subtitle: "Git repository hosting"
+            url: "http://gitlab.homelab.local"
+            
+          - name: "Jenkins"
+            logo: "https://www.jenkins.io/images/logos/jenkins/jenkins.svg"
+            subtitle: "CI/CD automation"
+            url: "http://jenkins.homelab.local"
+      
+      - name: "Testing Services"
+        icon: "fas fa-flask"
+        items:
+          - name: "Staging Homer"
+            subtitle: "Test dashboard configuration"
+            url: "http://staging.homelab.local"
+
+---
+# Staging Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: staging-homer
+  namespace: testing
+spec:
+  selector:
+    app: staging-homer
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+# Staging Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: staging-ingress
+  namespace: testing
+spec:
+  rules:
+  - host: staging.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: staging-homer
+            port:
+              number: 8080
+
+---
+# Development Resource Quotas
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: dev-resource-quota
+  namespace: development
+spec:
+  hard:
+    requests.cpu: "2000m"      # 2 CPU cores for development
+    requests.memory: "8Gi"     # 8GB RAM for development
+    limits.cpu: "4000m"        # 4 CPU cores max
+    limits.memory: "16Gi"      # 16GB RAM max
+    persistentvolumeclaims: "20"
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: test-resource-quota
+  namespace: testing
+spec:
+  hard:
+    requests.cpu: "500m"       # 0.5 CPU for testing
+    requests.memory: "1Gi"     # 1GB RAM for testing
+    limits.cpu: "1000m"        # 1 CPU core max
+    limits.memory: "2Gi"       # 2GB RAM max
+    persistentvolumeclaims: "5"

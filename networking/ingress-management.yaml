@@ -1,0 +1,334 @@
+# Centralized Ingress Management for Homelab Services
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-system
+  labels:
+    name: ingress-system
+
+---
+# Nginx Ingress Controller (Alternative/Fallback)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-ingress-controller
+  namespace: ingress-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx-ingress-controller
+  template:
+    metadata:
+      labels:
+        app: nginx-ingress-controller
+    spec:
+      # Multi-architecture support with preference for ARM64
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64", "amd64"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["nginx-ingress-controller"]
+              topologyKey: kubernetes.io/hostname
+      serviceAccountName: nginx-ingress
+      containers:
+      - name: nginx-ingress-controller
+        image: registry.k8s.io/ingress-nginx/controller:v1.8.1
+        args:
+          - /nginx-ingress-controller
+          - --configmap=$(POD_NAMESPACE)/nginx-configuration
+          - --tcp-services-configmap=$(POD_NAMESPACE)/tcp-services
+          - --udp-services-configmap=$(POD_NAMESPACE)/udp-services
+          - --publish-service=$(POD_NAMESPACE)/nginx-ingress
+          - --annotations-prefix=nginx.ingress.kubernetes.io
+          - --enable-ssl-passthrough
+          - --metrics-bind-address=0.0.0.0:10254
+        securityContext:
+          allowPrivilegeEscalation: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+          runAsUser: 101
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - name: http
+          containerPort: 80
+        - name: https
+          containerPort: 443
+        - name: metrics
+          containerPort: 10254
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 10254
+            scheme: HTTP
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 10254
+            scheme: HTTP
+          periodSeconds: 10
+          timeoutSeconds: 5
+
+---
+# Nginx Ingress Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-ingress
+  namespace: ingress-system
+
+---
+# Nginx Ingress RBAC
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nginx-ingress
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "endpoints", "nodes", "pods", "secrets", "namespaces"]
+  verbs: ["list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  resourceNames: []
+  verbs: ["create", "patch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses/status"]
+  verbs: ["update"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingressclasses"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nginx-ingress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nginx-ingress
+subjects:
+- kind: ServiceAccount
+  name: nginx-ingress
+  namespace: ingress-system
+
+---
+# Nginx Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-configuration
+  namespace: ingress-system
+data:
+  # Optimize for homelab use
+  worker-processes: "auto"
+  worker-connections: "1024"
+  keepalive-requests: "100"
+  keepalive-timeout: "65"
+  proxy-connect-timeout: "60"
+  proxy-send-timeout: "60"
+  proxy-read-timeout: "60"
+  proxy-buffer-size: "4k"
+  proxy-buffers: "8 4k"
+  proxy-busy-buffers-size: "8k"
+  
+  # Security headers
+  add-headers: "ingress-system/security-headers"
+  
+  # Enable real IP
+  use-forwarded-headers: "true"
+  compute-full-forwarded-for: "true"
+  
+  # Performance
+  enable-brotli: "true"
+  gzip-level: "6"
+  gzip-types: "text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript"
+
+---
+# Security Headers ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-headers
+  namespace: ingress-system
+data:
+  X-Frame-Options: "SAMEORIGIN"
+  X-Content-Type-Options: "nosniff"
+  X-XSS-Protection: "1; mode=block"
+  Referrer-Policy: "strict-origin-when-cross-origin"
+  Strict-Transport-Security: "max-age=31536000; includeSubDomains"
+
+---
+# TCP Services (for non-HTTP protocols)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tcp-services
+  namespace: ingress-system
+data:
+  1883: "smart-home/mosquitto:1883"  # MQTT
+  8883: "smart-home/mosquitto:8883"  # MQTT TLS
+  5432: "storage/postgresql:5432"    # PostgreSQL
+
+---
+# UDP Services
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: udp-services
+  namespace: ingress-system
+data:
+  53: "homelab-services/pihole:53"   # DNS
+
+---
+# Nginx Ingress Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-ingress
+  namespace: ingress-system
+  annotations:
+    metallb.universe.tf/address-pool: homelab-pool
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx-ingress-controller
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  - name: https
+    port: 443
+    targetPort: 443
+  - name: mqtt
+    port: 1883
+    targetPort: 1883
+    protocol: TCP
+  - name: mqtt-tls
+    port: 8883
+    targetPort: 8883
+    protocol: TCP
+
+---
+# Ingress Class Definition
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: k8s.io/ingress-nginx
+
+---
+# Wildcard Certificate for Homelab Domain
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: homelab-wildcard-cert
+  namespace: networking
+spec:
+  secretName: homelab-wildcard-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+  - "*.homelab.local"
+  - "homelab.local"
+
+---
+# Default Backend for 404 Handling
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: default-backend
+  namespace: ingress-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: default-backend
+  template:
+    metadata:
+      labels:
+        app: default-backend
+    spec:
+      # Use ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm", "arm64"]
+      containers:
+      - name: default-backend
+        image: registry.k8s.io/defaultbackend-amd64:1.5
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "5m"
+            memory: "16Mi"
+          limits:
+            cpu: "50m"
+            memory: "64Mi"
+
+---
+# Default Backend Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: default-backend
+  namespace: ingress-system
+spec:
+  selector:
+    app: default-backend
+  ports:
+  - port: 80
+    targetPort: 8080

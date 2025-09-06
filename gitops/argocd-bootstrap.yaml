@@ -1,0 +1,195 @@
+# ArgoCD Bootstrap Configuration for Homelab GitOps
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+  labels:
+    name: argocd
+
+---
+# ArgoCD Installation
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://argoproj.github.io/argo-helm
+    chart: argo-cd
+    targetRevision: 5.51.6
+    helm:
+      values: |
+        global:
+          image:
+            tag: v2.8.4
+        
+        server:
+          ingress:
+            enabled: true
+            hosts:
+              - argocd.homelab.local
+            paths:
+              - /
+            pathType: Prefix
+          
+          # Multi-architecture placement
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64", "arm64"]
+          
+          config:
+            repositories: |
+              - type: git
+                url: https://github.com/your-org/homelab
+                name: homelab-config
+            
+            resource.customizations: |
+              apps/Deployment:
+                health.lua: |
+                  hs = {}
+                  if obj.status ~= nil then
+                    if obj.status.replicas ~= nil and obj.status.updatedReplicas ~= nil and obj.status.readyReplicas ~= nil and obj.status.availableReplicas ~= nil then
+                      if obj.status.updatedReplicas == obj.status.replicas and obj.status.readyReplicas == obj.status.replicas and obj.status.availableReplicas == obj.status.replicas then
+                        hs.status = "Healthy"
+                        return hs
+                      end
+                    end
+                  end
+                  hs.status = "Progressing"
+                  return hs
+          
+          extraArgs:
+            - --insecure # For internal homelab use
+        
+        controller:
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64", "arm64"]
+          
+          metrics:
+            enabled: true
+            serviceMonitor:
+              enabled: true
+        
+        repoServer:
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64", "arm64"]
+        
+        redis:
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64", "arm64"]
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+
+---
+# Homelab Application of Applications
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: homelab-apps
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/homelab # Change this!
+    targetRevision: HEAD
+    path: gitops/applications
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# ArgoCD Projects for different application types
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: homelab-infrastructure
+  namespace: argocd
+spec:
+  description: Infrastructure applications (storage, networking)
+  sourceRepos:
+  - '*'
+  destinations:
+  - namespace: storage
+    server: https://kubernetes.default.svc
+  - namespace: networking
+    server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+  - group: '*'
+    kind: '*'
+  namespaceResourceWhitelist:
+  - group: '*'
+    kind: '*'
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: homelab-services
+  namespace: argocd
+spec:
+  description: Core homelab services
+  sourceRepos:
+  - '*'
+  destinations:
+  - namespace: homelab-services
+    server: https://kubernetes.default.svc
+  - namespace: smart-home
+    server: https://kubernetes.default.svc
+  - namespace: media
+    server: https://kubernetes.default.svc
+  - namespace: monitoring
+    server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+  - group: '*'
+    kind: '*'
+  namespaceResourceWhitelist:
+  - group: '*'
+    kind: '*'

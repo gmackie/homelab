@@ -45,52 +45,56 @@ KUBECTL_CMD="${KUBECTL_CMD:-kubectl}"
 SKIP_CONFIRMATION="${SKIP_CONFIRMATION:-false}"
 VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
 
-# Deployment phases
+# Deployment phases (simplified for actual available components)
 PHASES=(
-    "core-infrastructure"
-    "gitops"
-    "service-mesh"
-    "observability"
     "storage"
-    "media"
+    "services"
     "smart-home"
-    "homelab-services"
+    "media"
+    "monitoring"
     "dashboard"
+    "gitops"
 )
 
-# Component manifests
-declare -A MANIFESTS
-MANIFESTS["core-infrastructure"]="infrastructure/core-infrastructure.yaml"
-MANIFESTS["gitops"]="gitops/argocd.yaml"
-MANIFESTS["service-mesh"]="service-mesh/linkerd.yaml"
-MANIFESTS["observability"]="monitoring/prometheus.yaml monitoring/grafana.yaml monitoring/grafana-homeassistant.yaml"
-MANIFESTS["storage"]="storage/network-storage.yaml"
-MANIFESTS["media"]="media/media-stack.yaml media/sabnzbd.yaml"
-MANIFESTS["smart-home"]="smart-home/home-assistant.yaml smart-home/esphome-devices.yaml"
-MANIFESTS["homelab-services"]="services/homelab-services.yaml"
-MANIFESTS["dashboard"]="apps/dashboard/api/deployment.yaml apps/dashboard/ui/deployment.yaml"
+# Component manifests mapping (compatible with bash 3.2)
+get_manifests() {
+    case $1 in
+        "storage") echo "storage/network-storage.yaml" ;;
+        "services") echo "services/homelab-services.yaml" ;;
+        "smart-home") echo "smart-home/home-assistant.yaml smart-home/esphome-devices.yaml" ;;
+        "media") echo "media/media-stack.yaml media/sabnzbd.yaml" ;;
+        "monitoring") echo "monitoring/grafana-homeassistant.yaml" ;;
+        "dashboard") echo "apps/touchscreen-monitor/touchscreen-dashboard.yaml apps/dashboard/api/deployment.yaml apps/dashboard/ui/deployment.yaml" ;;
+        "gitops") echo "gitops/argocd-bootstrap.yaml" ;;
+        *) echo "" ;;
+    esac
+}
 
-declare -A DESCRIPTIONS
-DESCRIPTIONS["core-infrastructure"]="Core Infrastructure (Cilium, Longhorn, MetalLB)"
-DESCRIPTIONS["gitops"]="GitOps Platform (ArgoCD)"
-DESCRIPTIONS["service-mesh"]="Service Mesh (Linkerd)"
-DESCRIPTIONS["observability"]="Monitoring & Observability (Prometheus, Grafana)"
-DESCRIPTIONS["storage"]="Network Storage (MinIO, Nextcloud, NFS)"
-DESCRIPTIONS["media"]="Media Stack (Jellyfin, *arr apps, SABnzbd)"
-DESCRIPTIONS["smart-home"]="Smart Home Platform (Home Assistant, ESPHome)"
-DESCRIPTIONS["homelab-services"]="Essential Services (Pi-hole, Portainer, etc.)"
-DESCRIPTIONS["dashboard"]="Cluster Dashboard (API + UI)"
+get_description() {
+    case $1 in
+        "storage") echo "Network Storage (MinIO, Nextcloud, NFS)" ;;
+        "services") echo "Essential Services (Pi-hole, Portainer, Homer)" ;;
+        "smart-home") echo "Smart Home Platform (Home Assistant, ESPHome)" ;;
+        "media") echo "Media Stack (Jellyfin, *arr apps, SABnzbd)" ;;
+        "monitoring") echo "Monitoring & Observability (Grafana dashboards)" ;;
+        "dashboard") echo "Touchscreen Dashboard Interface" ;;
+        "gitops") echo "GitOps Platform (ArgoCD)" ;;
+        *) echo "Unknown component" ;;
+    esac
+}
 
-declare -A NAMESPACES
-NAMESPACES["core-infrastructure"]="kube-system longhorn-system metallb-system"
-NAMESPACES["gitops"]="argocd"
-NAMESPACES["service-mesh"]="linkerd linkerd-viz"
-NAMESPACES["observability"]="monitoring"
-NAMESPACES["storage"]="storage"
-NAMESPACES["media"]="media"
-NAMESPACES["smart-home"]="smart-home"
-NAMESPACES["homelab-services"]="homelab-services"
-NAMESPACES["dashboard"]="default"
+get_namespaces() {
+    case $1 in
+        "storage") echo "storage" ;;
+        "services") echo "homelab-services" ;;
+        "smart-home") echo "smart-home" ;;
+        "media") echo "media" ;;
+        "monitoring") echo "monitoring" ;;
+        "dashboard") echo "touchscreen default" ;;
+        "gitops") echo "argocd" ;;
+        *) echo "" ;;
+    esac
+}
 
 # Function to display banner
 display_banner() {
@@ -184,7 +188,7 @@ ensure_namespaces() {
         return 0
     fi
     
-    local namespaces=${NAMESPACES[$phase]:-}
+    local namespaces=$(get_namespaces "$phase")
     if [[ -n "$namespaces" ]]; then
         for ns in $namespaces; do
             if ! ${KUBECTL_CMD} get namespace $ns &> /dev/null; then
@@ -198,7 +202,7 @@ ensure_namespaces() {
 # Function to apply manifests
 apply_manifests() {
     local phase=$1
-    local manifests=${MANIFESTS[$phase]:-}
+    local manifests=$(get_manifests "$phase")
     
     if [[ -z "$manifests" ]]; then
         log_warning "No manifests defined for phase: $phase"
@@ -246,7 +250,7 @@ wait_for_phase_ready() {
     
     log_info "Waiting for $phase to be ready..."
     
-    local namespaces=${NAMESPACES[$phase]:-}
+    local namespaces=$(get_namespaces "$phase")
     if [[ -n "$namespaces" ]]; then
         for ns in $namespaces; do
             if ${KUBECTL_CMD} get namespace $ns &> /dev/null; then
@@ -296,7 +300,7 @@ display_cluster_status() {
     echo
     echo "=== Pod Status by Namespace ==="
     for phase in "${PHASES[@]}"; do
-        local namespaces=${NAMESPACES[$phase]:-}
+        local namespaces=$(get_namespaces "$phase")
         for ns in $namespaces; do
             if ${KUBECTL_CMD} get namespace $ns &> /dev/null; then
                 echo
@@ -453,7 +457,7 @@ main() {
     
     for phase in "${PHASES[@]}"; do
         local phase_start=$(date +%s)
-        log_step "Deploying phase: ${phase} - ${DESCRIPTIONS[$phase]}"
+        log_step "Deploying phase: ${phase} - $(get_description "$phase")"
         
         if apply_manifests "$phase"; then
             if [[ "${VALIDATE_ONLY}" != "true" ]]; then
