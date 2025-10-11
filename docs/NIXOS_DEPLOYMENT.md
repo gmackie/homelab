@@ -11,14 +11,43 @@ This guide integrates the homelab Kubernetes configurations with your NixOS-base
 
 ## 🚀 Step 1: Deploy NixOS on NUC
 
-### Build and Flash Custom ISO
+### Option A: Use Pre-built NixOS ISO (Recommended for tonight)
 
 ```bash
+# Download official NixOS minimal ISO for x86_64
+wget https://channels.nixos.org/nixos-24.11/latest-nixos-minimal-x86_64-linux.iso
+
+# Or use the graphical installer if preferred
+wget https://channels.nixos.org/nixos-24.11/latest-nixos-gnome-x86_64-linux.iso
+
+# Flash to USB (replace /dev/sdX with your USB device)
+sudo dd if=latest-nixos-minimal-x86_64-linux.iso of=/dev/sdX bs=4M status=progress
+```
+
+### Option B: Build Custom ISO (Requires x86_64 Linux machine)
+
+```bash
+# This requires an x86_64 Linux machine or remote builder
 # In the nix-config directory
 cd ../nix-config
 ./build-nuc-iso.sh
 
 # Flash to USB and install following NUC_K3S_INSTALL.md
+```
+
+**Note**: Since you're on ARM macOS, use Option A with the pre-built ISO and manually copy the NUC configuration during installation.
+
+### Copy NUC Configuration During Installation
+
+After booting from the NixOS ISO:
+
+```bash
+# On the NixOS installer, get the configuration from your repo
+curl -o /tmp/nuc-configuration.nix https://raw.githubusercontent.com/gmackie/nix-config/main/templates/nuc/configuration.nix
+
+# Or copy via USB if you have it prepared
+mount /dev/sdb1 /mnt/usb  # Your USB device
+cp /mnt/usb/configuration.nix /tmp/nuc-configuration.nix
 ```
 
 ### Verify NixOS + K3s Installation
