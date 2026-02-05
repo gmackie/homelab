@@ -171,7 +171,7 @@ validate_yaml() {
             return 1
         fi
     elif command -v python3 &> /dev/null; then
-        if ! python3 -c "import yaml; yaml.safe_load(open('$file'))" 2>/dev/null; then
+        if ! python3 -c "import yaml; list(yaml.safe_load_all(open('$file')))" 2>/dev/null; then
             log_error "YAML validation failed for $file"
             return 1
         fi

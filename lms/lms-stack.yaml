@@ -1,0 +1,646 @@
+# Learning Management Systems Stack
+# Moodle, Canvas LMS, and Chamilo for LTI development
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lms
+  labels:
+    name: lms
+
+---
+# =============================================================================
+# MOODLE LMS
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: moodle-data
+  namespace: lms
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: moodle-db
+  namespace: lms
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moodle-mariadb
+  namespace: lms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: moodle-mariadb
+  template:
+    metadata:
+      labels:
+        app: moodle-mariadb
+    spec:
+      containers:
+      - name: mariadb
+        image: mariadb:10.11
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "moodleroot123"
+        - name: MYSQL_DATABASE
+          value: "moodle"
+        - name: MYSQL_USER
+          value: "moodle"
+        - name: MYSQL_PASSWORD
+          value: "moodlepass123"
+        ports:
+        - containerPort: 3306
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: moodle-db
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moodle-mariadb
+  namespace: lms
+spec:
+  selector:
+    app: moodle-mariadb
+  ports:
+  - port: 3306
+    targetPort: 3306
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moodle
+  namespace: lms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: moodle
+  template:
+    metadata:
+      labels:
+        app: moodle
+    spec:
+      containers:
+      - name: moodle
+        image: bitnami/moodle:4.3
+        env:
+        - name: MOODLE_DATABASE_HOST
+          value: "moodle-mariadb"
+        - name: MOODLE_DATABASE_NAME
+          value: "moodle"
+        - name: MOODLE_DATABASE_USER
+          value: "moodle"
+        - name: MOODLE_DATABASE_PASSWORD
+          value: "moodlepass123"
+        - name: MOODLE_USERNAME
+          value: "admin"
+        - name: MOODLE_PASSWORD
+          value: "Admin123!"
+        - name: MOODLE_EMAIL
+          value: "admin@homelab.lan"
+        - name: MOODLE_SITE_NAME
+          value: "Homelab Moodle"
+        - name: MOODLE_SKIP_BOOTSTRAP
+          value: "no"
+        - name: MOODLE_HOST
+          value: "moodle.homelab.lan"
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 8443
+          name: https
+        volumeMounts:
+        - name: data
+          mountPath: /bitnami/moodle
+        - name: moodledata
+          mountPath: /bitnami/moodledata
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: moodle-data
+      - name: moodledata
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moodle
+  namespace: lms
+spec:
+  selector:
+    app: moodle
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: https
+    port: 443
+    targetPort: 8443
+
+---
+# =============================================================================
+# CANVAS LMS
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: canvas-data
+  namespace: lms
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: canvas-db
+  namespace: lms
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canvas-postgres
+  namespace: lms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: canvas-postgres
+  template:
+    metadata:
+      labels:
+        app: canvas-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: "canvas_production"
+        - name: POSTGRES_USER
+          value: "canvas"
+        - name: POSTGRES_PASSWORD
+          value: "canvaspass123"
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: canvas-db
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canvas-postgres
+  namespace: lms
+spec:
+  selector:
+    app: canvas-postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canvas-redis
+  namespace: lms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: canvas-redis
+  template:
+    metadata:
+      labels:
+        app: canvas-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canvas-redis
+  namespace: lms
+spec:
+  selector:
+    app: canvas-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: canvas-config
+  namespace: lms
+data:
+  database.yml: |
+    production:
+      adapter: postgresql
+      encoding: utf8
+      database: canvas_production
+      host: canvas-postgres
+      username: canvas
+      password: canvaspass123
+      timeout: 5000
+  redis.yml: |
+    production:
+      servers:
+        - redis://canvas-redis:6379
+  domain.yml: |
+    production:
+      domain: canvas.homelab.lan
+      ssl: false
+  security.yml: |
+    production:
+      encryption_key: "a]V@]3K=S_+|8E%bK-]3(9.E5c?TBM4DG4_:nCmAvkJOLwT0PR6"
+  outgoing_mail.yml: |
+    production:
+      address: localhost
+      port: 25
+      domain: homelab.lan
+      authentication: plain
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canvas
+  namespace: lms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: canvas
+  template:
+    metadata:
+      labels:
+        app: canvas
+    spec:
+      initContainers:
+      - name: wait-for-db
+        image: postgres:15-alpine
+        command: ['sh', '-c', 'until pg_isready -h canvas-postgres -p 5432 -U canvas; do echo waiting for database; sleep 2; done;']
+      containers:
+      - name: canvas
+        image: instructure/canvas-lms:stable
+        env:
+        - name: RAILS_ENV
+          value: "production"
+        - name: CANVAS_LMS_ADMIN_EMAIL
+          value: "admin@homelab.lan"
+        - name: CANVAS_LMS_ADMIN_PASSWORD
+          value: "Admin123!"
+        - name: CANVAS_LMS_ACCOUNT_NAME
+          value: "Homelab Canvas"
+        - name: CANVAS_LMS_STATS_COLLECTION
+          value: "opt_out"
+        - name: POSTGRES_HOST
+          value: "canvas-postgres"
+        - name: POSTGRES_USER
+          value: "canvas"
+        - name: POSTGRES_PASSWORD
+          value: "canvaspass123"
+        - name: REDIS_URL
+          value: "redis://canvas-redis:6379"
+        ports:
+        - containerPort: 3000
+          name: http
+        volumeMounts:
+        - name: config
+          mountPath: /usr/src/app/config/database.yml
+          subPath: database.yml
+        - name: config
+          mountPath: /usr/src/app/config/redis.yml
+          subPath: redis.yml
+        - name: config
+          mountPath: /usr/src/app/config/domain.yml
+          subPath: domain.yml
+        - name: config
+          mountPath: /usr/src/app/config/security.yml
+          subPath: security.yml
+        - name: config
+          mountPath: /usr/src/app/config/outgoing_mail.yml
+          subPath: outgoing_mail.yml
+        - name: data
+          mountPath: /usr/src/app/tmp
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+      volumes:
+      - name: config
+        configMap:
+          name: canvas-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: canvas-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: canvas
+  namespace: lms
+spec:
+  selector:
+    app: canvas
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+
+---
+# =============================================================================
+# CHAMILO LMS
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: chamilo-data
+  namespace: lms
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: chamilo-db
+  namespace: lms
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chamilo-mariadb
+  namespace: lms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chamilo-mariadb
+  template:
+    metadata:
+      labels:
+        app: chamilo-mariadb
+    spec:
+      containers:
+      - name: mariadb
+        image: mariadb:10.11
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "chamiloroot123"
+        - name: MYSQL_DATABASE
+          value: "chamilo"
+        - name: MYSQL_USER
+          value: "chamilo"
+        - name: MYSQL_PASSWORD
+          value: "chamilopass123"
+        ports:
+        - containerPort: 3306
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: chamilo-db
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chamilo-mariadb
+  namespace: lms
+spec:
+  selector:
+    app: chamilo-mariadb
+  ports:
+  - port: 3306
+    targetPort: 3306
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chamilo
+  namespace: lms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chamilo
+  template:
+    metadata:
+      labels:
+        app: chamilo
+    spec:
+      containers:
+      - name: chamilo
+        image: chamilo/chamilo-lms:1.11
+        env:
+        - name: CHAMILO_DB_HOST
+          value: "chamilo-mariadb"
+        - name: CHAMILO_DB_NAME
+          value: "chamilo"
+        - name: CHAMILO_DB_USER
+          value: "chamilo"
+        - name: CHAMILO_DB_PASSWORD
+          value: "chamilopass123"
+        - name: CHAMILO_ADMIN_EMAIL
+          value: "admin@homelab.lan"
+        - name: CHAMILO_ADMIN_PASSWORD
+          value: "Admin123!"
+        - name: CHAMILO_ADMIN_FIRSTNAME
+          value: "Admin"
+        - name: CHAMILO_ADMIN_LASTNAME
+          value: "User"
+        - name: CHAMILO_ADMIN_PHONE
+          value: ""
+        - name: CHAMILO_LANGUAGE
+          value: "english"
+        - name: CHAMILO_ENCRYPT_METHOD
+          value: "sha1"
+        - name: CHAMILO_URL
+          value: "http://chamilo.homelab.lan"
+        ports:
+        - containerPort: 80
+          name: http
+        volumeMounts:
+        - name: data
+          mountPath: /var/www/chamilo/app/courses
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: chamilo-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chamilo
+  namespace: lms
+spec:
+  selector:
+    app: chamilo
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+
+---
+# =============================================================================
+# INGRESS
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lms-ingress
+  namespace: lms
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "500m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: moodle.homelab.lan
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: moodle
+            port:
+              number: 80
+  - host: canvas.homelab.lan
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: canvas
+            port:
+              number: 80
+  - host: chamilo.homelab.lan
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: chamilo
+            port:
+              number: 80

@@ -1,64 +1,32 @@
-# Network Storage and File Management for Homelab Cluster
----
 apiVersion: v1
 kind: Namespace
 metadata:
   name: storage
   labels:
     name: storage
-
 ---
-# Longhorn Distributed Storage System
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: longhorn-config
   namespace: storage
 data:
-  values.yaml: |
-    defaultSettings:
-      backupTarget: s3://homelab-backups@us-east-1/
-      backupTargetCredentialSecret: aws-secret
-      createDefaultDiskLabeledNodes: true
-      defaultDataPath: /var/lib/longhorn/
-      replicaSoftAntiAffinity: false
-      storageOverProvisioningPercentage: 200
-      storageMinimalAvailablePercentage: 25
-      upgradeChecker: false
-      defaultReplicaCount: 2
-      guaranteedEngineCPU: 0.25
-      defaultLonghornStaticStorageClass: longhorn
-      backupstorePollInterval: 300
-      taintToleration: "node.longhorn.io/create-default-disk=true:NoSchedule"
-      
-    persistence:
-      defaultClass: true
-      defaultClassReplicaCount: 2
-      reclaimPolicy: Retain
-      
-    csi:
-      kubeletRootDir: /var/lib/kubelet
-      attacherReplicaCount: 2
-      provisionerReplicaCount: 2
-      resizerReplicaCount: 2
-      snapshotterReplicaCount: 2
-      
-    longhornManager:
-      tolerations:
-        - key: "node.longhorn.io/create-default-disk"
-          operator: "Equal"
-          value: "true"
-          effect: "NoSchedule"
-          
-    longhornDriver:
-      tolerations:
-        - key: "node.longhorn.io/create-default-disk"
-          operator: "Equal"
-          value: "true"
-          effect: "NoSchedule"
-
+  values.yaml: "defaultSettings:\n  backupTarget: s3://homelab-backups@us-east-1/\n\
+    \  backupTargetCredentialSecret: aws-secret\n  createDefaultDiskLabeledNodes:\
+    \ true\n  defaultDataPath: /var/lib/longhorn/\n  replicaSoftAntiAffinity: false\n\
+    \  storageOverProvisioningPercentage: 200\n  storageMinimalAvailablePercentage:\
+    \ 25\n  upgradeChecker: false\n  defaultReplicaCount: 2\n  guaranteedEngineCPU:\
+    \ 0.25\n  defaultLonghornStaticStorageClass: longhorn\n  backupstorePollInterval:\
+    \ 300\n  taintToleration: \"node.longhorn.io/create-default-disk=true:NoSchedule\"\
+    \n  \npersistence:\n  defaultClass: true\n  defaultClassReplicaCount: 2\n  reclaimPolicy:\
+    \ Retain\n  \ncsi:\n  kubeletRootDir: /var/lib/kubelet\n  attacherReplicaCount:\
+    \ 2\n  provisionerReplicaCount: 2\n  resizerReplicaCount: 2\n  snapshotterReplicaCount:\
+    \ 2\n  \nlonghornManager:\n  tolerations:\n    - key: \"node.longhorn.io/create-default-disk\"\
+    \n      operator: \"Equal\"\n      value: \"true\"\n      effect: \"NoSchedule\"\
+    \n      \nlonghornDriver:\n  tolerations:\n    - key: \"node.longhorn.io/create-default-disk\"\
+    \n      operator: \"Equal\"\n      value: \"true\"\n      effect: \"NoSchedule\"\
+    \n"
 ---
-# NFS Server for shared storage
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -74,7 +42,6 @@ spec:
       labels:
         app: nfs-server
     spec:
-      # Run on ARM64 for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -83,7 +50,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm64"]
+                values:
+                - arm64
       containers:
       - name: nfs-server
         image: itsthenetwork/nfs-server-alpine:latest
@@ -96,7 +64,7 @@ spec:
           containerPort: 111
         env:
         - name: SHARED_DIRECTORY
-          value: "/exports"
+          value: /exports
         volumeMounts:
         - name: nfs-storage
           mountPath: /exports
@@ -104,18 +72,16 @@ spec:
           privileged: true
         resources:
           requests:
-            cpu: "100m"
-            memory: "256Mi"
+            cpu: 100m
+            memory: 256Mi
           limits:
-            cpu: "500m"
-            memory: "1Gi"
+            cpu: 500m
+            memory: 1Gi
       volumes:
       - name: nfs-storage
         persistentVolumeClaim:
           claimName: nfs-storage
-
 ---
-# MinIO Object Storage
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -132,7 +98,6 @@ spec:
       labels:
         app: minio
     spec:
-      # Run on AMD64 for performance
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -141,15 +106,16 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["amd64"]
+                values:
+                - amd64
       containers:
       - name: minio
         image: minio/minio:latest
         args:
-          - server
-          - /data
-          - --console-address
-          - ":9001"
+        - server
+        - /data
+        - --console-address
+        - :9001
         ports:
         - containerPort: 9000
           name: api
@@ -157,21 +123,21 @@ spec:
           name: console
         env:
         - name: MINIO_ROOT_USER
-          value: "minioadmin"
+          value: minioadmin
         - name: MINIO_ROOT_PASSWORD
-          value: "minioadmin123"
+          value: minioadmin123
         - name: MINIO_BROWSER_REDIRECT_URL
-          value: "http://minio.homelab.local:9001"
+          value: http://minio.homelab.lan:9001
         volumeMounts:
         - name: minio-data
           mountPath: /data
         resources:
           requests:
-            cpu: "200m"
-            memory: "512Mi"
+            cpu: 200m
+            memory: 512Mi
           limits:
-            cpu: "1000m"
-            memory: "2Gi"
+            cpu: 1000m
+            memory: 2Gi
         livenessProbe:
           httpGet:
             path: /minio/health/live
@@ -188,14 +154,13 @@ spec:
   - metadata:
       name: minio-data
     spec:
-      accessModes: ["ReadWriteOnce"]
-      storageClassName: longhorn
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: local-path
       resources:
         requests:
-          storage: 1Ti
-
+          storage: 50Gi
 ---
-# Nextcloud for File Management
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -211,7 +176,6 @@ spec:
       labels:
         app: nextcloud
     spec:
-      # Run on AMD64 for performance
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -220,7 +184,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["amd64"]
+                values:
+                - amd64
       containers:
       - name: nextcloud
         image: nextcloud:27-apache
@@ -229,21 +194,21 @@ spec:
           name: web
         env:
         - name: POSTGRES_HOST
-          value: "nextcloud-postgres"
+          value: nextcloud-postgres
         - name: POSTGRES_DB
-          value: "nextcloud"
+          value: nextcloud
         - name: POSTGRES_USER
-          value: "nextcloud"
+          value: nextcloud
         - name: POSTGRES_PASSWORD
-          value: "nextcloud123"
+          value: nextcloud123
         - name: NEXTCLOUD_ADMIN_USER
-          value: "admin"
+          value: admin
         - name: NEXTCLOUD_ADMIN_PASSWORD
-          value: "admin123"
+          value: admin123
         - name: NEXTCLOUD_TRUSTED_DOMAINS
-          value: "nextcloud.homelab.local"
+          value: nextcloud.homelab.lan
         - name: REDIS_HOST
-          value: "nextcloud-redis"
+          value: nextcloud-redis
         volumeMounts:
         - name: nextcloud-data
           mountPath: /var/www/html
@@ -253,11 +218,11 @@ spec:
           mountPath: /mnt/shared
         resources:
           requests:
-            cpu: "500m"
-            memory: "1Gi"
+            cpu: 500m
+            memory: 1Gi
           limits:
-            cpu: "2000m"
-            memory: "4Gi"
+            cpu: 2000m
+            memory: 4Gi
       volumes:
       - name: nextcloud-data
         persistentVolumeClaim:
@@ -268,9 +233,7 @@ spec:
       - name: shared-storage
         persistentVolumeClaim:
           claimName: shared-storage
-
 ---
-# Nextcloud PostgreSQL
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -287,7 +250,6 @@ spec:
       labels:
         app: nextcloud-postgres
     spec:
-      # Run on ARM64 for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -296,19 +258,20 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm64"]
+                values:
+                - arm64
       containers:
       - name: postgres
         image: postgres:15-alpine
         env:
         - name: POSTGRES_DB
-          value: "nextcloud"
+          value: nextcloud
         - name: POSTGRES_USER
-          value: "nextcloud"
+          value: nextcloud
         - name: POSTGRES_PASSWORD
-          value: "nextcloud123"
+          value: nextcloud123
         - name: PGDATA
-          value: "/var/lib/postgresql/data/pgdata"
+          value: /var/lib/postgresql/data/pgdata
         ports:
         - containerPort: 5432
           name: postgres
@@ -317,23 +280,22 @@ spec:
           mountPath: /var/lib/postgresql/data
         resources:
           requests:
-            cpu: "100m"
-            memory: "256Mi"
+            cpu: 100m
+            memory: 256Mi
           limits:
-            cpu: "500m"
-            memory: "1Gi"
+            cpu: 500m
+            memory: 1Gi
   volumeClaimTemplates:
   - metadata:
       name: postgres-data
     spec:
-      accessModes: ["ReadWriteOnce"]
-      storageClassName: longhorn-ssd
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: local-path
       resources:
         requests:
-          storage: 50Gi
-
+          storage: 10Gi
 ---
-# Redis for Nextcloud caching
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -349,7 +311,6 @@ spec:
       labels:
         app: nextcloud-redis
     spec:
-      # Run on ARM for ultra-efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -358,7 +319,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm"]
+                values:
+                - arm
       containers:
       - name: redis
         image: redis:7-alpine
@@ -370,18 +332,16 @@ spec:
           mountPath: /data
         resources:
           requests:
-            cpu: "50m"
-            memory: "128Mi"
+            cpu: 50m
+            memory: 128Mi
           limits:
-            cpu: "200m"
-            memory: "512Mi"
+            cpu: 200m
+            memory: 512Mi
       volumes:
       - name: redis-data
         persistentVolumeClaim:
           claimName: nextcloud-redis-data
-
 ---
-# FileBrowser for simple file management
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -397,7 +357,6 @@ spec:
       labels:
         app: filebrowser
     spec:
-      # Run on ARM64 for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -406,7 +365,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm64"]
+                values:
+                - arm64
       containers:
       - name: filebrowser
         image: filebrowser/filebrowser:latest
@@ -415,7 +375,7 @@ spec:
           name: web
         env:
         - name: FB_BASEURL
-          value: "/files"
+          value: /files
         volumeMounts:
         - name: shared-storage
           mountPath: /srv
@@ -425,11 +385,11 @@ spec:
           mountPath: /database
         resources:
           requests:
-            cpu: "50m"
-            memory: "128Mi"
+            cpu: 50m
+            memory: 128Mi
           limits:
-            cpu: "200m"
-            memory: "512Mi"
+            cpu: 200m
+            memory: 512Mi
       volumes:
       - name: shared-storage
         persistentVolumeClaim:
@@ -440,9 +400,7 @@ spec:
       - name: filebrowser-database
         persistentVolumeClaim:
           claimName: filebrowser-database
-
 ---
-# Persistent Storage Claims
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -453,9 +411,8 @@ spec:
   - ReadWriteMany
   resources:
     requests:
-      storage: 2Ti
-  storageClassName: longhorn
-
+      storage: 50Gi
+  storageClassName: nfs
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -467,9 +424,8 @@ spec:
   - ReadWriteMany
   resources:
     requests:
-      storage: 5Ti
-  storageClassName: longhorn
-
+      storage: 100Gi
+  storageClassName: nfs
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -481,9 +437,8 @@ spec:
   - ReadWriteOnce
   resources:
     requests:
-      storage: 500Gi
-  storageClassName: longhorn
-
+      storage: 50Gi
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -495,9 +450,8 @@ spec:
   - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
-  storageClassName: longhorn-ssd
-
+      storage: 5Gi
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -509,9 +463,8 @@ spec:
   - ReadWriteOnce
   resources:
     requests:
-      storage: 5Gi
-  storageClassName: longhorn-ssd
-
+      storage: 2Gi
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -524,8 +477,7 @@ spec:
   resources:
     requests:
       storage: 1Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -537,11 +489,9 @@ spec:
   - ReadWriteOnce
   resources:
     requests:
-      storage: 5Gi
-  storageClassName: longhorn-ssd
-
+      storage: 2Gi
+  storageClassName: local-path
 ---
-# Services
 apiVersion: v1
 kind: Service
 metadata:
@@ -560,7 +510,6 @@ spec:
   - name: rpcbind
     port: 111
     targetPort: 111
-
 ---
 apiVersion: v1
 kind: Service
@@ -577,7 +526,6 @@ spec:
   - name: console
     port: 9001
     targetPort: 9001
-
 ---
 apiVersion: v1
 kind: Service
@@ -590,7 +538,6 @@ spec:
   ports:
   - port: 80
     targetPort: 80
-
 ---
 apiVersion: v1
 kind: Service
@@ -603,7 +550,6 @@ spec:
   ports:
   - port: 5432
     targetPort: 5432
-
 ---
 apiVersion: v1
 kind: Service
@@ -616,7 +562,6 @@ spec:
   ports:
   - port: 6379
     targetPort: 6379
-
 ---
 apiVersion: v1
 kind: Service
@@ -629,21 +574,19 @@ spec:
   ports:
   - port: 80
     targetPort: 80
-
 ---
-# Ingress for Storage Services
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: storage-ingress
   namespace: storage
   annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "0"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-body-size: '0'
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '600'
+    nginx.ingress.kubernetes.io/proxy-send-timeout: '600'
 spec:
   rules:
-  - host: minio.homelab.local
+  - host: minio.homelab.lan
     http:
       paths:
       - path: /
@@ -653,7 +596,7 @@ spec:
             name: minio
             port:
               number: 9001
-  - host: minio-api.homelab.local
+  - host: minio-api.homelab.lan
     http:
       paths:
       - path: /
@@ -663,7 +606,7 @@ spec:
             name: minio
             port:
               number: 9000
-  - host: nextcloud.homelab.local
+  - host: nextcloud.homelab.lan
     http:
       paths:
       - path: /
@@ -673,7 +616,7 @@ spec:
             name: nextcloud
             port:
               number: 80
-  - host: files.homelab.local
+  - host: files.homelab.lan
     http:
       paths:
       - path: /
@@ -683,65 +626,59 @@ spec:
             name: filebrowser
             port:
               number: 80
-
 ---
-# Storage Classes for different performance tiers
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: longhorn-ssd
   annotations:
-    storageclass.kubernetes.io/is-default-class: "false"
+    storageclass.kubernetes.io/is-default-class: 'false'
 provisioner: driver.longhorn.io
 allowVolumeExpansion: true
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
 parameters:
-  numberOfReplicas: "2"
-  staleReplicaTimeout: "2880"
-  fromBackup: ""
-  fsType: "ext4"
-  diskSelector: "ssd"
-  nodeSelector: "storage"
-
+  numberOfReplicas: '2'
+  staleReplicaTimeout: '2880'
+  fromBackup: ''
+  fsType: ext4
+  diskSelector: ssd
+  nodeSelector: storage
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: longhorn
   annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
+    storageclass.kubernetes.io/is-default-class: 'true'
 provisioner: driver.longhorn.io
 allowVolumeExpansion: true
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
 parameters:
-  numberOfReplicas: "2"
-  staleReplicaTimeout: "2880"
-  fromBackup: ""
-  fsType: "ext4"
-
+  numberOfReplicas: '2'
+  staleReplicaTimeout: '2880'
+  fromBackup: ''
+  fsType: ext4
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: longhorn-nvme
   annotations:
-    storageclass.kubernetes.io/is-default-class: "false"
+    storageclass.kubernetes.io/is-default-class: 'false'
 provisioner: driver.longhorn.io
 allowVolumeExpansion: true
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
 parameters:
-  numberOfReplicas: "3"
-  staleReplicaTimeout: "2880"
-  fromBackup: ""
-  fsType: "ext4"
-  diskSelector: "nvme"
-  nodeSelector: "storage,performance"
-
+  numberOfReplicas: '3'
+  staleReplicaTimeout: '2880'
+  fromBackup: ''
+  fsType: ext4
+  diskSelector: nvme
+  nodeSelector: storage,performance
 ---
-# Network File System (NFS) StorageClass
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -753,7 +690,7 @@ parameters:
 reclaimPolicy: Retain
 allowVolumeExpansion: true
 mountOptions:
-  - nfsvers=4.1
-  - proto=tcp
-  - hard
-  - intr
+- nfsvers=4.1
+- proto=tcp
+- hard
+- intr

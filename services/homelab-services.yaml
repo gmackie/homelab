@@ -388,7 +388,7 @@ spec:
         - name: ADMIN_TOKEN
           value: "vaultwarden123"
         - name: DOMAIN
-          value: "https://vault.homelab.local"
+          value: "https://vault.homelab.lan"
         volumeMounts:
         - name: vaultwarden-data
           mountPath: /data
@@ -513,25 +513,25 @@ data:
             logo: "assets/tools/dashboard.png"
             subtitle: "Cluster Dashboard"
             tag: "app"
-            url: "http://dashboard.homelab.local"
+            url: "http://dashboard.homelab.lan"
             target: "_blank"
           - name: "Grafana"
             logo: "assets/tools/grafana.png"
             subtitle: "Monitoring & Metrics"
             tag: "monitoring"
-            url: "http://grafana.homelab.local"
+            url: "http://grafana.homelab.lan"
             target: "_blank"
           - name: "ArgoCD"
             logo: "assets/tools/argocd.png"
             subtitle: "GitOps Deployment"
             tag: "devops"
-            url: "http://argocd.homelab.local"
+            url: "http://argocd.homelab.lan"
             target: "_blank"
           - name: "Portainer"
             logo: "assets/tools/portainer.png"
             subtitle: "Container Management"
             tag: "management"
-            url: "http://portainer.homelab.local"
+            url: "http://portainer.homelab.lan"
             target: "_blank"
             
       - name: "Storage & Files"
@@ -541,19 +541,19 @@ data:
             logo: "assets/tools/minio.png"
             subtitle: "Object Storage"
             tag: "storage"
-            url: "http://minio.homelab.local"
+            url: "http://minio.homelab.lan"
             target: "_blank"
           - name: "Nextcloud"
             logo: "assets/tools/nextcloud.png"
             subtitle: "File Sync & Share"
             tag: "files"
-            url: "http://nextcloud.homelab.local"
+            url: "http://nextcloud.homelab.lan"
             target: "_blank"
           - name: "File Browser"
             logo: "assets/tools/filebrowser.png"
             subtitle: "Simple File Manager"
             tag: "files"
-            url: "http://files.homelab.local"
+            url: "http://files.homelab.lan"
             target: "_blank"
             
       - name: "Media & Entertainment"
@@ -563,25 +563,25 @@ data:
             logo: "assets/tools/jellyfin.png"
             subtitle: "Media Server"
             tag: "media"
-            url: "http://jellyfin.homelab.local"
+            url: "http://jellyfin.homelab.lan"
             target: "_blank"
           - name: "Radarr"
             logo: "assets/tools/radarr.png"
             subtitle: "Movie Management"
             tag: "media"
-            url: "http://radarr.homelab.local"
+            url: "http://radarr.homelab.lan"
             target: "_blank"
           - name: "Sonarr"
             logo: "assets/tools/sonarr.png"
             subtitle: "TV Show Management"
             tag: "media"
-            url: "http://sonarr.homelab.local"
+            url: "http://sonarr.homelab.lan"
             target: "_blank"
           - name: "SABnzbd"
             logo: "assets/tools/sabnzbd.png"
             subtitle: "Usenet Downloader"
             tag: "downloads"
-            url: "http://sabnzbd.homelab.local"
+            url: "http://sabnzbd.homelab.lan"
             target: "_blank"
             
       - name: "Smart Home"
@@ -591,19 +591,19 @@ data:
             logo: "assets/tools/homeassistant.png"
             subtitle: "Smart Home Hub"
             tag: "automation"
-            url: "http://homeassistant.homelab.local"
+            url: "http://homeassistant.homelab.lan"
             target: "_blank"
           - name: "Node-RED"
             logo: "assets/tools/nodered.png"
             subtitle: "Flow-based Programming"
             tag: "automation"
-            url: "http://nodered.homelab.local"
+            url: "http://nodered.homelab.lan"
             target: "_blank"
           - name: "ESPHome"
             logo: "assets/tools/esphome.png"
             subtitle: "IoT Device Management"
             tag: "iot"
-            url: "http://esphome.homelab.local"
+            url: "http://esphome.homelab.lan"
             target: "_blank"
             
       - name: "Network & Security"
@@ -613,25 +613,25 @@ data:
             logo: "assets/tools/pihole.png"
             subtitle: "DNS Ad Blocker"
             tag: "security"
-            url: "http://pihole.homelab.local/admin"
+            url: "http://pihole.homelab.lan/admin"
             target: "_blank"
           - name: "Vaultwarden"
             logo: "assets/tools/vaultwarden.png"
             subtitle: "Password Manager"
             tag: "security"
-            url: "http://vault.homelab.local"
+            url: "http://vault.homelab.lan"
             target: "_blank"
           - name: "Uptime Kuma"
             logo: "assets/tools/uptime-kuma.png"
             subtitle: "Status Monitoring"
             tag: "monitoring"
-            url: "http://uptime.homelab.local"
+            url: "http://uptime.homelab.lan"
             target: "_blank"
           - name: "Speedtest"
             logo: "assets/tools/speedtest.png"
             subtitle: "Internet Speed Monitor"
             tag: "monitoring"
-            url: "http://speedtest.homelab.local"
+            url: "http://speedtest.homelab.lan"
             target: "_blank"
 
 ---
@@ -688,7 +688,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
+  storageClassName: local-path
 
 ---
 apiVersion: v1
@@ -702,7 +702,7 @@ spec:
   resources:
     requests:
       storage: 2Gi
-  storageClassName: longhorn-ssd
+  storageClassName: local-path
 
 ---
 apiVersion: v1
@@ -716,7 +716,7 @@ spec:
   resources:
     requests:
       storage: 10Gi
-  storageClassName: longhorn-ssd
+  storageClassName: local-path
 
 ---
 apiVersion: v1
@@ -730,7 +730,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
+  storageClassName: local-path
 
 ---
 apiVersion: v1
@@ -744,7 +744,7 @@ spec:
   resources:
     requests:
       storage: 10Gi
-  storageClassName: longhorn-ssd
+  storageClassName: local-path
 
 ---
 apiVersion: v1
@@ -758,7 +758,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
+  storageClassName: local-path
 
 ---
 apiVersion: v1
@@ -772,7 +772,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
+  storageClassName: local-path
 
 ---
 apiVersion: v1
@@ -786,7 +786,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
+  storageClassName: local-path
 
 ---
 # Services
@@ -913,7 +913,7 @@ metadata:
   namespace: homelab-services
 spec:
   rules:
-  - host: pihole.homelab.local
+  - host: pihole.homelab.lan
     http:
       paths:
       - path: /
@@ -923,7 +923,7 @@ spec:
             name: pihole
             port:
               number: 80
-  - host: portainer.homelab.local
+  - host: portainer.homelab.lan
     http:
       paths:
       - path: /
@@ -933,7 +933,7 @@ spec:
             name: portainer
             port:
               number: 9000
-  - host: uptime.homelab.local
+  - host: uptime.homelab.lan
     http:
       paths:
       - path: /
@@ -943,7 +943,7 @@ spec:
             name: uptime-kuma
             port:
               number: 3001
-  - host: homer.homelab.local
+  - host: homer.homelab.lan
     http:
       paths:
       - path: /
@@ -953,7 +953,7 @@ spec:
             name: homer
             port:
               number: 8080
-  - host: vault.homelab.local
+  - host: vault.homelab.lan
     http:
       paths:
       - path: /
@@ -963,7 +963,7 @@ spec:
             name: vaultwarden
             port:
               number: 80
-  - host: speedtest.homelab.local
+  - host: speedtest.homelab.lan
     http:
       paths:
       - path: /

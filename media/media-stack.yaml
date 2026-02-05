@@ -1,14 +1,10 @@
-# Complete Media Stack for Homelab
----
 apiVersion: v1
 kind: Namespace
 metadata:
   name: media
   labels:
     name: media
-
 ---
-# Jellyfin Media Server
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,7 +20,6 @@ spec:
       labels:
         app: jellyfin
     spec:
-      # Run on AMD64 for transcoding performance
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -33,7 +28,10 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["amd64"]
+                values:
+                - amd64
+      securityContext:
+        fsGroup: 1000
       containers:
       - name: jellyfin
         image: jellyfin/jellyfin:latest
@@ -49,9 +47,9 @@ spec:
           name: dlna-tcp
         env:
         - name: JELLYFIN_PublishedServerUrl
-          value: "http://jellyfin.homelab.local"
+          value: http://jellyfin.homelab.lan
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         volumeMounts:
         - name: config
           mountPath: /config
@@ -67,16 +65,14 @@ spec:
           mountPath: /music
         resources:
           requests:
-            cpu: "1000m"
-            memory: "2Gi"
+            cpu: 1000m
+            memory: 2Gi
           limits:
-            cpu: "4000m"
-            memory: "8Gi"
-            nvidia.com/gpu: 1  # Optional GPU for transcoding
+            cpu: 4000m
+            memory: 8Gi
         securityContext:
           runAsUser: 1000
           runAsGroup: 1000
-          fsGroup: 1000
       volumes:
       - name: config
         persistentVolumeClaim:
@@ -96,9 +92,7 @@ spec:
       - name: music
         persistentVolumeClaim:
           claimName: music-storage
-
 ---
-# Radarr for Movie Management
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -114,7 +108,6 @@ spec:
       labels:
         app: radarr
     spec:
-      # Run on ARM64 for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -123,7 +116,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm64"]
+                values:
+                - arm64
       containers:
       - name: radarr
         image: linuxserver/radarr:latest
@@ -132,11 +126,11 @@ spec:
           name: web
         env:
         - name: PUID
-          value: "1000"
+          value: '1000'
         - name: PGID
-          value: "1000"
+          value: '1000'
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         volumeMounts:
         - name: config
           mountPath: /config
@@ -146,11 +140,11 @@ spec:
           mountPath: /downloads
         resources:
           requests:
-            cpu: "100m"
-            memory: "256Mi"
+            cpu: 100m
+            memory: 256Mi
           limits:
-            cpu: "500m"
-            memory: "1Gi"
+            cpu: 500m
+            memory: 1Gi
       volumes:
       - name: config
         persistentVolumeClaim:
@@ -161,9 +155,7 @@ spec:
       - name: downloads
         persistentVolumeClaim:
           claimName: downloads-storage
-
 ---
-# Sonarr for TV Show Management
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -179,7 +171,6 @@ spec:
       labels:
         app: sonarr
     spec:
-      # Run on ARM64 for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -188,7 +179,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm64"]
+                values:
+                - arm64
       containers:
       - name: sonarr
         image: linuxserver/sonarr:latest
@@ -197,11 +189,11 @@ spec:
           name: web
         env:
         - name: PUID
-          value: "1000"
+          value: '1000'
         - name: PGID
-          value: "1000"
+          value: '1000'
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         volumeMounts:
         - name: config
           mountPath: /config
@@ -211,11 +203,11 @@ spec:
           mountPath: /downloads
         resources:
           requests:
-            cpu: "100m"
-            memory: "256Mi"
+            cpu: 100m
+            memory: 256Mi
           limits:
-            cpu: "500m"
-            memory: "1Gi"
+            cpu: 500m
+            memory: 1Gi
       volumes:
       - name: config
         persistentVolumeClaim:
@@ -226,9 +218,7 @@ spec:
       - name: downloads
         persistentVolumeClaim:
           claimName: downloads-storage
-
 ---
-# Lidarr for Music Management
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -244,7 +234,6 @@ spec:
       labels:
         app: lidarr
     spec:
-      # Run on ARM64 for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -253,7 +242,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm64"]
+                values:
+                - arm64
       containers:
       - name: lidarr
         image: linuxserver/lidarr:latest
@@ -262,11 +252,11 @@ spec:
           name: web
         env:
         - name: PUID
-          value: "1000"
+          value: '1000'
         - name: PGID
-          value: "1000"
+          value: '1000'
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         volumeMounts:
         - name: config
           mountPath: /config
@@ -276,11 +266,11 @@ spec:
           mountPath: /downloads
         resources:
           requests:
-            cpu: "100m"
-            memory: "256Mi"
+            cpu: 100m
+            memory: 256Mi
           limits:
-            cpu: "500m"
-            memory: "1Gi"
+            cpu: 500m
+            memory: 1Gi
       volumes:
       - name: config
         persistentVolumeClaim:
@@ -291,9 +281,7 @@ spec:
       - name: downloads
         persistentVolumeClaim:
           claimName: downloads-storage
-
 ---
-# Prowlarr for Indexer Management
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -309,7 +297,6 @@ spec:
       labels:
         app: prowlarr
     spec:
-      # Run on ARM for ultra-efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -318,7 +305,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm"]
+                values:
+                - arm
       containers:
       - name: prowlarr
         image: linuxserver/prowlarr:latest
@@ -327,28 +315,26 @@ spec:
           name: web
         env:
         - name: PUID
-          value: "1000"
+          value: '1000'
         - name: PGID
-          value: "1000"
+          value: '1000'
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         volumeMounts:
         - name: config
           mountPath: /config
         resources:
           requests:
-            cpu: "50m"
-            memory: "128Mi"
+            cpu: 50m
+            memory: 128Mi
           limits:
-            cpu: "200m"
-            memory: "512Mi"
+            cpu: 200m
+            memory: 512Mi
       volumes:
       - name: config
         persistentVolumeClaim:
           claimName: prowlarr-config
-
 ---
-# qBittorrent for Downloads
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -364,7 +350,6 @@ spec:
       labels:
         app: qbittorrent
     spec:
-      # Run on AMD64 for download performance
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -373,7 +358,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["amd64"]
+                values:
+                - amd64
       containers:
       - name: qbittorrent
         image: linuxserver/qbittorrent:latest
@@ -387,13 +373,13 @@ spec:
           protocol: UDP
         env:
         - name: PUID
-          value: "1000"
+          value: '1000'
         - name: PGID
-          value: "1000"
+          value: '1000'
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         - name: WEBUI_PORT
-          value: "8080"
+          value: '8080'
         volumeMounts:
         - name: config
           mountPath: /config
@@ -401,11 +387,11 @@ spec:
           mountPath: /downloads
         resources:
           requests:
-            cpu: "200m"
-            memory: "512Mi"
+            cpu: 200m
+            memory: 512Mi
           limits:
-            cpu: "1000m"
-            memory: "2Gi"
+            cpu: 1000m
+            memory: 2Gi
       volumes:
       - name: config
         persistentVolumeClaim:
@@ -413,9 +399,7 @@ spec:
       - name: downloads
         persistentVolumeClaim:
           claimName: downloads-storage
-
 ---
-# Jackett for Torrent Indexers
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -431,7 +415,6 @@ spec:
       labels:
         app: jackett
     spec:
-      # Run on ARM for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -440,7 +423,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm"]
+                values:
+                - arm
       containers:
       - name: jackett
         image: linuxserver/jackett:latest
@@ -449,11 +433,11 @@ spec:
           name: web
         env:
         - name: PUID
-          value: "1000"
+          value: '1000'
         - name: PGID
-          value: "1000"
+          value: '1000'
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         volumeMounts:
         - name: config
           mountPath: /config
@@ -461,11 +445,11 @@ spec:
           mountPath: /downloads
         resources:
           requests:
-            cpu: "50m"
-            memory: "128Mi"
+            cpu: 50m
+            memory: 128Mi
           limits:
-            cpu: "200m"
-            memory: "512Mi"
+            cpu: 200m
+            memory: 512Mi
       volumes:
       - name: config
         persistentVolumeClaim:
@@ -473,9 +457,7 @@ spec:
       - name: downloads
         persistentVolumeClaim:
           claimName: downloads-storage
-
 ---
-# Overseerr for Request Management
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -491,7 +473,6 @@ spec:
       labels:
         app: overseerr
     spec:
-      # Run on ARM64 for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -500,7 +481,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm64"]
+                values:
+                - arm64
       containers:
       - name: overseerr
         image: linuxserver/overseerr:latest
@@ -509,28 +491,26 @@ spec:
           name: web
         env:
         - name: PUID
-          value: "1000"
+          value: '1000'
         - name: PGID
-          value: "1000"
+          value: '1000'
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         volumeMounts:
         - name: config
           mountPath: /config
         resources:
           requests:
-            cpu: "100m"
-            memory: "256Mi"
+            cpu: 100m
+            memory: 256Mi
           limits:
-            cpu: "500m"
-            memory: "1Gi"
+            cpu: 500m
+            memory: 1Gi
       volumes:
       - name: config
         persistentVolumeClaim:
           claimName: overseerr-config
-
 ---
-# Bazarr for Subtitle Management
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -546,7 +526,6 @@ spec:
       labels:
         app: bazarr
     spec:
-      # Run on ARM for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -555,7 +534,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm"]
+                values:
+                - arm
       containers:
       - name: bazarr
         image: linuxserver/bazarr:latest
@@ -564,11 +544,11 @@ spec:
           name: web
         env:
         - name: PUID
-          value: "1000"
+          value: '1000'
         - name: PGID
-          value: "1000"
+          value: '1000'
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         volumeMounts:
         - name: config
           mountPath: /config
@@ -578,11 +558,11 @@ spec:
           mountPath: /tv
         resources:
           requests:
-            cpu: "50m"
-            memory: "128Mi"
+            cpu: 50m
+            memory: 128Mi
           limits:
-            cpu: "200m"
-            memory: "512Mi"
+            cpu: 200m
+            memory: 512Mi
       volumes:
       - name: config
         persistentVolumeClaim:
@@ -593,9 +573,7 @@ spec:
       - name: tv
         persistentVolumeClaim:
           claimName: tv-storage
-
 ---
-# Tautulli for Jellyfin Analytics
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -611,7 +589,6 @@ spec:
       labels:
         app: tautulli
     spec:
-      # Run on ARM64 for efficiency
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -620,7 +597,8 @@ spec:
               matchExpressions:
               - key: kubernetes.io/arch
                 operator: In
-                values: ["arm64"]
+                values:
+                - arm64
       containers:
       - name: tautulli
         image: linuxserver/tautulli:latest
@@ -629,28 +607,89 @@ spec:
           name: web
         env:
         - name: PUID
-          value: "1000"
+          value: '1000'
         - name: PGID
-          value: "1000"
+          value: '1000'
         - name: TZ
-          value: "America/New_York"
+          value: America/New_York
         volumeMounts:
         - name: config
           mountPath: /config
         resources:
           requests:
-            cpu: "50m"
-            memory: "128Mi"
+            cpu: 50m
+            memory: 128Mi
           limits:
-            cpu: "200m"
-            memory: "512Mi"
+            cpu: 200m
+            memory: 512Mi
       volumes:
       - name: config
         persistentVolumeClaim:
           claimName: tautulli-config
-
 ---
-# Persistent Storage Claims
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sabnzbd
+  namespace: media
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sabnzbd
+  template:
+    metadata:
+      labels:
+        app: sabnzbd
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values:
+                - amd64
+      containers:
+      - name: sabnzbd
+        image: linuxserver/sabnzbd:latest
+        ports:
+        - containerPort: 8080
+          name: web
+        env:
+        - name: PUID
+          value: '1000'
+        - name: PGID
+          value: '1000'
+        - name: TZ
+          value: America/New_York
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: downloads
+          mountPath: /downloads
+        - name: incomplete
+          mountPath: /incomplete-downloads
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: sabnzbd-config
+      - name: downloads
+        persistentVolumeClaim:
+          claimName: downloads-storage
+      - name: incomplete
+        persistentVolumeClaim:
+          claimName: sabnzbd-incomplete
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -662,8 +701,7 @@ spec:
   resources:
     requests:
       storage: 10Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -676,8 +714,7 @@ spec:
   resources:
     requests:
       storage: 50Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -690,8 +727,7 @@ spec:
   resources:
     requests:
       storage: 100Gi
-  storageClassName: longhorn
-
+  storageClassName: nfs
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -704,8 +740,7 @@ spec:
   resources:
     requests:
       storage: 5Ti
-  storageClassName: longhorn
-
+  storageClassName: nfs
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -718,8 +753,7 @@ spec:
   resources:
     requests:
       storage: 3Ti
-  storageClassName: longhorn
-
+  storageClassName: nfs
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -732,8 +766,7 @@ spec:
   resources:
     requests:
       storage: 1Ti
-  storageClassName: longhorn
-
+  storageClassName: nfs
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -746,8 +779,7 @@ spec:
   resources:
     requests:
       storage: 2Ti
-  storageClassName: longhorn
-
+  storageClassName: nfs
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -760,8 +792,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -774,8 +805,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -788,8 +818,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -802,8 +831,7 @@ spec:
   resources:
     requests:
       storage: 2Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -816,8 +844,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -830,8 +857,7 @@ spec:
   resources:
     requests:
       storage: 2Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -844,8 +870,7 @@ spec:
   resources:
     requests:
       storage: 5Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -858,8 +883,7 @@ spec:
   resources:
     requests:
       storage: 2Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -872,10 +896,47 @@ spec:
   resources:
     requests:
       storage: 2Gi
-  storageClassName: longhorn-ssd
-
+  storageClassName: local-path
 ---
-# Services
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sabnzbd-config
+  namespace: media
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sabnzbd-incomplete
+  namespace: media
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: downloads-storage
+  namespace: media
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: local-path
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -898,7 +959,6 @@ spec:
     port: 1900
     targetPort: 1900
     protocol: UDP
-
 ---
 apiVersion: v1
 kind: Service
@@ -911,7 +971,6 @@ spec:
   ports:
   - port: 7878
     targetPort: 7878
-
 ---
 apiVersion: v1
 kind: Service
@@ -924,7 +983,6 @@ spec:
   ports:
   - port: 8989
     targetPort: 8989
-
 ---
 apiVersion: v1
 kind: Service
@@ -937,7 +995,6 @@ spec:
   ports:
   - port: 8686
     targetPort: 8686
-
 ---
 apiVersion: v1
 kind: Service
@@ -950,7 +1007,6 @@ spec:
   ports:
   - port: 9696
     targetPort: 9696
-
 ---
 apiVersion: v1
 kind: Service
@@ -972,7 +1028,6 @@ spec:
     port: 6881
     targetPort: 6881
     protocol: UDP
-
 ---
 apiVersion: v1
 kind: Service
@@ -985,7 +1040,6 @@ spec:
   ports:
   - port: 9117
     targetPort: 9117
-
 ---
 apiVersion: v1
 kind: Service
@@ -998,7 +1052,6 @@ spec:
   ports:
   - port: 5055
     targetPort: 5055
-
 ---
 apiVersion: v1
 kind: Service
@@ -1011,7 +1064,6 @@ spec:
   ports:
   - port: 6767
     targetPort: 6767
-
 ---
 apiVersion: v1
 kind: Service
@@ -1024,21 +1076,31 @@ spec:
   ports:
   - port: 8181
     targetPort: 8181
-
 ---
-# Ingress for Media Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: sabnzbd
+  namespace: media
+spec:
+  selector:
+    app: sabnzbd
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: media-ingress
   namespace: media
   annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "0"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-body-size: '0'
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '600'
+    nginx.ingress.kubernetes.io/proxy-send-timeout: '600'
 spec:
   rules:
-  - host: jellyfin.homelab.local
+  - host: jellyfin.homelab.lan
     http:
       paths:
       - path: /
@@ -1048,7 +1110,7 @@ spec:
             name: jellyfin
             port:
               number: 8096
-  - host: radarr.homelab.local
+  - host: radarr.homelab.lan
     http:
       paths:
       - path: /
@@ -1058,7 +1120,7 @@ spec:
             name: radarr
             port:
               number: 7878
-  - host: sonarr.homelab.local
+  - host: sonarr.homelab.lan
     http:
       paths:
       - path: /
@@ -1068,7 +1130,7 @@ spec:
             name: sonarr
             port:
               number: 8989
-  - host: lidarr.homelab.local
+  - host: lidarr.homelab.lan
     http:
       paths:
       - path: /
@@ -1078,7 +1140,7 @@ spec:
             name: lidarr
             port:
               number: 8686
-  - host: prowlarr.homelab.local
+  - host: prowlarr.homelab.lan
     http:
       paths:
       - path: /
@@ -1088,7 +1150,7 @@ spec:
             name: prowlarr
             port:
               number: 9696
-  - host: qbittorrent.homelab.local
+  - host: qbittorrent.homelab.lan
     http:
       paths:
       - path: /
@@ -1098,7 +1160,7 @@ spec:
             name: qbittorrent
             port:
               number: 8080
-  - host: jackett.homelab.local
+  - host: jackett.homelab.lan
     http:
       paths:
       - path: /
@@ -1108,7 +1170,7 @@ spec:
             name: jackett
             port:
               number: 9117
-  - host: overseerr.homelab.local
+  - host: overseerr.homelab.lan
     http:
       paths:
       - path: /
@@ -1118,7 +1180,7 @@ spec:
             name: overseerr
             port:
               number: 5055
-  - host: bazarr.homelab.local
+  - host: bazarr.homelab.lan
     http:
       paths:
       - path: /
@@ -1128,7 +1190,7 @@ spec:
             name: bazarr
             port:
               number: 6767
-  - host: tautulli.homelab.local
+  - host: tautulli.homelab.lan
     http:
       paths:
       - path: /
@@ -1138,3 +1200,13 @@ spec:
             name: tautulli
             port:
               number: 8181
+  - host: sabnzbd.homelab.lan
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: sabnzbd
+            port:
+              number: 8080
