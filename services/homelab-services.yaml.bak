@@ -1,0 +1,975 @@
+# Essential Homelab Services for Cluster Management
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: homelab-services
+  labels:
+    name: homelab-services
+
+---
+# Pi-hole DNS Ad Blocker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pihole
+  namespace: homelab-services
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pihole
+  template:
+    metadata:
+      labels:
+        app: pihole
+    spec:
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: pihole
+        image: pihole/pihole:latest
+        ports:
+        - containerPort: 80
+          name: web
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        - containerPort: 53
+          name: dns-udp
+          protocol: UDP
+        env:
+        - name: TZ
+          value: "America/New_York"
+        - name: WEBPASSWORD
+          value: "pihole123"
+        - name: FTLCONF_LOCAL_IPV4
+          value: "10.43.0.0/16"
+        - name: PIHOLE_DNS_
+          value: "1.1.1.1;8.8.8.8"
+        - name: DNSMASQ_LISTENING
+          value: "all"
+        volumeMounts:
+        - name: pihole-config
+          mountPath: /etc/pihole
+        - name: pihole-dnsmasq
+          mountPath: /etc/dnsmasq.d
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        securityContext:
+          capabilities:
+            add:
+            - NET_ADMIN
+      volumes:
+      - name: pihole-config
+        persistentVolumeClaim:
+          claimName: pihole-config
+      - name: pihole-dnsmasq
+        persistentVolumeClaim:
+          claimName: pihole-dnsmasq
+
+---
+# Portainer Container Management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portainer
+  namespace: homelab-services
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: portainer
+  template:
+    metadata:
+      labels:
+        app: portainer
+    spec:
+      # Run on AMD64 for web UI performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      serviceAccountName: portainer
+      containers:
+      - name: portainer
+        image: portainer/portainer-ce:latest
+        ports:
+        - containerPort: 9000
+          name: web
+        - containerPort: 8000
+          name: edge
+        volumeMounts:
+        - name: portainer-data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+      volumes:
+      - name: portainer-data
+        persistentVolumeClaim:
+          claimName: portainer-data
+
+---
+# Uptime Kuma Monitoring
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: uptime-kuma
+  namespace: homelab-services
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: uptime-kuma
+  template:
+    metadata:
+      labels:
+        app: uptime-kuma
+    spec:
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: uptime-kuma
+        image: louislam/uptime-kuma:latest
+        ports:
+        - containerPort: 3001
+          name: web
+        volumeMounts:
+        - name: uptime-kuma-data
+          mountPath: /app/data
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+      volumes:
+      - name: uptime-kuma-data
+        persistentVolumeClaim:
+          claimName: uptime-kuma-data
+
+---
+# Homer Dashboard
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: homer
+  namespace: homelab-services
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: homer
+  template:
+    metadata:
+      labels:
+        app: homer
+    spec:
+      # Run on ARM for ultra-low power
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: homer
+        image: b4bz/homer:latest
+        ports:
+        - containerPort: 8080
+          name: web
+        env:
+        - name: INIT_ASSETS
+          value: "1"
+        volumeMounts:
+        - name: homer-config
+          mountPath: /www/assets
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: homer-config
+        configMap:
+          name: homer-config
+
+---
+# Nginx Proxy Manager
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-proxy-manager
+  namespace: homelab-services
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-proxy-manager
+  template:
+    metadata:
+      labels:
+        app: nginx-proxy-manager
+    spec:
+      # Run on AMD64 for performance
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64"]
+      containers:
+      - name: nginx-proxy-manager
+        image: jc21/nginx-proxy-manager:latest
+        ports:
+        - containerPort: 80
+          name: http
+        - containerPort: 443
+          name: https
+        - containerPort: 81
+          name: admin
+        env:
+        - name: DISABLE_IPV6
+          value: "true"
+        volumeMounts:
+        - name: nginx-data
+          mountPath: /data
+        - name: nginx-letsencrypt
+          mountPath: /etc/letsencrypt
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+      volumes:
+      - name: nginx-data
+        persistentVolumeClaim:
+          claimName: nginx-proxy-manager-data
+      - name: nginx-letsencrypt
+        persistentVolumeClaim:
+          claimName: nginx-proxy-manager-letsencrypt
+
+---
+# Cloudflared Tunnel
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: homelab-services
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cloudflared
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+    spec:
+      # Run on ARM for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm"]
+      containers:
+      - name: cloudflared
+        image: cloudflare/cloudflared:latest
+        args:
+        - tunnel
+        - --config
+        - /etc/cloudflared/config.yaml
+        - run
+        env:
+        - name: TUNNEL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: cloudflared-token
+              key: token
+        volumeMounts:
+        - name: cloudflared-config
+          mountPath: /etc/cloudflared
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: cloudflared-config
+        configMap:
+          name: cloudflared-config
+
+---
+# Vaultwarden Password Manager
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultwarden
+  namespace: homelab-services
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vaultwarden
+  template:
+    metadata:
+      labels:
+        app: vaultwarden
+    spec:
+      # Run on ARM64 for security and efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: vaultwarden
+        image: vaultwarden/server:latest
+        ports:
+        - containerPort: 80
+          name: web
+        env:
+        - name: WEBSOCKET_ENABLED
+          value: "true"
+        - name: SENDS_ALLOWED
+          value: "true"
+        - name: ADMIN_TOKEN
+          value: "vaultwarden123"
+        - name: DOMAIN
+          value: "https://vault.homelab.local"
+        volumeMounts:
+        - name: vaultwarden-data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "512Mi"
+      volumes:
+      - name: vaultwarden-data
+        persistentVolumeClaim:
+          claimName: vaultwarden-data
+
+---
+# Speedtest Tracker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: speedtest-tracker
+  namespace: homelab-services
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: speedtest-tracker
+  template:
+    metadata:
+      labels:
+        app: speedtest-tracker
+    spec:
+      # Run on ARM64 for efficiency
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+      containers:
+      - name: speedtest-tracker
+        image: lscr.io/linuxserver/speedtest-tracker:latest
+        ports:
+        - containerPort: 80
+          name: web
+        env:
+        - name: PUID
+          value: "1000"
+        - name: PGID
+          value: "1000"
+        - name: TZ
+          value: "America/New_York"
+        - name: APP_KEY
+          value: "base64:speedtest-key-here"
+        volumeMounts:
+        - name: speedtest-data
+          mountPath: /config
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+      volumes:
+      - name: speedtest-data
+        persistentVolumeClaim:
+          claimName: speedtest-tracker-data
+
+---
+# ConfigMaps
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: homer-config
+  namespace: homelab-services
+data:
+  config.yml: |
+    title: "Homelab Dashboard"
+    subtitle: "Multi-Architecture Kubernetes Cluster"
+    logo: "assets/logo.png"
+    icon: "fas fa-skull-crossbones"
+    
+    header: true
+    footer: false
+    
+    theme: default
+    colors:
+      light:
+        highlight-primary: "#3367d6"
+        highlight-secondary: "#4285f4"
+        highlight-hover: "#5a95f5"
+        background: "#f5f5f5"
+        card-background: "#ffffff"
+        text: "#363636"
+        text-header: "#ffffff"
+        text-title: "#303030"
+        text-subtitle: "#424242"
+        card-shadow: rgba(0, 0, 0, 0.1)
+        link-hover: "#363636"
+      dark:
+        highlight-primary: "#3367d6"
+        highlight-secondary: "#4285f4"
+        highlight-hover: "#5a95f5"
+        background: "#131313"
+        card-background: "#2b2b2b"
+        text: "#eaeaea"
+        text-header: "#ffffff"
+        text-title: "#fafafa"
+        text-subtitle: "#f5f5f5"
+        card-shadow: rgba(0, 0, 0, 0.4)
+        link-hover: "#ffdd57"
+    
+    services:
+      - name: "Infrastructure"
+        icon: "fas fa-server"
+        items:
+          - name: "Dashboard"
+            logo: "assets/tools/dashboard.png"
+            subtitle: "Cluster Dashboard"
+            tag: "app"
+            url: "http://dashboard.homelab.local"
+            target: "_blank"
+          - name: "Grafana"
+            logo: "assets/tools/grafana.png"
+            subtitle: "Monitoring & Metrics"
+            tag: "monitoring"
+            url: "http://grafana.homelab.local"
+            target: "_blank"
+          - name: "ArgoCD"
+            logo: "assets/tools/argocd.png"
+            subtitle: "GitOps Deployment"
+            tag: "devops"
+            url: "http://argocd.homelab.local"
+            target: "_blank"
+          - name: "Portainer"
+            logo: "assets/tools/portainer.png"
+            subtitle: "Container Management"
+            tag: "management"
+            url: "http://portainer.homelab.local"
+            target: "_blank"
+            
+      - name: "Storage & Files"
+        icon: "fas fa-hdd"
+        items:
+          - name: "MinIO"
+            logo: "assets/tools/minio.png"
+            subtitle: "Object Storage"
+            tag: "storage"
+            url: "http://minio.homelab.local"
+            target: "_blank"
+          - name: "Nextcloud"
+            logo: "assets/tools/nextcloud.png"
+            subtitle: "File Sync & Share"
+            tag: "files"
+            url: "http://nextcloud.homelab.local"
+            target: "_blank"
+          - name: "File Browser"
+            logo: "assets/tools/filebrowser.png"
+            subtitle: "Simple File Manager"
+            tag: "files"
+            url: "http://files.homelab.local"
+            target: "_blank"
+            
+      - name: "Media & Entertainment"
+        icon: "fas fa-film"
+        items:
+          - name: "Jellyfin"
+            logo: "assets/tools/jellyfin.png"
+            subtitle: "Media Server"
+            tag: "media"
+            url: "http://jellyfin.homelab.local"
+            target: "_blank"
+          - name: "Radarr"
+            logo: "assets/tools/radarr.png"
+            subtitle: "Movie Management"
+            tag: "media"
+            url: "http://radarr.homelab.local"
+            target: "_blank"
+          - name: "Sonarr"
+            logo: "assets/tools/sonarr.png"
+            subtitle: "TV Show Management"
+            tag: "media"
+            url: "http://sonarr.homelab.local"
+            target: "_blank"
+          - name: "SABnzbd"
+            logo: "assets/tools/sabnzbd.png"
+            subtitle: "Usenet Downloader"
+            tag: "downloads"
+            url: "http://sabnzbd.homelab.local"
+            target: "_blank"
+            
+      - name: "Smart Home"
+        icon: "fas fa-home"
+        items:
+          - name: "Home Assistant"
+            logo: "assets/tools/homeassistant.png"
+            subtitle: "Smart Home Hub"
+            tag: "automation"
+            url: "http://homeassistant.homelab.local"
+            target: "_blank"
+          - name: "Node-RED"
+            logo: "assets/tools/nodered.png"
+            subtitle: "Flow-based Programming"
+            tag: "automation"
+            url: "http://nodered.homelab.local"
+            target: "_blank"
+          - name: "ESPHome"
+            logo: "assets/tools/esphome.png"
+            subtitle: "IoT Device Management"
+            tag: "iot"
+            url: "http://esphome.homelab.local"
+            target: "_blank"
+            
+      - name: "Network & Security"
+        icon: "fas fa-shield-alt"
+        items:
+          - name: "Pi-hole"
+            logo: "assets/tools/pihole.png"
+            subtitle: "DNS Ad Blocker"
+            tag: "security"
+            url: "http://pihole.homelab.local/admin"
+            target: "_blank"
+          - name: "Vaultwarden"
+            logo: "assets/tools/vaultwarden.png"
+            subtitle: "Password Manager"
+            tag: "security"
+            url: "http://vault.homelab.local"
+            target: "_blank"
+          - name: "Uptime Kuma"
+            logo: "assets/tools/uptime-kuma.png"
+            subtitle: "Status Monitoring"
+            tag: "monitoring"
+            url: "http://uptime.homelab.local"
+            target: "_blank"
+          - name: "Speedtest"
+            logo: "assets/tools/speedtest.png"
+            subtitle: "Internet Speed Monitor"
+            tag: "monitoring"
+            url: "http://speedtest.homelab.local"
+            target: "_blank"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+  namespace: homelab-services
+data:
+  config.yaml: |
+    tunnel: homelab-tunnel
+    credentials-file: /etc/cloudflared/credentials.json
+    ingress:
+      - hostname: homelab.yourdomain.com
+        service: http://homer.homelab-services.svc.cluster.local:8080
+      - hostname: grafana.yourdomain.com
+        service: http://grafana.monitoring.svc.cluster.local:3000
+      - hostname: "*.yourdomain.com"
+        service: http://nginx-proxy-manager.homelab-services.svc.cluster.local:80
+      - service: http_status:404
+
+---
+# Service Account for Portainer
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portainer
+  namespace: homelab-services
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portainer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: portainer
+  namespace: homelab-services
+
+---
+# Persistent Storage Claims
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pihole-config
+  namespace: homelab-services
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pihole-dnsmasq
+  namespace: homelab-services
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: portainer-data
+  namespace: homelab-services
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uptime-kuma-data
+  namespace: homelab-services
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nginx-proxy-manager-data
+  namespace: homelab-services
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nginx-proxy-manager-letsencrypt
+  namespace: homelab-services
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vaultwarden-data
+  namespace: homelab-services
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: speedtest-tracker-data
+  namespace: homelab-services
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: longhorn-ssd
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: pihole
+  namespace: homelab-services
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: 192.168.1.53
+spec:
+  type: LoadBalancer
+  selector:
+    app: pihole
+  ports:
+  - name: web
+    port: 80
+    targetPort: 80
+  - name: dns-tcp
+    port: 53
+    targetPort: 53
+    protocol: TCP
+  - name: dns-udp
+    port: 53
+    targetPort: 53
+    protocol: UDP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portainer
+  namespace: homelab-services
+spec:
+  selector:
+    app: portainer
+  ports:
+  - name: web
+    port: 9000
+    targetPort: 9000
+  - name: edge
+    port: 8000
+    targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: uptime-kuma
+  namespace: homelab-services
+spec:
+  selector:
+    app: uptime-kuma
+  ports:
+  - port: 3001
+    targetPort: 3001
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: homer
+  namespace: homelab-services
+spec:
+  selector:
+    app: homer
+  ports:
+  - port: 8080
+    targetPort: 8080
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-proxy-manager
+  namespace: homelab-services
+spec:
+  selector:
+    app: nginx-proxy-manager
+  type: LoadBalancer
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  - name: https
+    port: 443
+    targetPort: 443
+  - name: admin
+    port: 81
+    targetPort: 81
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultwarden
+  namespace: homelab-services
+spec:
+  selector:
+    app: vaultwarden
+  ports:
+  - port: 80
+    targetPort: 80
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: speedtest-tracker
+  namespace: homelab-services
+spec:
+  selector:
+    app: speedtest-tracker
+  ports:
+  - port: 80
+    targetPort: 80
+
+---
+# Ingress for Homelab Services
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: homelab-services-ingress
+  namespace: homelab-services
+spec:
+  rules:
+  - host: pihole.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: pihole
+            port:
+              number: 80
+  - host: portainer.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: portainer
+            port:
+              number: 9000
+  - host: uptime.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: uptime-kuma
+            port:
+              number: 3001
+  - host: homer.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: homer
+            port:
+              number: 8080
+  - host: vault.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: vaultwarden
+            port:
+              number: 80
+  - host: speedtest.homelab.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: speedtest-tracker
+            port:
+              number: 80
