@@ -13,7 +13,7 @@ services:
       - REDIS_CON=redis://archivist-redis:6379
       - HOST_UID=1000
       - HOST_GID=1000
-      - TA_HOST=newnas.local
+      - TA_HOST=newnas.local 192.168.0.189
       - TA_USERNAME=tubearchivist
       - TA_PASSWORD=${TA_PASSWORD:-changeme}
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-changeme}
@@ -68,12 +68,18 @@ services:
 
   image-api:
     build: ./image-api
-    container_name: image-api
+    container_name: hoarder-catalog
     restart: unless-stopped
     ports:
       - "8082:8082"
     volumes:
       - images:/data/images
+      - ta-media:/data/youtube:ro
+      - metube-downloads:/data/media:ro
+    environment:
+      - TA_API_URL=http://tubearchivist:8000
+      - TA_API_KEY=${TA_API_KEY}
+      - METUBE_API_URL=http://metube:8081
 
 volumes:
   ta-media:

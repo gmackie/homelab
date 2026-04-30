@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hoarder</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Hoarder</h1>
+    <div class="controls">
+      <input type="search" id="search" placeholder="Search...">
+      <select id="platform-filter">
+        <option value="">All Sources</option>
+        <option value="youtube">YouTube</option>
+        <option value="soundcloud">SoundCloud</option>
+        <option value="twitch">Twitch</option>
+      </select>
+      <button id="sync-btn" title="Sync now">&#8635;</button>
+      <button id="settings-btn" title="Settings">&#9881;</button>
+    </div>
+  </header>
+  <nav class="tabs">
+    <button class="tab active" data-tab="video">Videos</button>
+    <button class="tab" data-tab="audio">Music</button>
+    <button class="tab" data-tab="image">Images</button>
+  </nav>
+  <main id="content"></main>
+  <div id="now-playing" class="now-playing hidden">
+    <audio id="global-audio" controls></audio>
+    <span id="now-playing-title"></span>
+  </div>
+  <dialog id="settings-dialog">
+    <h2>Settings</h2>
+    <div id="channel-rules"></div>
+    <div class="dialog-actions">
+      <button id="manual-sync">Sync Now</button>
+      <button id="close-settings">Close</button>
+    </div>
+  </dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>
