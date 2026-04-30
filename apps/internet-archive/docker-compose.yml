@@ -81,13 +81,13 @@ volumes:
     driver_opts:
       type: none
       o: bind
-      device: /data/archive/youtube
+      device: /tank/media/archive/youtube
   ta-cache:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: /data/archive/youtube-cache
+      device: /tank/media/archive/youtube-cache
   ta-redis:
   ta-es:
   metube-downloads:
@@ -95,10 +95,10 @@ volumes:
     driver_opts:
       type: none
       o: bind
-      device: /data/archive/media
+      device: /tank/media/archive/metube
   images:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: /data/archive/images
+      device: /tank/media/archive/images
