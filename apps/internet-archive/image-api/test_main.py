@@ -19,6 +19,30 @@ async def test_health(client):
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
 
+
+@pytest.mark.anyio
+async def test_destination_availability_uses_storedge_sentinel(
+    client, tmp_path, monkeypatch
+):
+    sentinel = tmp_path / ".hoarder-storedge"
+    monkeypatch.setenv("STOREDGE_SENTINEL_PATH", str(sentinel))
+
+    unavailable = await client.get("/destinations")
+    assert unavailable.status_code == 200
+    assert unavailable.json() == {
+        "destinations": [
+            {"id": "newnas", "available": True},
+            {"id": "storedge", "available": False},
+        ]
+    }
+
+    sentinel.touch()
+    available = await client.get("/destinations")
+    assert available.json()["destinations"][1] == {
+        "id": "storedge",
+        "available": True,
+    }
+
 @pytest.mark.anyio
 async def test_upload_image(client, tmp_path, monkeypatch):
     monkeypatch.setenv("IMAGE_STORAGE_PATH", str(tmp_path))
@@ -37,7 +61,71 @@ async def test_upload_image(client, tmp_path, monkeypatch):
     body = resp.json()
     assert body["status"] == "saved"
     assert body["filename"] == "meme.png"
+    assert body["destination"] == "newnas"
     assert "id" in body
+
+
+@pytest.mark.anyio
+async def test_upload_image_to_storedge(client, tmp_path, monkeypatch):
+    newnas_path = tmp_path / "newnas"
+    storedge_path = tmp_path / "storedge"
+    monkeypatch.setenv("IMAGE_STORAGE_PATH", str(newnas_path))
+    monkeypatch.setenv("STOREDGE_IMAGE_STORAGE_PATH", str(storedge_path))
+    sentinel = tmp_path / ".hoarder-storedge"
+    sentinel.touch()
+    monkeypatch.setenv("STOREDGE_SENTINEL_PATH", str(sentinel))
+    monkeypatch.setenv("IMAGE_DB_PATH", str(tmp_path / "metadata.db"))
+
+    resp = await client.post(
+        "/upload",
+        files={"image": ("storedge.png", io.BytesIO(b"storedge"), "image/png")},
+        data={"destination": "storedge"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["destination"] == "storedge"
+    assert not list(newnas_path.glob("*")) if newnas_path.exists() else True
+    assert (storedge_path / f"{body['id']}.png").read_bytes() == b"storedge"
+
+
+@pytest.mark.anyio
+async def test_upload_to_storedge_fails_closed_without_mount_sentinel(
+    client, tmp_path, monkeypatch
+):
+    storedge_path = tmp_path / "storedge"
+    monkeypatch.setenv("STOREDGE_IMAGE_STORAGE_PATH", str(storedge_path))
+    monkeypatch.setenv(
+        "STOREDGE_SENTINEL_PATH", str(tmp_path / "missing-sentinel")
+    )
+    monkeypatch.setenv("IMAGE_DB_PATH", str(tmp_path / "metadata.db"))
+
+    resp = await client.post(
+        "/upload",
+        files={"image": ("unmounted.png", io.BytesIO(b"nope"), "image/png")},
+        data={"destination": "storedge"},
+    )
+
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "Storedge is not mounted"
+    assert not storedge_path.exists()
+
+
+@pytest.mark.anyio
+async def test_upload_rejects_unknown_destination(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("IMAGE_STORAGE_PATH", str(tmp_path / "newnas"))
+    monkeypatch.setenv("STOREDGE_IMAGE_STORAGE_PATH", str(tmp_path / "storedge"))
+    monkeypatch.setenv("IMAGE_DB_PATH", str(tmp_path / "metadata.db"))
+
+    resp = await client.post(
+        "/upload",
+        files={"image": ("invalid.png", io.BytesIO(b"invalid"), "image/png")},
+        data={"destination": "other"},
+    )
+
+    assert resp.status_code == 422
+    assert not (tmp_path / "newnas").exists()
+    assert not (tmp_path / "storedge").exists()
 
 @pytest.mark.anyio
 async def test_upload_image_no_tags(client, tmp_path, monkeypatch):
@@ -70,6 +158,32 @@ async def test_list_images(client, tmp_path, monkeypatch):
     items = resp.json()
     assert len(items) >= 1
     assert items[0]["source_url"] == "https://example.com"
+    assert items[0]["destination"] == "newnas"
+
+
+def test_get_db_migrates_legacy_images_to_newnas(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy.db"
+    db = __import__("sqlite3").connect(db_path)
+    db.execute(
+        "CREATE TABLE images (id TEXT PRIMARY KEY, filename TEXT NOT NULL, "
+        "source_url TEXT, page_title TEXT, tags TEXT, created_at TEXT NOT NULL)"
+    )
+    db.execute(
+        "INSERT INTO images VALUES (?, ?, ?, ?, ?, ?)",
+        ("legacy", "old.png", "", "", "", "2026-01-01"),
+    )
+    db.commit()
+    db.close()
+    monkeypatch.setenv("IMAGE_DB_PATH", str(db_path))
+
+    from main import get_db
+    migrated = get_db()
+    row = migrated.execute(
+        "SELECT destination FROM images WHERE id = ?", ("legacy",)
+    ).fetchone()
+    migrated.close()
+
+    assert row["destination"] == "newnas"
 
 @pytest.mark.anyio
 async def test_catalog_empty(client, tmp_path, monkeypatch):

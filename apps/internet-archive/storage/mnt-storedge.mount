@@ -1,0 +1,14 @@
+[Unit]
+Description=Storedge archive over Tailscale NFS
+After=tailscaled.service network-online.target
+Wants=tailscaled.service network-online.target
+
+[Mount]
+What=storedge:/mnt/core/srv/share/archive
+Where=/mnt/storedge
+Type=nfs
+Options=rw,hard,_netdev,nosuid,nodev
+TimeoutSec=30
+
+[Install]
+WantedBy=multi-user.target

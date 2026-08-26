@@ -4,10 +4,11 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -43,8 +44,21 @@ def _db_path():
     return os.environ.get("IMAGE_DB_PATH", "/data/images/metadata.db")
 
 
-def _storage_path():
+def _storage_path(destination: Literal["newnas", "storedge"] = "newnas"):
+    if destination == "storedge":
+        return os.environ.get(
+            "STOREDGE_IMAGE_STORAGE_PATH", "/data/storedge-images/files"
+        )
     return os.environ.get("IMAGE_STORAGE_PATH", "/data/images/files")
+
+
+def _destination_available(destination: Literal["newnas", "storedge"]):
+    if destination == "newnas":
+        return True
+    sentinel = os.environ.get(
+        "STOREDGE_SENTINEL_PATH", "/data/storedge/.hoarder-storedge"
+    )
+    return Path(sentinel).is_file()
 
 
 def get_db():
@@ -59,9 +73,17 @@ def get_db():
             source_url TEXT,
             page_title TEXT,
             tags TEXT,
+            destination TEXT NOT NULL DEFAULT 'newnas',
             created_at TEXT NOT NULL
         )"""
     )
+    image_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(images)").fetchall()
+    }
+    if "destination" not in image_columns:
+        conn.execute(
+            "ALTER TABLE images ADD COLUMN destination TEXT NOT NULL DEFAULT 'newnas'"
+        )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS media (
             id TEXT PRIMARY KEY,
@@ -102,14 +124,27 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/destinations")
+def list_destinations():
+    return {
+        "destinations": [
+            {"id": "newnas", "available": True},
+            {"id": "storedge", "available": _destination_available("storedge")},
+        ]
+    }
+
+
 @app.post("/upload")
 async def upload_image(
     image: UploadFile = File(...),
     source_url: str = Form(""),
     page_title: str = Form(""),
     tags: str = Form(""),
+    destination: Literal["newnas", "storedge"] = Form("newnas"),
 ):
-    storage = Path(_storage_path())
+    if not _destination_available(destination):
+        raise HTTPException(status_code=503, detail="Storedge is not mounted")
+    storage = Path(_storage_path(destination))
     storage.mkdir(parents=True, exist_ok=True)
 
     image_id = uuid.uuid4().hex[:12]
@@ -124,8 +159,17 @@ async def upload_image(
 
     db = get_db()
     db.execute(
-        "INSERT INTO images (id, filename, source_url, page_title, tags, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (image_id, image.filename, source_url, page_title, ",".join(tag_list), now),
+        "INSERT INTO images (id, filename, source_url, page_title, tags, destination, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            image_id,
+            image.filename,
+            source_url,
+            page_title,
+            ",".join(tag_list),
+            destination,
+            now,
+        ),
     )
     db.commit()
     db.close()
@@ -135,6 +179,7 @@ async def upload_image(
         "id": image_id,
         "filename": image.filename,
         "tags": tag_list,
+        "destination": destination,
     }
 
 
@@ -150,6 +195,7 @@ def list_images():
             "source_url": r["source_url"],
             "page_title": r["page_title"],
             "tags": [t for t in r["tags"].split(",") if t] if r["tags"] else [],
+            "destination": r["destination"],
             "created_at": r["created_at"],
         }
         for r in rows

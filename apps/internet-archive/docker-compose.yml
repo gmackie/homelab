@@ -13,7 +13,7 @@ services:
       - REDIS_CON=redis://archivist-redis:6379
       - HOST_UID=1000
       - HOST_GID=1000
-      - TA_HOST=newnas.local 192.168.0.189
+      - TA_HOST=newnas newnas.local 100.123.166.5 192.168.0.189
       - TA_USERNAME=tubearchivist
       - TA_PASSWORD=${TA_PASSWORD:-changeme}
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-changeme}
@@ -63,6 +63,7 @@ services:
       - "8081:8081"
     volumes:
       - metube-downloads:/downloads
+      - /mnt/storedge/metube:/downloads/storedge
     environment:
       - CORS_ALLOWED_ORIGINS=*
 
@@ -76,10 +77,13 @@ services:
       - images:/data/images
       - ta-media:/data/youtube:ro
       - metube-downloads:/data/media:ro
+      - /mnt/storedge:/data/storedge
     environment:
       - TA_API_URL=http://tubearchivist:8000
       - TA_API_KEY=${TA_API_KEY}
       - METUBE_API_URL=http://metube:8081
+      - STOREDGE_IMAGE_STORAGE_PATH=/data/storedge/images/files
+      - STOREDGE_SENTINEL_PATH=/data/storedge/.hoarder-storedge
 
 volumes:
   ta-media:
