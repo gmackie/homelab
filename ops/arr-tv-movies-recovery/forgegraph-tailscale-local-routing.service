@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep labnuc LAN routes local instead of accepting overlapping tailnet routes
+Wants=tailscaled.service
+After=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/tailscale set --accept-routes=false
+TimeoutStartSec=20
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=ForgeGraph: speedtest-tracker
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/podman stop speedtest
+ExecStartPre=-/usr/bin/podman rm speedtest
+ExecStart=/usr/bin/podman run --rm --name speedtest --publish 127.0.0.1:8082:80 --env-file /etc/forgegraph/homelab-speedtest-tracker.env -v /var/lib/forgegraph/homelab/speedtest-data:/config docker.io/linuxserver/speedtest-tracker:latest
+ExecStop=/usr/bin/podman stop speedtest
+
+[Install]
+WantedBy=multi-user.target
