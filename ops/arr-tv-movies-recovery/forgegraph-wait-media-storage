@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+mount_point=/mnt/nas/homelab
+nas_ip=100.123.166.5
+nas_source="$nas_ip:/tank/media/library"
+attempts=${FORGEGRAPH_MEDIA_STORAGE_ATTEMPTS:-60}
+delay=${FORGEGRAPH_MEDIA_STORAGE_DELAY_SECONDS:-2}
+
+for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if timeout 4 tailscale ping --c 1 --timeout=3s --until-direct=false "$nas_ip" >/dev/null 2>&1; then
+        timeout 6 stat "$mount_point/downloads" >/dev/null 2>&1 || true
+    fi
+
+    if findmnt -rn -T "$mount_point" -S "$nas_source" -t nfs4 >/dev/null \
+        && [[ -d "$mount_point/downloads" ]] \
+        && [[ -d "$mount_point/movies" ]] \
+        && [[ -d "$mount_point/tv" ]]; then
+        exit 0
+    fi
+
+    sleep "$delay"
+done
+
+echo "newnas media storage did not become ready after $attempts attempts" >&2
+exit 1

@@ -7,14 +7,20 @@ TV/movie media path between `newnas` and `labnuc`.
   keeps root squashing enabled.
 - `labnuc-fstab.entry` mounts the export through a systemd automount so boot is
   not blocked when the NAS is unavailable.
-- `media-storage.conf` makes storage-backed services depend on the actual
-  `/mnt/nas/homelab` mount.
+- `forgegraph-media-storage-online.service` and
+  `forgegraph-wait-media-storage` wait for the Tailscale path and the actual
+  newnas NFS mount to become ready after boot.
+- `media-storage.conf` makes storage-backed services depend on that readiness
+  gate, so a one-time early mount failure does not leave them inactive.
 - `jellyfin-tv-movies.conf` removes the obsolete music/general bind mounts and
   exposes only the read-only movie and TV libraries requested for this phase.
 
-Install the export fragment under `/etc/exports.d/` on newnas, the fstab entry
-in `/etc/fstab` on labnuc, and the service fragments as systemd drop-ins. Run
-`exportfs -ra`, `systemctl daemon-reload`, and `findmnt --verify` before starting
+Install the export fragment under `/etc/exports.d/` on newnas and the fstab
+entry in `/etc/fstab` on labnuc. Install `forgegraph-wait-media-storage` as
+`/usr/local/libexec/forgegraph-wait-media-storage`, install the readiness unit
+under `/etc/systemd/system/`, and install the service fragments as systemd
+drop-ins. Run `exportfs -ra`, `systemctl daemon-reload`, `systemctl enable
+forgegraph-media-storage-online.service`, and `findmnt --verify` before starting
 the media services.
 
 Provider and indexer credentials do not belong in this repository. Configure

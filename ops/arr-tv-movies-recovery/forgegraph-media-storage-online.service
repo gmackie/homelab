@@ -1,0 +1,14 @@
+[Unit]
+Description=Wait for newnas media storage
+Wants=network-online.target tailscaled.service mnt-nas-homelab.automount
+After=network-online.target tailscaled.service mnt-nas-homelab.automount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/forgegraph-wait-media-storage
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
