@@ -3,9 +3,10 @@
 # Simple validation for YAML files with multiple documents
 set -euo pipefail
 
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
 GREEN='\033[0;32m'
 RED='\033[0;31m'
-BLUE='\033[0;34m'
 NC='\033[0m'
 
 total=0
@@ -17,8 +18,9 @@ echo
 
 validate_file() {
     local file=$1
-    local basename=$(basename "$file")
-    ((total++))
+    local basename
+    basename=$(basename "$file")
+    ((total+=1))
     
     # Handle multi-document YAML files
     if python3 -c "
@@ -31,10 +33,10 @@ except Exception as e:
     print(f'Invalid: $basename - {e}')
     exit(1)
 " 2>/dev/null; then
-        ((valid++))
+        ((valid+=1))
     else
         echo -e "${RED}✗ $basename${NC}"
-        ((invalid++))
+        ((invalid+=1))
     fi
 }
 
@@ -55,13 +57,13 @@ echo "Validating key homelab configurations:"
 echo
 
 for file in "${key_files[@]}"; do
-    full_path="/Volumes/dev/homelab/$file"
+    full_path="$REPO_ROOT/$file"
     if [[ -f "$full_path" ]]; then
         validate_file "$full_path"
     else
         echo -e "${RED}✗ $file (not found)${NC}"
-        ((total++))
-        ((invalid++))
+        ((total+=1))
+        ((invalid+=1))
     fi
 done
 
@@ -83,4 +85,5 @@ if [[ $invalid -eq 0 ]]; then
     echo "3. Set up your 1024x600 touchscreen with Homer dashboard"
 else
     echo -e "${RED}❌ Some configurations need attention.${NC}"
+    exit 1
 fi

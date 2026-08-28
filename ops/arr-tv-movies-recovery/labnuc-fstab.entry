@@ -1,0 +1,1 @@
+100.123.166.5:/tank/media/library /mnt/nas/homelab nfs4 nofail,_netdev,x-systemd.automount,x-systemd.mount-timeout=15s,hard,timeo=600,retrans=2 0 0
