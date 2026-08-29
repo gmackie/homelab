@@ -1,7 +1,7 @@
 [Unit]
 Description=Wait for newnas media storage
-Wants=network-online.target tailscaled.service mnt-nas-homelab.automount
-After=network-online.target tailscaled.service mnt-nas-homelab.automount
+Wants=network-online.target mnt-nas-homelab.automount
+After=network-online.target mnt-nas-homelab.automount
 
 [Service]
 Type=oneshot

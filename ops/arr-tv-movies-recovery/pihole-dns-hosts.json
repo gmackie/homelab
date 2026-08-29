@@ -7,5 +7,6 @@
   "10.1.1.188 overseerr.homelab.lan",
   "10.1.1.188 tautulli.homelab.lan",
   "10.1.1.188 pihole.homelab.lan",
-  "10.1.1.188 speedtest.homelab.lan"
+  "10.1.1.188 speedtest.homelab.lan",
+  "10.1.0.75 newnas.homelab.lan"
 ]

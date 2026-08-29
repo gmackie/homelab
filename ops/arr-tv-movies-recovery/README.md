@@ -3,12 +3,12 @@
 This directory records the host-level configuration used to restore the
 TV/movie media path between `newnas` and `labnuc`.
 
-- `newnas.exports` restricts the NFS export to labnuc's Tailscale address and
-  keeps root squashing enabled.
+- `newnas.exports` restricts the NFS export to labnuc's reserved LAN address
+  and keeps root squashing enabled.
 - `labnuc-fstab.entry` mounts the export through a systemd automount so boot is
   not blocked when the NAS is unavailable.
 - `forgegraph-media-storage-online.service` and
-  `forgegraph-wait-media-storage` wait for the Tailscale path and the actual
+  `forgegraph-wait-media-storage` wait for the LAN DNS name and the actual
   newnas NFS mount to become ready after boot.
 - `media-storage.conf` makes storage-backed services depend on that readiness
   gate, so a one-time early mount failure does not leave them inactive.
@@ -18,7 +18,8 @@ TV/movie media path between `newnas` and `labnuc`.
   `10.1.0.0/16` route from overriding labnuc's directly connected
   `10.1.0.0/23` LAN.
 - `pihole-dns-hosts.json` is the authoritative set of local media names served
-  by Pi-hole at labnuc's reserved LAN address, `10.1.1.188`.
+  by Pi-hole, including `newnas.homelab.lan` at its reserved primary LAN
+  address, `10.1.0.75`.
 - `caddy-media.conf` provides the matching HTTP virtual hosts and keeps the
   application ports off user-facing URLs.
 - `Caddyfile.labnuc` makes port 80 Caddy's local HTTP listener while preserving
@@ -43,6 +44,13 @@ the advanced `local_ranges` setting. Keep general internet exposure disabled
 and use `10.0.0.0/8, 100.64.0.0/10` for the homelab LAN and tailnet. Its host
 whitelist should contain `labnuc`, `100.64.115.45`, and
 `sabnzbd.homelab.lan`.
+
+The NewNAS primary NIC (`6c:1f:f7:40:40:c8`) is reserved as `10.1.0.75` on
+the Default UniFi DHCP scope. Keep its second NIC (`6c:1f:f7:40:40:c9`)
+reserved as `10.1.0.76`; do not attach either reservation to the Trusted
+`10.1.10.0/24` scope. Allow TCP/2049 from labnuc's reserved `10.1.1.188`
+address in NewNAS UFW. The media mount must resolve `newnas.homelab.lan` to
+`10.1.0.75` and use that LAN path, not the NewNAS Tailscale address.
 
 ## Local and tailnet DNS
 
