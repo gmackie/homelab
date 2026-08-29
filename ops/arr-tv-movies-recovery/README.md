@@ -20,6 +20,8 @@ TV/movie media path between `newnas` and `labnuc`.
 - `pihole-dns-hosts.json` is the authoritative set of local media names served
   by Pi-hole, including `newnas.homelab.lan` at its reserved primary LAN
   address, `10.1.0.75`.
+- `labnuc-resolv.conf` makes labnuc itself query its local Pi-hole directly,
+  avoiding a split-DNS loop through its own Tailscale address.
 - `caddy-media.conf` provides the matching HTTP virtual hosts and keeps the
   application ports off user-facing URLs.
 - `Caddyfile.labnuc` makes port 80 Caddy's local HTTP listener while preserving
@@ -86,4 +88,7 @@ service configuration before changing them.
 In the Tailscale DNS configuration, use `100.64.115.45` as the restricted
 nameserver for `homelab.lan`, replacing any stale resolver for that suffix.
 Keep MagicDNS enabled; a global DNS override is not required for this private
-suffix.
+suffix. Keep `tailscale set --accept-dns=false` on labnuc itself because it is
+the resolver advertised for this route. Install `labnuc-resolv.conf` as the
+host's `/etc/resolv.conf`; other tailnet clients can continue accepting the
+Tailscale split-DNS configuration normally.
