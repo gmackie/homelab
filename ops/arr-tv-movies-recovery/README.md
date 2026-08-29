@@ -41,6 +41,16 @@ Provider and indexer credentials do not belong in this repository. Configure
 them directly in SABnzbd and Prowlarr using the local service interfaces or a
 secret-management path.
 
+SABnzbd runs downloads and post-processing only during the overnight window,
+01:00-07:00 Eastern time. Keep these daily scheduler entries in `schedlines`:
+
+```text
+1 0 1 1234567 resume
+1 0 7 1234567 pause_all
+1 0 1 1234567 resume_post
+1 0 7 1234567 pause_post
+```
+
 SABnzbd treats the Tailscale CGNAT range as external unless it is listed under
 the advanced `local_ranges` setting. Keep general internet exposure disabled
 and use `10.0.0.0/8, 100.64.0.0/10` for the homelab LAN and tailnet. Its host
