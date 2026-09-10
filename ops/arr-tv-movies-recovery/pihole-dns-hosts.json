@@ -1,0 +1,12 @@
+[
+  "10.1.1.188 jellyfin.homelab.lan",
+  "10.1.1.188 sonarr.homelab.lan",
+  "10.1.1.188 radarr.homelab.lan",
+  "10.1.1.188 prowlarr.homelab.lan",
+  "10.1.1.188 sabnzbd.homelab.lan",
+  "10.1.1.188 overseerr.homelab.lan",
+  "10.1.1.188 tautulli.homelab.lan",
+  "10.1.1.188 pihole.homelab.lan",
+  "10.1.1.188 speedtest.homelab.lan",
+  "10.1.0.75 newnas.homelab.lan"
+]

@@ -1,0 +1,14 @@
+{
+    admin "unix//run/caddy/admin.socket"
+    http_port 80
+    auto_https disable_redirects
+}
+
+https://labnuc.local:8444 {
+    reverse_proxy localhost:18789 {
+        header_up X-Forwarded-Proto {scheme}
+    }
+    tls internal
+}
+
+import /etc/caddy/conf.d/*
