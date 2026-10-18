@@ -101,3 +101,18 @@ Hetzner capacity overrides include each attached data volume. Linux application
 hosts warn below 15 GiB or above 85% utilization; Mac build hosts warn below
 40 GiB, ahead of Preflight's 25 GiB admission floor. Storedge's small OS disk
 uses a 4 GiB floor, while its data pool is checked by utilization.
+
+## 2026-10-18 migration record
+
+MinIO cutover used the same image version and credentials, a stopped-source
+final rsync, then immutable ZFS snapshot `tank/apps/minio@LAB-1-cutover-20261018`.
+All three buckets compared equal before/after: 326 artifact objects
+(162,524,959,644 bytes), 53 snapshot objects (12,923,399,625 bytes), empty team-assets.
+Authenticated PUT/GET/DELETE and both API health endpoints passed through labnuc.
+A full per-file SHA256 manifest of the stopped source and frozen NAS snapshot
+is required before local source retirement. Source manifest: 11,748 entries,
+175,454,063,920 file bytes, SHA256
+ee90ecc799a273d0e1d602b2cd0332ccbee936518aacc6db22017cfd17708226.
+Receipts and manifests are retained under `~/storage-recovery/2026-10-18` on
+labtop and beside NAS archives. Secondary storedge seed continues separately;
+its successful checksum replication must be recorded before claiming redundancy.
