@@ -136,3 +136,10 @@ exact container image in storedge `service-config/`. Restore that directory only
 to a root-owned 0700 directory; never publish its contents or copy credentials
 into a checkout. Recovery does not depend on the upstream image registry staying
 available. The original labnuc environment and Podman image are also preserved.
+
+Secondary replication uses SSH keepalives and a 120-second rsync inactivity
+timeout. Failed runs retry every 15 minutes; the normal daily timer remains
+04:15 UTC plus jitter. Inspect `systemctl status fleet-storage-backup` and its
+journal. On 2026-10-18 storedge became unreachable over SSH/Tailscale during the
+first seed while still answering LAN ICMP. Treat redundancy as incomplete until
+a full successful checksum run; retain labnuc's stopped source meanwhile.

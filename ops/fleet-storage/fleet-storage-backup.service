@@ -3,6 +3,7 @@ Description=Replicate NAS build storage to storedge (LAB-1)
 After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/tank/apps/minio /tank/archive
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -10,3 +11,5 @@ ExecStart=/usr/local/lib/fleet-storage/backup-to-storedge.sh
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=12h
+Restart=on-failure
+RestartSec=15min
