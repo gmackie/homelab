@@ -90,3 +90,9 @@ Unreferenced Nix store paths are collected weekly by `fleet-nix-gc.timer` on
 Hetzner hosts. This runs `nix-store --gc` only: no profile generation deletion,
 no GC-root removal. Referenced deployments and rollback generations remain.
 NAS pressure units include the actual data pools, not just the OS filesystem.
+
+Reinstall Mac controls with `python3 scripts/install-macos-storage-controls.py
+/ /Volumes/dev /Volumes/dev-ssd --apply` on labtop; use `/ /Volumes/T9-APFS` on
+Mini. Without `--apply`, prints the planned agents. Installs the hourly telemetry
+and, only where Nix exists, a Sunday 06:15 local-time user GC agent. Existing
+legacy sweep plists are backed up before replacement.
