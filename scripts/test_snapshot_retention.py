@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -55,7 +56,7 @@ class RetentionTests(unittest.TestCase):
             config.write_text(json.dumps({'node_name': 'fixture', 'snapshot': {'s3_endpoint': 'fixture'}}))
             argv = ['retain', '--root', str(root), '--config', str(config), '--apply',
                     '--ssh-verifier', 'fixture', '--ssh-key', str(root / 'key')]
-            with patch.object(retention.sys if hasattr(retention, 'sys') else __import__('sys'), 'argv', argv):
+            with patch.object(sys, 'argv', argv):
                 with patch.object(retention.subprocess, 'check_output', return_value='not a digest'):
                     with self.assertRaises(RuntimeError):
                         retention.main()

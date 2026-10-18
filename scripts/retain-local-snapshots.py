@@ -97,7 +97,7 @@ def main():
                 if not args.ssh_key:
                     raise RuntimeError('--ssh-key is required with --ssh-verifier')
                 expected = subprocess.check_output([
-                    'ssh', '-i', str(args.ssh_key), '-o', 'BatchMode=yes',
+                    'ssh', '-T', '-i', str(args.ssh_key), '-o', 'BatchMode=yes',
                     '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15',
                     args.ssh_verifier,
                 ], input=json.dumps({'key': key}), text=True, timeout=1800).strip()

@@ -125,3 +125,8 @@ The dedicated master key is constrained on newnas by source tailnet IP and a
 forced helper command, which can read only `hetzner-master/` keys in the artifacts
 bucket. NAS credentials remain root-only. Without `--ssh-verifier`, the script
 performs its own authenticated S3 readback as before.
+
+MinIO's ZFS budget is `refquota=2T` for live data and `quota=3T` including
+snapshots, leaving most of the shared NAS pool available to other services.
+These are ceilings, not reservations. Increase deliberately after inspecting
+pool/backup headroom; hourly telemetry sees the dataset's effective free space.
