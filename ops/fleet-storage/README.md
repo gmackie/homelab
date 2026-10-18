@@ -139,7 +139,12 @@ available. The original labnuc environment and Podman image are also preserved.
 
 Secondary replication uses SSH keepalives and a 120-second rsync inactivity
 timeout. Failed runs retry every 15 minutes; the normal daily timer remains
-04:15 UTC plus jitter. Inspect `systemctl status fleet-storage-backup` and its
+04:15 UTC plus jitter. Retries reuse the frozen snapshot named in root-only
+`/var/lib/fleet-storage/pending-minio-snapshot`; they create no additional
+snapshots while that run remains incomplete. The marker clears only after all
+data and recovery configuration copies succeed. A missing snapshot or invalid
+marker fails closed; investigate before replacing the marker or frozen source.
+Inspect `systemctl status fleet-storage-backup` and its
 journal. On 2026-10-18 storedge became unreachable over SSH/Tailscale during the
 first seed while still answering LAN ICMP. Treat redundancy as incomplete until
 a full successful checksum run; retain labnuc's stopped source meanwhile.
