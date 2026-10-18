@@ -130,3 +130,9 @@ MinIO's ZFS budget is `refquota=2T` for live data and `quota=3T` including
 snapshots, leaving most of the shared NAS pool available to other services.
 These are ceilings, not reservations. Increase deliberately after inspecting
 pool/backup headroom; hourly telemetry sees the dataset's effective free space.
+
+The backup also stores root-only MinIO service credentials, systemd unit and the
+exact container image in storedge `service-config/`. Restore that directory only
+to a root-owned 0700 directory; never publish its contents or copy credentials
+into a checkout. Recovery does not depend on the upstream image registry staying
+available. The original labnuc environment and Podman image are also preserved.
