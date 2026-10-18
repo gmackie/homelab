@@ -85,3 +85,8 @@ configuration, failed download or mismatched content fails closed. Receipts live
 in `/var/lib/forgegraph/storage-receipts`. NAS daily/weekly/monthly history is
 unchanged. This timer is installed on hetzner-master, the host with the large
 local database dumps; it never touches PostgreSQL data directories.
+
+Unreferenced Nix store paths are collected weekly by `fleet-nix-gc.timer` on
+Hetzner hosts. This runs `nix-store --gc` only: no profile generation deletion,
+no GC-root removal. Referenced deployments and rollback generations remain.
+NAS pressure units include the actual data pools, not just the OS filesystem.
