@@ -35,7 +35,9 @@ for item in items:
 if args.apply:
     for directory in [lib, logs, agents]:
         directory.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(Path(__file__).with_name('storage-pressure.py'), lib / 'storage-pressure.py')
+    source = Path(__file__).with_name('storage-pressure.py')
+    if source.resolve() != (lib / 'storage-pressure.py').resolve():
+        shutil.copy2(source, lib / 'storage-pressure.py')
     for item in items:
         path = agents / (item['Label'] + '.plist')
         backup = path.with_suffix('.plist.before-LAB-1')
