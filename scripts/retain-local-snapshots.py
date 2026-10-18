@@ -81,6 +81,8 @@ def main():
     parser.add_argument('--config', type=Path, default=Path('/etc/forgegraph/agent.json'))
     parser.add_argument('--receipts', type=Path, default=Path('/var/lib/forgegraph/storage-receipts'))
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--ssh-verifier', help='trusted NAS host with the restricted hash-minio-object helper')
+    parser.add_argument('--ssh-key', type=Path, help='dedicated SSH verifier key')
     args = parser.parse_args()
     if not args.root.exists():
         return
@@ -91,7 +93,18 @@ def main():
         key = config['node_name'] + '/' + path.parent.name + '/' + path.name
         print(json.dumps({'candidate': str(path), 'object': key, 'apply': args.apply}), flush=True)
         if args.apply:
-            expected = remote_digest(config['snapshot'], key)
+            if args.ssh_verifier:
+                if not args.ssh_key:
+                    raise RuntimeError('--ssh-key is required with --ssh-verifier')
+                expected = subprocess.check_output([
+                    'ssh', '-i', str(args.ssh_key), '-o', 'BatchMode=yes',
+                    '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15',
+                    args.ssh_verifier,
+                ], input=json.dumps({'key': key}), text=True, timeout=1800).strip()
+                if not re.fullmatch('[0-9a-f]{64}', expected):
+                    raise RuntimeError('invalid digest from trusted verifier')
+            else:
+                expected = remote_digest(config['snapshot'], key)
             retire(path, expected, args.receipts)
             print(json.dumps({'retired': str(path), 'sha256': expected}), flush=True)
 

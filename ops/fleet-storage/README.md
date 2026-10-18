@@ -116,3 +116,12 @@ ee90ecc799a273d0e1d602b2cd0332ccbee936518aacc6db22017cfd17708226.
 Receipts and manifests are retained under `~/storage-recovery/2026-10-18` on
 labtop and beside NAS archives. Secondary storedge seed continues separately;
 its successful checksum replication must be recorded before claiming redundancy.
+
+The master retention service offloads S3 readback hashing to a restricted SSH
+helper on newnas, avoiding transfer of every large dump back over the WAN.
+The helper reads the entire S3 object locally and returns only SHA256; master
+still hashes its local dump and checks for changes/open handles before deletion.
+The dedicated master key is constrained on newnas by source tailnet IP and a
+forced helper command, which can read only `hetzner-master/` keys in the artifacts
+bucket. NAS credentials remain root-only. Without `--ssh-verifier`, the script
+performs its own authenticated S3 readback as before.

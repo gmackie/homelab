@@ -45,6 +45,22 @@ class RetentionTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertEqual(json.loads((receipts / 'old.sql.gz.json').read_text())['sha256'], value)
 
+    def test_invalid_trusted_verifier_response_retains_snapshot(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); directory = root / 'db'; directory.mkdir()
+            for date in ['2026-10-17', '2026-10-18']:
+                (directory / ('db-' + date + '.sql.gz')).write_bytes(b'dump')
+            config = root / 'config.json'
+            config.write_text(json.dumps({'node_name': 'fixture', 'snapshot': {'s3_endpoint': 'fixture'}}))
+            argv = ['retain', '--root', str(root), '--config', str(config), '--apply',
+                    '--ssh-verifier', 'fixture', '--ssh-key', str(root / 'key')]
+            with patch.object(retention.sys if hasattr(retention, 'sys') else __import__('sys'), 'argv', argv):
+                with patch.object(retention.subprocess, 'check_output', return_value='not a digest'):
+                    with self.assertRaises(RuntimeError):
+                        retention.main()
+            self.assertTrue((directory / 'db-2026-10-17.sql.gz').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -5,6 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/local/lib/fleet-storage/retain-local-snapshots.py --apply
+ExecStart=/usr/bin/python3 /usr/local/lib/fleet-storage/retain-local-snapshots.py --apply --ssh-verifier mackieg@100.123.166.5 --ssh-key /root/.ssh/LAB-1-snapshot-verifier
 Nice=10
 TimeoutStartSec=8h
