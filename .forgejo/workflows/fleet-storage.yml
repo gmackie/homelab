@@ -2,7 +2,7 @@ name: Fleet storage
 
 on:
   push:
-    branches: [master, LAB-1-fleet-storage]
+    branches: [master, LAB-1-fleet-storage, LAB-1-local-snapshot-retention]
   pull_request:
     branches: [master]
 
@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Archive verification and inactivity guards
-        run: python3 -m unittest discover -s scripts -p 'test_archive*.py' -v
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
       - name: Backup shell syntax
         run: bash -n ops/fleet-storage/backup-to-storedge.sh
       - name: Capacity telemetry

@@ -72,3 +72,16 @@ same site, not an off-site backup. Monitor the timer result and NAS capacity.
 
 A backup failure must be resolved rather than treating a local copy as disposable.
 No automatic build-product retention is enabled until owners choose that policy.
+
+## Local database snapshot retention
+
+`fleet-snapshot-retention.timer` runs daily at 08:15 UTC (up to 15 minutes jitter),
+after the agent's 03:00 UTC database dumps. It keeps the newest dated dump per
+database locally. An older local dump is removed only after an authenticated
+full-object S3 GET and a matching SHA256 of the local file, with no open handles
+or changes during verification. Pre-restore snapshots, unknown filenames and
+symlinks are excluded. Default script invocation is inspect-only. Missing S3
+configuration, failed download or mismatched content fails closed. Receipts live
+in `/var/lib/forgegraph/storage-receipts`. NAS daily/weekly/monthly history is
+unchanged. This timer is installed on hetzner-master, the host with the large
+local database dumps; it never touches PostgreSQL data directories.

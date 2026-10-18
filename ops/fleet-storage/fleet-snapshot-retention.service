@@ -1,0 +1,10 @@
+[Unit]
+Description=Retire verified local duplicates of NAS database dumps (LAB-1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/fleet-storage/retain-local-snapshots.py --apply
+Nice=10
+TimeoutStartSec=8h
