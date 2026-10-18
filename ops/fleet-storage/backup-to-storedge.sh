@@ -5,7 +5,7 @@ set -euo pipefail
 exec 9>/run/fleet-storage-backup.lock
 flock -n 9 || exit 0
 stamp="fleet-storage-$(date -u +%Y%m%dT%H%M%SZ)"
-ssh_command='ssh -i /root/.ssh/LAB-1-storedge -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15'
+ssh_command='ssh -c aes128-gcm@openssh.com -i /root/.ssh/LAB-1-storedge -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15'
 zfs snapshot "tank/apps/minio@$stamp"
 snapshot="/tank/apps/minio/.zfs/snapshot/$stamp/"
 rsync -aH --numeric-ids --delete-delay --checksum -e "$ssh_command" "$snapshot" mackieg@100.113.97.115:minio/

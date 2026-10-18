@@ -3,7 +3,7 @@ Description=Fleet storage capacity telemetry (LAB-1)
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/local/lib/fleet-storage/storage-pressure.py /
+ExecStart=/usr/bin/python3 /usr/local/lib/fleet-storage/storage-pressure.py --min-free-gib 15 /
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only

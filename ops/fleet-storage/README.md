@@ -96,3 +96,8 @@ Reinstall Mac controls with `python3 scripts/install-macos-storage-controls.py
 Mini. Without `--apply`, prints the planned agents. Installs the hourly telemetry
 and, only where Nix exists, a Sunday 06:15 local-time user GC agent. Existing
 legacy sweep plists are backed up before replacement.
+
+Hetzner capacity overrides include each attached data volume. Linux application
+hosts warn below 15 GiB or above 85% utilization; Mac build hosts warn below
+40 GiB, ahead of Preflight's 25 GiB admission floor. Storedge's small OS disk
+uses a 4 GiB floor, while its data pool is checked by utilization.
