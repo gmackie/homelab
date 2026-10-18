@@ -1,0 +1,20 @@
+name: Fleet storage
+
+on:
+  push:
+    branches: [master, LAB-1-fleet-storage]
+  pull_request:
+    branches: [master]
+
+jobs:
+  verify:
+    name: Verify archive safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive verification and inactivity guards
+        run: python3 -m unittest discover -s scripts -p 'test_archive*.py' -v
+      - name: Backup shell syntax
+        run: bash -n ops/fleet-storage/backup-to-storedge.sh
+      - name: Capacity telemetry
+        run: python3 scripts/storage-pressure.py / --min-free-gib 0 --max-used-percent 100
