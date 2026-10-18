@@ -1,0 +1,11 @@
+[Unit]
+Description=Check fleet capacity hourly (LAB-1)
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=1h
+RandomizedDelaySec=2m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

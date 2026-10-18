@@ -1,0 +1,18 @@
+[Unit]
+Description=ForgeGraph artifact storage on newnas (LAB-1)
+After=network-online.target docker.service
+Requires=docker.service
+Wants=network-online.target
+RequiresMountsFor=/tank/apps/minio
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f forgegraph-minio
+ExecStart=/usr/bin/docker run --rm --name forgegraph-minio --network host --env-file /etc/forgegraph/homelab-storage-minio.env -v /tank/apps/minio:/data sha256:2fb7f0bdb1505a75598d4f9db77021300ed06733e6ada642065fd9cfafbd5a29 server /data --address :9010 --console-address :9011
+ExecStop=/usr/bin/docker stop -t 30 forgegraph-minio
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

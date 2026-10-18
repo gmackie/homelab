@@ -1,0 +1,9 @@
+[Unit]
+Description=Preserve labnuc MinIO api endpoint (LAB-1)
+
+[Socket]
+ListenStream=9010
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
