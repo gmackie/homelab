@@ -72,3 +72,74 @@ same site, not an off-site backup. Monitor the timer result and NAS capacity.
 
 A backup failure must be resolved rather than treating a local copy as disposable.
 No automatic build-product retention is enabled until owners choose that policy.
+
+## Local database snapshot retention
+
+`fleet-snapshot-retention.timer` runs daily at 08:15 UTC (up to 15 minutes jitter),
+after the agent's 03:00 UTC database dumps. It keeps the newest dated dump per
+database locally. An older local dump is removed only after an authenticated
+full-object S3 GET and a matching SHA256 of the local file, with no open handles
+or changes during verification. Pre-restore snapshots, unknown filenames and
+symlinks are excluded. Default script invocation is inspect-only. Missing S3
+configuration, failed download or mismatched content fails closed. Receipts live
+in `/var/lib/forgegraph/storage-receipts`. NAS daily/weekly/monthly history is
+unchanged. This timer is installed on hetzner-master, the host with the large
+local database dumps; it never touches PostgreSQL data directories.
+
+Unreferenced Nix store paths are collected weekly by `fleet-nix-gc.timer` on
+Hetzner hosts. This runs `nix-store --gc` only: no profile generation deletion,
+no GC-root removal. Referenced deployments and rollback generations remain.
+NAS pressure units include the actual data pools, not just the OS filesystem.
+
+Reinstall Mac controls with `python3 scripts/install-macos-storage-controls.py
+/ /Volumes/dev /Volumes/dev-ssd --apply` on labtop; use `/ /Volumes/T9-APFS` on
+Mini. Without `--apply`, prints the planned agents. Installs the hourly telemetry
+and, only where Nix exists, a Sunday 06:15 local-time user GC agent. Existing
+legacy sweep plists are backed up before replacement.
+
+Hetzner capacity overrides include each attached data volume. Linux application
+hosts warn below 15 GiB or above 85% utilization; Mac build hosts warn below
+40 GiB, ahead of Preflight's 25 GiB admission floor. Storedge's small OS disk
+uses a 4 GiB floor, while its data pool is checked by utilization.
+
+## 2026-10-18 migration record
+
+MinIO cutover used the same image version and credentials, a stopped-source
+final rsync, then immutable ZFS snapshot `tank/apps/minio@LAB-1-cutover-20261018`.
+All three buckets compared equal before/after: 326 artifact objects
+(162,524,959,644 bytes), 53 snapshot objects (12,923,399,625 bytes), empty team-assets.
+Authenticated PUT/GET/DELETE and both API health endpoints passed through labnuc.
+A full per-file SHA256 manifest of the stopped source and frozen NAS snapshot
+is required before local source retirement. Source manifest: 11,748 entries,
+175,454,063,920 file bytes, SHA256
+ee90ecc799a273d0e1d602b2cd0332ccbee936518aacc6db22017cfd17708226.
+Receipts and manifests are retained under `~/storage-recovery/2026-10-18` on
+labtop and beside NAS archives. Secondary storedge seed continues separately;
+its successful checksum replication must be recorded before claiming redundancy.
+
+The master retention service offloads S3 readback hashing to a restricted SSH
+helper on newnas, avoiding transfer of every large dump back over the WAN.
+The helper reads the entire S3 object locally and returns only SHA256; master
+still hashes its local dump and checks for changes/open handles before deletion.
+The dedicated master key is constrained on newnas by source tailnet IP and a
+forced helper command, which can read only `hetzner-master/` keys in the artifacts
+bucket. NAS credentials remain root-only. Without `--ssh-verifier`, the script
+performs its own authenticated S3 readback as before.
+
+MinIO's ZFS budget is `refquota=2T` for live data and `quota=3T` including
+snapshots, leaving most of the shared NAS pool available to other services.
+These are ceilings, not reservations. Increase deliberately after inspecting
+pool/backup headroom; hourly telemetry sees the dataset's effective free space.
+
+The backup also stores root-only MinIO service credentials, systemd unit and the
+exact container image in storedge `service-config/`. Restore that directory only
+to a root-owned 0700 directory; never publish its contents or copy credentials
+into a checkout. Recovery does not depend on the upstream image registry staying
+available. The original labnuc environment and Podman image are also preserved.
+
+Secondary replication uses SSH keepalives and a 120-second rsync inactivity
+timeout. Failed runs retry every 15 minutes; the normal daily timer remains
+04:15 UTC plus jitter. Inspect `systemctl status fleet-storage-backup` and its
+journal. On 2026-10-18 storedge became unreachable over SSH/Tailscale during the
+first seed while still answering LAN ICMP. Treat redundancy as incomplete until
+a full successful checksum run; retain labnuc's stopped source meanwhile.
