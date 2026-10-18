@@ -1,0 +1,11 @@
+[Unit]
+Description=Forward labnuc MinIO console to newnas (LAB-1)
+After=network-online.target
+Wants=network-online.target
+Requires=forgegraph-minio-console-proxy.socket
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 100.123.166.5:9011
+Restart=on-failure
+PrivateTmp=true
+NoNewPrivileges=true

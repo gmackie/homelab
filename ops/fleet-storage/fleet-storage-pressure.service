@@ -1,0 +1,9 @@
+[Unit]
+Description=Fleet storage capacity telemetry (LAB-1)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/fleet-storage/storage-pressure.py /
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
