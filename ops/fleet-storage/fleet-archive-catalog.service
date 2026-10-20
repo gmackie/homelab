@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh the verified NAS archive catalog (LAB-1)
+RequiresMountsFor=/tank/archive
+
+[Service]
+Type=oneshot
+User=mackieg
+UMask=0077
+ExecStart=/usr/bin/python3 /usr/local/lib/fleet-storage/catalog-nas-archives.py /tank/archive/fleet-storage

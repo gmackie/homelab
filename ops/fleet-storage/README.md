@@ -5,6 +5,20 @@ Active checkouts, SQLite/Postgres databases, Unity projects, and node_modules st
 local; do not replace them with network symlinks. One pnpm store per local volume
 allows hardlinks/clones without adding network latency to builds.
 
+## Browse retained files
+
+Newnas serves `smb://newnas.local/fleet-archive` (or `smb://10.1.0.76/fleet-archive`)
+to the existing `mackieg` NAS account. This authenticated share is read-only;
+partial transfers are hidden. It exposes only `/tank/archive/fleet-storage`,
+without changing the existing writable `tank-public` share. Add the supplied
+`fleet-archive-smb.conf` share stanza to Samba configuration, validate with
+`testparm`, then reload `smb.service` on newnas (not `smbd.service`).
+
+The hourly `fleet-archive-catalog.timer` publishes `README.md` and `catalog.json`
+from completed receipts, with original paths, sizes, SHA256 and restore commands.
+It does not rehash every archive or imply secondary backup success. The catalog
+service runs as the archive owner; no NAS or MinIO credentials enter the share.
+
 ## Deployed controls
 
 - Preflight runner PR 19 checks both workspace and home filesystems before every
