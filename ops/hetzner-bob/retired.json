@@ -1,0 +1,29 @@
+{
+  "node": "hetzner-bob",
+  "protected": ["bob-gateway", "ooda-runner", "bob-web", "nginx.service", "certbot.timer"],
+  "retired": [
+    {
+      "id": "omnibank-token-rotate",
+      "issue": "LAB-12",
+      "reason": "Failed every month since July: the unit runs scripts/mint-service-token.sh as root, which calls `forge node exec` back into hetzner-bob, and root on bob has no forge login (\"not logged in\"). Even when it worked it only wrote a new never-expiring token to /opt/omnibank/merchant-service-token.txt, which no service reads; it did not push the token to Workers or revoke the old one, so it was credential sprawl, not rotation. OmniBank service tokens are minted with expires=NULL (shadybank src/apiserver.py post_service_tokens), so nothing expires while it is off. Rotation is the ops-host script scripts/rotate-service-token.sh in gmackie/shadybank.",
+      "restore": "Restore the two unit files from the backup tarball and `systemctl enable --now omnibank-token-rotate.timer` only after the mint script runs node-locally (docker exec) and revokes the previous token.",
+      "units": ["omnibank-token-rotate.timer", "omnibank-token-rotate.service"]
+    },
+    {
+      "id": "levelforge-fleet-controller",
+      "issue": "LAB-12",
+      "reason": "Hand-installed on 2026-04-30 from a copy of gmackie/levelforge packages/fleet-controller (/opt/levelforge, never updated; no deploy config in the repo). The unit was already disabled and was stopped on 2026-11-16 22:11 UTC (exit 143 on SIGTERM, which systemd records as failed). The only Agones fleet (game-servers/testgame, 8 replicas) has had 0 Ready game servers for 138 days, and the levelforge release roadmap lists provisioning Agones and deploying fleet-controller as unfinished. /opt/levelforge is left in place.",
+      "restore": "Deploy fleet-controller through a supported levelforge deploy path when Agones hosting is live; or restore the unit file from the backup tarball.",
+      "units": ["levelforge-fleet-controller.service"]
+    },
+    {
+      "id": "net.omnidat.cc-bob-edge",
+      "issue": "OMNI2-6",
+      "reason": "net.omnidat.cc moved off hetzner-bob: the ForgeGraph route is omnichat/production -> labnuc:3110 (proxied through labnuc's Cloudflare tunnel, with TLS at the Cloudflare edge), and a public probe gets no hits in bob's nginx logs. The bob nginx site, the netcontrol-relay socket, and the webroot LE certificate are dead, and the cert could not renew from about 2026-12-01 (HTTP-01 404 at labnuc).",
+      "restore": "Restore the nginx site, relay units, and /etc/letsencrypt lineage from the backup tarball, and point the ForgeGraph route back to hetzner-bob:18890.",
+      "units": ["netcontrol-relay.socket", "netcontrol-relay.service"],
+      "nginx_sites": ["net.omnidat.cc"],
+      "certs": ["net.omnidat.cc"]
+    }
+  ]
+}
