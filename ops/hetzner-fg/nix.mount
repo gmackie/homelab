@@ -1,0 +1,19 @@
+# hetzner-fg: /etc/systemd/system/nix.mount (FORGE-205)
+# The Nix store lives on the /mnt/docker volume (sdb). Registry and nixci
+# builds left ~7 GB of dead store paths per run on the 75 GB root disk, so
+# root kept dropping below the 15 GiB fleet-storage-pressure floor.
+# The directory under the mount on / is empty and immutable (chattr +i): if
+# this mount fails, nix cannot silently start a fresh store on root.
+[Unit]
+Description=Nix store on the /mnt/docker volume (FORGE-205)
+RequiresMountsFor=/mnt/docker
+Before=local-fs.target
+
+[Mount]
+What=/mnt/docker/nix
+Where=/nix
+Type=none
+Options=bind
+
+[Install]
+WantedBy=local-fs.target
