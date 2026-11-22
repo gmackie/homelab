@@ -14,13 +14,19 @@ import subprocess
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('paths', nargs='+')
 parser.add_argument('--apply', action='store_true')
+# Macs warn below 40 GiB only: APFS reports container-wide usage, so the Linux
+# 85% utilization rule would demand ~139 GiB free on a 926 GiB container.
+parser.add_argument('--min-free-gib', default='40')
+parser.add_argument('--max-used-percent', default='100')
 args = parser.parse_args()
 home = Path.home()
 lib = home / '.local/lib/fleet-storage'
 logs = home / 'Library/Logs'
 agents = home / 'Library/LaunchAgents'
 items = [{'Label': 'com.forgegraph.preflight-disk-sweep',
-          'ProgramArguments': ['/usr/bin/python3', str(lib / 'storage-pressure.py')] + args.paths,
+          'ProgramArguments': ['/usr/bin/python3', str(lib / 'storage-pressure.py'),
+                                               '--min-free-gib', args.min_free_gib,
+                                               '--max-used-percent', args.max_used_percent] + args.paths,
           'RunAtLoad': True, 'StartInterval': 3600,
           'StandardOutPath': str(logs / 'fleet-storage-pressure.log'),
           'StandardErrorPath': str(logs / 'fleet-storage-pressure.log')}]

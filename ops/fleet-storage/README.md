@@ -103,6 +103,10 @@ local database dumps; it never touches PostgreSQL data directories.
 Unreferenced Nix store paths are collected weekly by `fleet-nix-gc.timer` on
 Hetzner hosts. This runs `nix-store --gc` only: no profile generation deletion,
 no GC-root removal. Referenced deployments and rollback generations remain.
+hetzner-fg collects daily instead (`hetzner-fg-nix-gc.conf`, installed as
+`/etc/systemd/system/fleet-nix-gc.timer.d/hetzner-fg.conf`): its ForgeGraph
+registry builds use `--no-link` and leave several GiB of dead paths per run on a
+75 GiB root, which kept `/` under the 15 GiB floor between weekly runs.
 NAS pressure units include the actual data pools, not just the OS filesystem.
 
 Reinstall Mac controls with `python3 scripts/install-macos-storage-controls.py
@@ -113,8 +117,18 @@ legacy sweep plists are backed up before replacement.
 
 Hetzner capacity overrides include each attached data volume. Linux application
 hosts warn below 15 GiB or above 85% utilization; Mac build hosts warn below
-40 GiB, ahead of Preflight's 25 GiB admission floor. Storedge's small OS disk
-uses a 4 GiB floor, while its data pool is checked by utilization.
+40 GiB, ahead of Preflight's 25 GiB admission floor. The Mac installer passes
+`--min-free-gib 40 --max-used-percent 100`: APFS reports container-wide usage, so
+the Linux 85% rule would demand ~139 GiB free on labtop's 926 GiB container.
+Storedge's small OS disk uses a 4 GiB floor, while its data pool is checked by
+utilization.
+
+ForgeGraph dev-storage (`com.forgegraph.storage`, `forge storage maintain`) checks
+its free-space reserve on the volume holding `stagingRoot`. Keep `stagingRoot`
+on the external volume (labtop `/Volumes/dev-ssd/.forge-storage/staging`), as
+its own README requires; with staging on the internal container the 80 GiB
+labtop reserve is never met and every hourly run exits 1 before archiving
+anything. Mini keeps internal staging under its 20 GiB reserve.
 
 ## 2026-10-18 migration record
 
