@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retire obsolete node-local units, nginx sites and LE lineages from a manifest.
+"""Retire obsolete node-local units, files, nginx sites and LE lineages from a manifest.
 
 Dry-run by default (prints the plan). On the node, as root:
     python3 retire-node-units.py ops/hetzner-bob/retired.json --apply
@@ -15,10 +15,13 @@ import subprocess
 import sys
 
 BACKUP_DIR = '/root/retired-node-units'
+# Plain `files` entries are for config and env files only, never service data.
+FORBIDDEN_FILE_PREFIXES = ('/nix/', '/var/lib/', '/srv/', '/home/', '/mnt/')
 
 
 def paths_for(entry):
     paths = [f'/etc/systemd/system/{u}' for u in entry.get('units', [])]
+    paths += list(entry.get('files', []))
     for site in entry.get('nginx_sites', []):
         paths += [f'/etc/nginx/sites-enabled/{site}', f'/etc/nginx/sites-available/{site}']
     for cert in entry.get('certs', []):
@@ -34,6 +37,9 @@ def _guard(manifest):
             base = unit.rsplit('.', 1)[0]
             if unit in protected or base in protected or any(p in unit for p in ('gateway', 'ooda-runner')):
                 raise ValueError(f'{entry["id"]}: refusing to retire protected unit {unit}')
+        for path in entry.get('files', []):
+            if not path.startswith('/') or '..' in path.split('/') or path.startswith(FORBIDDEN_FILE_PREFIXES):
+                raise ValueError(f'{entry["id"]}: refusing to remove {path}')
 
 
 def plan(manifest, stamp, exists=lambda p: True):
@@ -50,6 +56,9 @@ def plan(manifest, stamp, exists=lambda p: True):
         steps.append({'cmd': f'systemctl disable --now {u}'})
     for u in units:
         steps.append({'cmd': f'rm -f /etc/systemd/system/{u}'})
+    for f in (f for e in entries for f in e.get('files', [])):
+        if exists(f):
+            steps.append({'cmd': f'rm -f {shlex.quote(f)}'})
     steps.append({'cmd': 'systemctl daemon-reload'})
     reset = [u for e in entries for u in e.get('units', [])]
     if reset:

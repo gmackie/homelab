@@ -1,0 +1,17 @@
+{
+  "node": "hetzner-fg",
+  "protected": ["forgegraph-agent", "nix-serve", "promtail", "nix.mount", "postgresql",
+                "forgejo", "gitea", "caddy", "forgegraph-fg-npm-registry-registry",
+                "forgegraph-upm", "forgegraph-metrics-sync", "fleet-nix-gc", "fleet-storage-pressure"],
+  "retired": [
+    {
+      "id": "forgegraph-legacy-server",
+      "issue": "LAB-15",
+      "reason": "Self-hosted ForgeGraph web server (/nix/store/3wcvz7sm...-forgegraph-0.1.0, PORT=4000, local Postgres db `forgegraph`), from before ForgeGraph moved to the Cloudflare Worker at forgegraf.com. Its only consumer was the nginx site forge.gmac.io -> 127.0.0.1:4000, and nginx is inactive on this host; forge.gmac.io is answered by Cloudflare Access, and no ForgeGraph route, Caddy or cloudflared ingress points at :4000. It logged nothing but its own stop in 14 days. It was stopped by the FORGE-205 nix.mount cutover at 2026-11-22 22:46:29Z and nothing noticed. Nothing requires it (reverse deps: multi-user.target only); forgegraph-agent, forgegraph-metrics-sync (pushes to forgegraf.com) and the registry are separate units. Its env still held GITEA_TOKEN for the dead git.gmac.io instance (Forgejo rejects it) plus legacy OAuth/session secrets; env.file- and env.file.bak- are identical copies.",
+      "restore": "Restore the unit and env files from /root/retired-node-units/<stamp>.tar.gz and replace GITEA_TOKEN with a token from `forge forgejo-token --no-store` before `systemctl enable --now forgegraph.service`. The local `forgegraph` Postgres database was left untouched.",
+      "units": ["forgegraph.service"],
+      "files": ["/etc/forgegraph/env/forgegraph.env", "/etc/forgegraph/env.file-",
+                "/etc/forgegraph/env.file.bak-"]
+    }
+  ]
+}
