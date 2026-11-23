@@ -12,9 +12,10 @@ USABLE = 201_077_346_304
 PRESSURE_PERCENT = 85            # fleet-storage-pressure / df alert line
 REGISTRY_BUILD_DEAD = 7 * GiB    # dead paths one registry/nixci build leaves
 # Measured 2026-11-23 01:43-01:53Z (nix flake check, min-free 32 GiB): free
-# space fell 4.4 GB below where it started while auto-GC held gc.lock, because
-# build directories (build-dir on the same volume) are not collectable.
-OBSERVED_BUILD_DIP = 4_427_816_960
+# space fell from 33,834,024,960 to 27,393,843,200 bytes (86.4% used) while
+# auto-GC held gc.lock, because build directories (build-dir on the same
+# volume) are not collectable.
+OBSERVED_BUILD_DIP = 33_834_024_960 - 27_393_843_200
 
 
 def nix_conf():
