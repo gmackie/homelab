@@ -41,13 +41,22 @@ the volume could reach about 95% before Nix collected anything.
 | --- | --- | --- |
 | Usable (df used + avail) | 201,077,346,304 (187.3 GiB) | ext4 reserves the rest of the 196.3 GiB filesystem |
 | 85% line (df Use%) | 28.1 GiB free | `fleet-storage-pressure` (shutil) trips later, at ~20.4 GiB free |
-| `min-free` | 34359738368 (32 GiB) | line + about half a registry build of dead paths (~7 GiB) |
-| `max-free` | 51539607552 (48 GiB) | a pass frees up to two builds' worth, then stops |
+| `min-free` | 39728447488 (37 GiB) | line + 2x the measured build dip (4.4 GB) |
+| `max-free` | 56908316672 (53 GiB) | a pass frees up to two builds' worth, then stops |
 
 During a build Nix checks free space every `min-free-check-interval` (5 s). Below
 `min-free` it collects dead paths until `max-free` is free or nothing dead is
 left. It does not collect again in that process until free space drops another
-3%. The daily `fleet-nix-gc` collects everything dead regardless. If live data
+3%. The daily `fleet-nix-gc` collects everything dead regardless.
+
+The first setting (32 GiB) was measured on 2026-11-23 against a `nix flake check`
+that started at 33.8 GB free. Auto-GC held `gc.lock` the whole time, yet free space
+fell to 29.4 GB (85.4% used) for about 30 s, because `build-dir`
+(`/mnt/HC_Volume_104330084/nix-build`, the same volume) is not collectable. It
+then settled at exactly `max-free`. The margin is now twice that dip.
+`nix-build/` is shared: ForgeGraph CF Worker builds (`fg-cf-worker-*`),
+`manifestci-*` and others also leave directories there (16.5 GB with no build
+running). If live data
 alone takes the volume past 85% (`/mnt/docker/.pnpm-store` is ~38 GiB), GC cannot
 help; prune that instead.
 
