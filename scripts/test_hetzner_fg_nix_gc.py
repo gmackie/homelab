@@ -11,6 +11,11 @@ GiB = 1024 ** 3
 USABLE = 201_077_346_304
 PRESSURE_PERCENT = 85            # fleet-storage-pressure / df alert line
 REGISTRY_BUILD_DEAD = 7 * GiB    # dead paths one registry/nixci build leaves
+# Measured 2026-11-23 01:43-01:53Z (nix flake check, min-free 32 GiB): free
+# space fell from 33,834,024,960 to 27,393,843,200 bytes (86.4% used) while
+# auto-GC held gc.lock, because build directories (build-dir on the same
+# volume) are not collectable.
+OBSERVED_BUILD_DIP = 33_834_024_960 - 27_393_843_200
 
 
 def nix_conf():
@@ -35,6 +40,8 @@ class NixAutoGcTests(unittest.TestCase):
         # builds, so a margin of half a build's output is enough to collect
         # before the alert line rather than at the old 8 GiB.
         self.assertGreaterEqual(self.min_free, self.pressure_free + REGISTRY_BUILD_DEAD / 2)
+        # A build that starts just above min-free must not dip past the line.
+        self.assertGreaterEqual(self.min_free, self.pressure_free + 2 * OBSERVED_BUILD_DIP)
         self.assertEqual(self.min_free % GiB, 0)
 
     def test_one_auto_gc_frees_at_least_two_builds_of_garbage(self):
