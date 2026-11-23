@@ -1,0 +1,13 @@
+# Installed as /etc/forgejo-runner/cache-server.yaml, root:root 0600 (FORGE-463).
+# Read by forgejo-cache-server.service. Runners that use this server set
+#   cache.external_server: "http://100.121.231.92:8090/"
+#   cache.secret_url: "file:/etc/forgejo-runner/cache-secret"
+# and must never carry an inline `secret:`.
+log:
+  level: info
+cache:
+  enabled: true
+  dir: /opt/forgejo-runner/.cache/shared-actcache
+  host: 100.121.231.92
+  port: 8090
+  secret_url: "file:/etc/forgejo-runner/cache-secret"
