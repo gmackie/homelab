@@ -1,0 +1,16 @@
+# Installed as /etc/systemd/system/forgejo-cache-server.service (FORGE-463).
+# The shared secret is read from a root-only file named in cache-server.yaml
+# (cache.secret_url). Never pass --secret: argv is world-readable through ps.
+[Unit]
+Description=Forgejo Actions shared cache server
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/forgejo-runner/act_runner cache-server -c /etc/forgejo-runner/cache-server.yaml
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

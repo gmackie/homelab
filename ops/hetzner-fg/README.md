@@ -108,3 +108,57 @@ Docker.
 Stop the dependents, then `systemctl disable --now nix.mount`. `chattr -i /nix`,
 `rsync -aHAXS --numeric-ids /mnt/docker/nix/ /nix/`, remove the drop-ins,
 `systemctl daemon-reload`, and start the services. Root needs about 9 GiB free.
+
+# Shared Actions cache server (FORGE-463)
+
+`forgejo-cache-server.service` runs `act_runner cache-server` on
+`100.121.231.92:8090` (Tailscale) for runners that set
+`cache.external_server: "http://100.121.231.92:8090/"`. Until 2026-11-23 the unit
+passed `--secret <value>` on the command line, which any local user could read
+with `ps` or `systemctl show`. The secret now lives only in root-only files:
+
+| File | Installed as | Mode |
+| --- | --- | --- |
+| `forgejo-cache-server.service` | `/etc/systemd/system/forgejo-cache-server.service`, enabled | 644 |
+| `cache-server.yaml` | `/etc/forgejo-runner/cache-server.yaml` | root 600 |
+| (generated) | `/etc/forgejo-runner/cache-secret` | root 600, dir 700 |
+
+Runner configs that use this server set `cache.secret_url:
+"file:/etc/forgejo-runner/cache-secret"` and no inline `secret:`. On 2026-11-23
+that was `/opt/forgejo-runner/config.yaml` on hetzner-fg and on hetzner-worker
+(both runner units disabled; configs set to 600). hetzner-worker has no copy of
+the secret file. Before enabling that runner, copy it root-to-root (never through
+argv, a chat or `forge node exec`).
+
+Never put the secret in argv or an `Environment=` line, and never print it.
+
+## Rotating the secret
+
+```sh
+umask 077
+P=$(systemctl show -p MainPID --value forgejo-cache-server)
+cp /etc/forgejo-runner/cache-secret /root/old-cache-secret   # for the rejection check
+openssl rand -hex 32 > /etc/forgejo-runner/cache-secret.new
+mv /etc/forgejo-runner/cache-secret.new /etc/forgejo-runner/cache-secret
+# copy the new file to every off-host runner that uses this server, then:
+systemctl restart forgejo-cache-server
+# restart each runner daemon that uses it, one at a time, while it runs no job
+```
+
+## Verify
+
+`scripts/actcache-check.py` does what actions/cache does: reserve, upload,
+commit, look up and download one entry, with MACs computed from a secret file.
+It prints only `ok`, `rejected` or an error.
+
+```sh
+ps -eo args | grep '[c]ache-server'    # no --secret
+python3 scripts/actcache-check.py --url http://100.121.231.92:8090 \
+  --secret-file /etc/forgejo-runner/cache-secret --expect ok
+python3 scripts/actcache-check.py --url http://100.121.231.92:8090 \
+  --secret-file /root/old-cache-secret --expect rejected
+shred -u /root/old-cache-secret
+```
+
+`forgejo-cache-prune.service` (monthly) stops the server, wipes the store and
+starts it again. The secret is unchanged.
